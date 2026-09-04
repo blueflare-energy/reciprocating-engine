@@ -1,20 +1,27 @@
 # Vendored upstream sources
 
-This directory holds third-party sources that we build against or patch,
-vendored **unmodified** so that our changes are always visible as a separate,
-reviewable patch series.
+Third-party sources we build against or patch, pinned by reference rather than
+committed in full, so our changes stay visible as a separate patch series.
 
-## Contents
+## habanalabs
 
-Nothing is vendored yet. The primary planned entry is the open-source Intel
-`habanalabs` accelerator driver, pinned to a specific upstream revision.
+The open-source Intel `habanalabs` accelerator driver. The upstream source is
+47 MB, so it is not committed. Instead:
+
+- `habanalabs/SOURCE` pins the exact upstream package, version, and sha256.
+- `habanalabs/fetch.sh` downloads that package, verifies the checksum, extracts
+  the source into `habanalabs/src/` (git-ignored), and applies the patch series
+  from `../patches/habanalabs-1.19.0-561/`.
+
+```console
+vendor/habanalabs/fetch.sh          # needs the Intel Gaudi vault apt repo
+DEB_PATH=/path/to.deb vendor/habanalabs/fetch.sh   # or a pre-downloaded .deb
+```
 
 ## Rules
 
-- Files here are a faithful copy of a specific upstream revision. Record the
-  source URL and the exact commit or tag in a `SOURCE` file alongside each
-  vendored tree.
-- Do not edit vendored files in place. All modifications live under
-  `../patches/` and are applied on top of the pinned revision.
-- Upstream licenses are preserved verbatim within each vendored tree and govern
-  that tree regardless of the repository's own license.
+- `SOURCE` records the exact upstream revision and checksum. Do not edit the
+  fetched tree in place; all changes live under `../patches/` and are applied by
+  `fetch.sh`.
+- Upstream licenses (the habanalabs driver is GPL-2.0) govern the fetched tree
+  regardless of this repository's own license.

@@ -8,10 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- Workspace scaffold with three crates: `reng-core`, `reng-hal`, `reng-cli`.
+- Workspace scaffold with four crates: `reng-core`, `reng-hal`, `reng-ceiling`,
+  `reng-cli`.
 - `reng-core`: dtype, tensor shape, and device-identifier types.
 - `reng-hal`: Gaudi2 device discovery through the kernel `accel` subsystem,
   with silicon-stepping detection and no vendor-userspace dependency.
-- `reng devices` CLI command.
+- `reng-ceiling`: first-principles roofline calculator for prefill and decode
+  ceilings on Gaudi2, MoE-aware, driven from a HuggingFace `config.json`.
+- `reng devices` and `reng ceiling` CLI commands.
+- Vendored (by reference) the habanalabs driver, with patch 0001 guarding the
+  Gaudi2 MIN/MAX macros so the 1.19.0 driver builds on kernel 6.8+.
 - CI pipeline (build, format, clippy, tests, coverage) and self-hosted status
   badges.

@@ -4,3 +4,6 @@
 *.log
 cov.json
 .DS_Store
+
+# Vendored driver source is reconstructed by vendor/habanalabs/fetch.sh, not committed.
+/vendor/habanalabs/src/

@@ -1,0 +1,26 @@
+Subject: [PATCH 0001] gaudi2: guard local MIN/MAX macro definitions
+
+Kernel 6.8 provides MIN() and MAX() in <linux/minmax.h>. The Gaudi2 HBM
+bringup source defines its own MIN/MAX, which trips -Werror=macro-redefined
+and fails the out-of-tree DKMS build on kernel 6.8 and newer. Guard the local
+definitions with #ifndef so they yield to the kernel's definitions when
+present and remain intact on older kernels that lack them.
+
+Verified: rebuilds cleanly on Ubuntu 24.04 kernel 6.8.0-139-generic.
+Applies to: habanalabs-dkms 1.19.0-561 (see ../../vendor/habanalabs/SOURCE).
+
+--- a/drivers/accel/habanalabs/gaudi2/gaudi2_hbm_bringup.c
++++ b/drivers/accel/habanalabs/gaudi2/gaudi2_hbm_bringup.c
+@@ -71,8 +71,12 @@
+ #define PHY_RREG(addr) hbm_phy_read(hdev, dev, addr)
+ #define PHY_WREG(addr, val) hbm_phy_write(hdev, dev, addr, val)
+ #define CEIL(numerator, denominator) ((numerator + denominator - 1) / (denominator))
++#ifndef MIN
+ #define MIN(a, b) ((a < b) ? a : b)
++#endif
++#ifndef MAX
+ #define MAX(a, b) ((a > b) ? a : b)
++#endif
+
+ #define phy_poll_timeout(hdev, hbm_dev, addr, val, cond, sleep_us, timeout_us) \
+ ({ \

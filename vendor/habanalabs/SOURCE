@@ -1,0 +1,14 @@
+# Vendored by reference: Intel habanalabs accelerator driver (DKMS source).
+#
+# The 47 MB upstream source tree is not committed. fetch.sh pins the exact
+# upstream package below, verifies its checksum, extracts the source, and
+# applies the patch series in ../../patches/habanalabs-1.19.0-561/.
+
+package:  habanalabs-dkms
+version:  1.19.0-561
+arch:     all
+file:     habanalabs-dkms_1.19.0-561_all.deb
+sha256:   9545f71e93c6d137558189faa4d52b613e5b36e8ef44468279cda5a6bc6e8abb
+repo:     https://vault.habana.ai/artifactory/debian noble main
+extracts: usr/src/habanalabs-1.19.0-561/
+license:  GPL-2.0 (see the source tree headers and its COPYING file)

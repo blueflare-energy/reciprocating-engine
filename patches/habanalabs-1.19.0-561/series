@@ -1,0 +1,3 @@
+# Patch series for habanalabs-dkms 1.19.0-561, applied in order onto the
+# vendored source (see ../../vendor/habanalabs/fetch.sh).
+0001-guard-min-max-macros.patch
