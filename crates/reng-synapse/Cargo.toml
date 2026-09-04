@@ -31,3 +31,8 @@ required-features = ["link-synapse"]
 name = "reng-mme-chain"
 path = "src/bin/mme_chain.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-softmax-test"
+path = "src/bin/softmax_test.rs"
+required-features = ["link-synapse"]

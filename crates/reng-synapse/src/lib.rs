@@ -53,6 +53,12 @@ mod chain;
 pub use chain::{matmul_chain_bf16, matmul_chain_cpu};
 
 #[cfg(feature = "link-synapse")]
+mod ops;
+
+#[cfg(feature = "link-synapse")]
+pub use ops::{softmax_bf16, softmax_cpu};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as

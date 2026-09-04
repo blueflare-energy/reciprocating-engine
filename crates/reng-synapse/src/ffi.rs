@@ -37,6 +37,12 @@ pub struct synGEMMParams {
     pub transpose_b: bool,
 }
 
+/// ns_Softmax::Params { int dim; } — the axis (FCD-first) to softmax over.
+#[repr(C)]
+pub struct synSoftmaxParams {
+    pub dim: c_int,
+}
+
 #[repr(C)]
 pub struct synLaunchTensorInfo {
     pub tensor_name: *const c_char,
