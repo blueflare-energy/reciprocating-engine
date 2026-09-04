@@ -1,10 +1,11 @@
 //! Rust interface to the Intel Gaudi SynapseAI graph compiler.
 //!
-//! The public surface is small: bf16 conversion helpers, a CPU reference
-//! matmul, and (behind the `link-synapse` feature) [`matmul_bf16`], which runs
-//! `C = A @ B` on the Gaudi2 MME through the SynapseAI C API. The feature gates
-//! everything that links `libSynapse`, so the crate still builds as a plain
-//! rlib on hosts without the Habana libraries.
+//! The public surface: bf16 conversion helpers, a CPU reference matmul, and
+//! (behind the `link-synapse` feature) [`MatmulHpu`], a compile-once /
+//! launch-many bf16 matmul on the Gaudi2 MME, plus the [`matmul_bf16`]
+//! convenience wrapper. The feature gates everything that links `libSynapse`,
+//! so the crate still builds as a plain rlib on hosts without the Habana
+//! libraries.
 
 /// Convert an `f32` to bf16 bits, rounding to nearest even.
 #[must_use]
@@ -45,20 +46,16 @@ pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 #[cfg(feature = "link-synapse")]
 mod ffi;
 
+#[cfg(feature = "link-synapse")]
+pub use hpu::MatmulHpu;
+
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as
-/// `f32`.
-///
-/// Inputs are row-major `f32`; they are rounded to bf16, computed on the HPU
-/// (with FP32 accumulation), and converted back. Requires `libSynapse` at link
-/// time (the `link-synapse` feature) and a Gaudi2 device at run time.
+/// `f32`. Convenience one-shot; use [`MatmulHpu`] to compile once and launch
+/// many times.
 ///
 /// # Errors
 ///
 /// Returns an error if any SynapseAI call fails.
-///
-/// # Panics
-///
-/// Panics if `a.len() != m*k` or `b.len() != k*n`.
 #[cfg(feature = "link-synapse")]
 pub fn matmul_bf16(
     a: &[f32],
@@ -67,13 +64,16 @@ pub fn matmul_bf16(
     k: usize,
     n: usize,
 ) -> reng_core::Result<Vec<f32>> {
-    use core::ffi::c_void;
-    use ffi::*;
-    use reng_core::Error;
-    use std::ffi::CString;
+    MatmulHpu::new(m, k, n)?.run(a, b)
+}
 
-    assert_eq!(a.len(), m * k);
-    assert_eq!(b.len(), k * n);
+#[cfg(feature = "link-synapse")]
+mod hpu {
+    use super::{bf16_to_f32, f32_to_bf16};
+    use crate::ffi::*;
+    use core::ffi::c_void;
+    use reng_core::{Error, Result};
+    use std::ffi::CString;
 
     macro_rules! syn {
         ($call:expr) => {{
@@ -87,202 +87,313 @@ pub fn matmul_bf16(
         }};
     }
 
-    syn!(synInitialize());
-    let mut graph: synGraphHandle = core::ptr::null_mut();
-    syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
-
-    // Persistent bf16 tensors. Synapse sizes are FCD-first (fastest dim first):
-    // A[m,k] -> [k,m], B[k,n] -> [n,k], C[m,n] -> [n,m].
-    let names = [
-        CString::new("A").unwrap(),
-        CString::new("B").unwrap(),
-        CString::new("C").unwrap(),
-    ];
-    let sizes: [[u64; 2]; 3] = [
-        [k as u64, m as u64],
-        [n as u64, k as u64],
-        [n as u64, m as u64],
-    ];
-    let mut tensors: Vec<synTensor> = Vec::with_capacity(3);
-    for (name, dims) in names.iter().zip(sizes.iter()) {
-        let mut sec: synSectionHandle = core::ptr::null_mut();
-        syn!(synSectionCreate(&mut sec, 0, graph));
-        syn!(synSectionSetPersistent(sec, true));
-        let mut t: synTensor = core::ptr::null_mut();
-        syn!(synTensorHandleCreate(
-            &mut t,
-            graph,
-            SYN_TENSOR_DATA,
-            name.as_ptr()
-        ));
-        syn!(synTensorAssignToSection(t, sec, 0));
-        let mut geo = synTensorGeometry {
-            sizes: [0; HABANA_DIM_MAX],
-            dims: 2,
-        };
-        geo.sizes[0] = dims[0];
-        geo.sizes[1] = dims[1];
-        syn!(synTensorSetGeometry(t, &geo, SYN_GEOMETRY_SIZES));
-        syn!(synTensorSetDeviceDataType(t, SYN_TYPE_BF16));
-        tensors.push(t);
+    /// A compiled bf16 matmul `C[m,n] = A[m,k] @ B[k,n]` on the Gaudi2 MME.
+    ///
+    /// The graph is compiled to a recipe once in [`MatmulHpu::new`]; each
+    /// [`MatmulHpu::run`] copies inputs in, launches the recipe, and copies the
+    /// result out. Device and host buffers are held for the lifetime of the
+    /// handle and released on drop.
+    pub struct MatmulHpu {
+        m: usize,
+        k: usize,
+        n: usize,
+        dev: synDeviceId,
+        graph: synGraphHandle,
+        recipe: synRecipeHandle,
+        stream: synStreamHandle,
+        dev_a: u64,
+        dev_b: u64,
+        dev_c: u64,
+        ws_addr: u64,
+        host_a: *mut c_void,
+        host_b: *mut c_void,
+        host_c: *mut c_void,
+        names: [CString; 3],
+        ids: [u64; 3],
+        sizes: [[u64; 2]; 3],
     }
 
-    let params = synGEMMParams {
-        transpose_a: false,
-        transpose_b: false,
-    };
-    let inputs = [tensors[0], tensors[1]];
-    let outputs = [tensors[2]];
-    let guid = CString::new("gemm").unwrap();
-    let node_name = CString::new("mm").unwrap();
-    syn!(synNodeCreate(
-        graph,
-        inputs.as_ptr(),
-        outputs.as_ptr(),
-        2,
-        1,
-        (&raw const params).cast::<c_void>(),
-        core::mem::size_of::<synGEMMParams>() as u32,
-        guid.as_ptr(),
-        node_name.as_ptr(),
-        core::ptr::null(),
-        core::ptr::null(),
-    ));
+    impl MatmulHpu {
+        /// Build the graph and compile the recipe, then acquire a device and
+        /// allocate the input, output, and workspace buffers.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if any SynapseAI call fails.
+        ///
+        /// # Panics
+        ///
+        /// Never panics; dimensions are validated by [`MatmulHpu::run`].
+        pub fn new(m: usize, k: usize, n: usize) -> Result<Self> {
+            syn!(synInitialize());
+            let mut graph: synGraphHandle = core::ptr::null_mut();
+            syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
 
-    let recipe_name = CString::new("mm").unwrap();
-    let mut recipe: synRecipeHandle = core::ptr::null_mut();
-    syn!(synGraphCompile(
-        &mut recipe,
-        graph,
-        recipe_name.as_ptr(),
-        core::ptr::null()
-    ));
+            // Synapse sizes are FCD-first: A[m,k]->[k,m], B[k,n]->[n,k], C->[n,m].
+            let names = [
+                CString::new("A").unwrap(),
+                CString::new("B").unwrap(),
+                CString::new("C").unwrap(),
+            ];
+            let sizes: [[u64; 2]; 3] = [
+                [k as u64, m as u64],
+                [n as u64, k as u64],
+                [n as u64, m as u64],
+            ];
+            let mut tensors: Vec<synTensor> = Vec::with_capacity(3);
+            for (name, dims) in names.iter().zip(sizes.iter()) {
+                let mut sec: synSectionHandle = core::ptr::null_mut();
+                syn!(synSectionCreate(&mut sec, 0, graph));
+                syn!(synSectionSetPersistent(sec, true));
+                let mut t: synTensor = core::ptr::null_mut();
+                syn!(synTensorHandleCreate(
+                    &mut t,
+                    graph,
+                    SYN_TENSOR_DATA,
+                    name.as_ptr()
+                ));
+                syn!(synTensorAssignToSection(t, sec, 0));
+                let mut geo = synTensorGeometry {
+                    sizes: [0; HABANA_DIM_MAX],
+                    dims: 2,
+                };
+                geo.sizes[0] = dims[0];
+                geo.sizes[1] = dims[1];
+                syn!(synTensorSetGeometry(t, &geo, SYN_GEOMETRY_SIZES));
+                syn!(synTensorSetDeviceDataType(t, SYN_TYPE_BF16));
+                tensors.push(t);
+            }
 
-    // The recipe validates persistent tensors at launch by id, so retrieve the
-    // ids the compiler assigned to A, B, and C by name.
-    let name_ptrs: [*const core::ffi::c_char; 3] =
-        [names[0].as_ptr(), names[1].as_ptr(), names[2].as_ptr()];
-    let mut ids: [u64; 3] = [0; 3];
-    syn!(synTensorRetrieveIds(
-        recipe,
-        name_ptrs.as_ptr(),
-        ids.as_mut_ptr(),
-        3
-    ));
+            let params = synGEMMParams {
+                transpose_a: false,
+                transpose_b: false,
+            };
+            let inputs = [tensors[0], tensors[1]];
+            let outputs = [tensors[2]];
+            let guid = CString::new("gemm").unwrap();
+            let node_name = CString::new("mm").unwrap();
+            syn!(synNodeCreate(
+                graph,
+                inputs.as_ptr(),
+                outputs.as_ptr(),
+                2,
+                1,
+                (&raw const params).cast::<c_void>(),
+                core::mem::size_of::<synGEMMParams>() as u32,
+                guid.as_ptr(),
+                node_name.as_ptr(),
+                core::ptr::null(),
+                core::ptr::null(),
+            ));
 
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+            let recipe_name = CString::new("mm").unwrap();
+            let mut recipe: synRecipeHandle = core::ptr::null_mut();
+            syn!(synGraphCompile(
+                &mut recipe,
+                graph,
+                recipe_name.as_ptr(),
+                core::ptr::null()
+            ));
 
-    let bytes_a = (m * k * 2) as u64;
-    let bytes_b = (k * n * 2) as u64;
-    let bytes_c = (m * n * 2) as u64;
+            let name_ptrs: [*const core::ffi::c_char; 3] =
+                [names[0].as_ptr(), names[1].as_ptr(), names[2].as_ptr()];
+            let mut ids: [u64; 3] = [0; 3];
+            syn!(synTensorRetrieveIds(
+                recipe,
+                name_ptrs.as_ptr(),
+                ids.as_mut_ptr(),
+                3
+            ));
 
-    let (mut dev_a, mut dev_b, mut dev_c) = (0u64, 0u64, 0u64);
-    syn!(synDeviceMalloc(dev, bytes_a, 0, 0, &mut dev_a));
-    syn!(synDeviceMalloc(dev, bytes_b, 0, 0, &mut dev_b));
-    syn!(synDeviceMalloc(dev, bytes_c, 0, 0, &mut dev_c));
+            let mut dev: synDeviceId = 0;
+            syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
 
-    let mut ws_size = 0u64;
-    syn!(synWorkspaceGetSize(&mut ws_size, recipe));
-    let mut ws_addr = 0u64;
-    if ws_size > 0 {
-        syn!(synDeviceMalloc(dev, ws_size, 0, 0, &mut ws_addr));
-    }
+            let bytes_a = (m * k * 2) as u64;
+            let bytes_b = (k * n * 2) as u64;
+            let bytes_c = (m * n * 2) as u64;
 
-    let (mut host_a, mut host_b, mut host_c): (*mut c_void, *mut c_void, *mut c_void) = (
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    );
-    syn!(synHostMalloc(dev, bytes_a, 0, &mut host_a));
-    syn!(synHostMalloc(dev, bytes_b, 0, &mut host_b));
-    syn!(synHostMalloc(dev, bytes_c, 0, &mut host_c));
+            let (mut dev_a, mut dev_b, mut dev_c) = (0u64, 0u64, 0u64);
+            syn!(synDeviceMalloc(dev, bytes_a, 0, 0, &mut dev_a));
+            syn!(synDeviceMalloc(dev, bytes_b, 0, 0, &mut dev_b));
+            syn!(synDeviceMalloc(dev, bytes_c, 0, 0, &mut dev_c));
 
-    // SAFETY: host buffers were just allocated with the matching byte sizes.
-    unsafe {
-        let ha = host_a.cast::<u16>();
-        for (idx, &v) in a.iter().enumerate() {
-            *ha.add(idx) = f32_to_bf16(v);
+            let mut ws_size = 0u64;
+            syn!(synWorkspaceGetSize(&mut ws_size, recipe));
+            let mut ws_addr = 0u64;
+            if ws_size > 0 {
+                syn!(synDeviceMalloc(dev, ws_size, 0, 0, &mut ws_addr));
+            }
+
+            let (mut host_a, mut host_b, mut host_c): (*mut c_void, *mut c_void, *mut c_void) = (
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+            syn!(synHostMalloc(dev, bytes_a, 0, &mut host_a));
+            syn!(synHostMalloc(dev, bytes_b, 0, &mut host_b));
+            syn!(synHostMalloc(dev, bytes_c, 0, &mut host_c));
+
+            Ok(Self {
+                m,
+                k,
+                n,
+                dev,
+                graph,
+                recipe,
+                stream: core::ptr::null_mut(),
+                dev_a,
+                dev_b,
+                dev_c,
+                ws_addr,
+                host_a,
+                host_b,
+                host_c,
+                names,
+                ids,
+                sizes,
+            })
+            .and_then(Self::with_stream)
         }
-        let hb = host_b.cast::<u16>();
-        for (idx, &v) in b.iter().enumerate() {
-            *hb.add(idx) = f32_to_bf16(v);
+
+        fn with_stream(mut self) -> Result<Self> {
+            let mut stream: synStreamHandle = core::ptr::null_mut();
+            syn!(synStreamCreateGeneric(&mut stream, self.dev, 0));
+            self.stream = stream;
+            Ok(self)
+        }
+
+        fn infos(&self) -> [synLaunchTensorInfo; 3] {
+            let addrs = [self.dev_a, self.dev_b, self.dev_c];
+            core::array::from_fn(|i| {
+                let mut ti = synLaunchTensorInfo {
+                    tensor_name: self.names[i].as_ptr(),
+                    tensor_address: addrs[i],
+                    tensor_type: SYN_TENSOR_DATA,
+                    tensor_size: [0; HABANA_DIM_MAX],
+                    tensor_id: self.ids[i],
+                };
+                ti.tensor_size[0] = self.sizes[i][0];
+                ti.tensor_size[1] = self.sizes[i][1];
+                ti
+            })
+        }
+
+        /// Launch the compiled recipe once, reusing whatever inputs are already
+        /// resident on the device. Use it to time steady-state throughput after
+        /// a [`MatmulHpu::run`].
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the launch or synchronization fails.
+        pub fn launch_only(&self) -> Result<()> {
+            let infos = self.infos();
+            syn!(synLaunch(
+                self.stream,
+                infos.as_ptr(),
+                3,
+                self.ws_addr,
+                self.recipe,
+                0
+            ));
+            syn!(synStreamSynchronize(self.stream));
+            Ok(())
+        }
+
+        /// Copy `a` and `b` to the device, launch, and return `C` as `f32`.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if any SynapseAI call fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `a.len() != m*k` or `b.len() != k*n`.
+        pub fn run(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+            assert_eq!(a.len(), self.m * self.k);
+            assert_eq!(b.len(), self.k * self.n);
+            let bytes_a = (self.m * self.k * 2) as u64;
+            let bytes_b = (self.k * self.n * 2) as u64;
+            let bytes_c = (self.m * self.n * 2) as u64;
+
+            // SAFETY: host buffers were allocated in `new` with these sizes.
+            unsafe {
+                let ha = self.host_a.cast::<u16>();
+                for (idx, &v) in a.iter().enumerate() {
+                    *ha.add(idx) = f32_to_bf16(v);
+                }
+                let hb = self.host_b.cast::<u16>();
+                for (idx, &v) in b.iter().enumerate() {
+                    *hb.add(idx) = f32_to_bf16(v);
+                }
+            }
+
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.host_a as u64,
+                bytes_a,
+                self.dev_a,
+                SYN_HOST_TO_DRAM
+            ));
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.host_b as u64,
+                bytes_b,
+                self.dev_b,
+                SYN_HOST_TO_DRAM
+            ));
+            syn!(synStreamSynchronize(self.stream));
+
+            self.launch_only()?;
+
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.dev_c,
+                bytes_c,
+                self.host_c as u64,
+                SYN_DRAM_TO_HOST
+            ));
+            syn!(synStreamSynchronize(self.stream));
+
+            let mut out = vec![0.0f32; self.m * self.n];
+            // SAFETY: host_c holds m*n bf16 values just copied from the device.
+            unsafe {
+                let hc = self.host_c.cast::<u16>();
+                for (idx, o) in out.iter_mut().enumerate() {
+                    *o = bf16_to_f32(*hc.add(idx));
+                }
+            }
+            Ok(out)
         }
     }
 
-    let mut stream: synStreamHandle = core::ptr::null_mut();
-    syn!(synStreamCreateGeneric(&mut stream, dev, 0));
-    syn!(synMemCopyAsync(
-        stream,
-        host_a as u64,
-        bytes_a,
-        dev_a,
-        SYN_HOST_TO_DRAM
-    ));
-    syn!(synMemCopyAsync(
-        stream,
-        host_b as u64,
-        bytes_b,
-        dev_b,
-        SYN_HOST_TO_DRAM
-    ));
-    syn!(synStreamSynchronize(stream));
-
-    let mk = |name: &CString, addr: u64, dims: [u64; 2], id: u64| {
-        let mut ti = synLaunchTensorInfo {
-            tensor_name: name.as_ptr(),
-            tensor_address: addr,
-            tensor_type: SYN_TENSOR_DATA,
-            tensor_size: [0; HABANA_DIM_MAX],
-            tensor_id: id,
-        };
-        ti.tensor_size[0] = dims[0];
-        ti.tensor_size[1] = dims[1];
-        ti
-    };
-    let infos = [
-        mk(&names[0], dev_a, sizes[0], ids[0]),
-        mk(&names[1], dev_b, sizes[1], ids[1]),
-        mk(&names[2], dev_c, sizes[2], ids[2]),
-    ];
-    syn!(synLaunch(stream, infos.as_ptr(), 3, ws_addr, recipe, 0));
-    syn!(synStreamSynchronize(stream));
-
-    syn!(synMemCopyAsync(
-        stream,
-        dev_c,
-        bytes_c,
-        host_c as u64,
-        SYN_DRAM_TO_HOST
-    ));
-    syn!(synStreamSynchronize(stream));
-
-    let mut out = vec![0.0f32; m * n];
-    // SAFETY: host_c holds m*n bf16 values just copied from the device.
-    unsafe {
-        let hc = host_c.cast::<u16>();
-        for (idx, o) in out.iter_mut().enumerate() {
-            *o = bf16_to_f32(*hc.add(idx));
+    impl Drop for MatmulHpu {
+        fn drop(&mut self) {
+            // Best-effort teardown; ignore errors on the way out.
+            unsafe {
+                if !self.host_a.is_null() {
+                    synHostFree(self.dev, self.host_a, 0);
+                }
+                if !self.host_b.is_null() {
+                    synHostFree(self.dev, self.host_b, 0);
+                }
+                if !self.host_c.is_null() {
+                    synHostFree(self.dev, self.host_c, 0);
+                }
+                synDeviceFree(self.dev, self.dev_a, 0);
+                synDeviceFree(self.dev, self.dev_b, 0);
+                synDeviceFree(self.dev, self.dev_c, 0);
+                if self.ws_addr != 0 {
+                    synDeviceFree(self.dev, self.ws_addr, 0);
+                }
+                if !self.stream.is_null() {
+                    synStreamDestroy(self.stream);
+                }
+                synGraphDestroy(self.graph);
+                synDeviceRelease(self.dev);
+                synDestroy();
+            }
         }
     }
-
-    // Best-effort teardown; ignore errors on the way out.
-    unsafe {
-        synHostFree(dev, host_a, 0);
-        synHostFree(dev, host_b, 0);
-        synHostFree(dev, host_c, 0);
-        synDeviceFree(dev, dev_a, 0);
-        synDeviceFree(dev, dev_b, 0);
-        synDeviceFree(dev, dev_c, 0);
-        if ws_addr != 0 {
-            synDeviceFree(dev, ws_addr, 0);
-        }
-        synStreamDestroy(stream);
-        synGraphDestroy(graph);
-        synDeviceRelease(dev);
-        synDestroy();
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

@@ -21,3 +21,8 @@ reng-core = { path = "../reng-core", version = "0.0.1" }
 name = "reng-hello-mme"
 path = "src/bin/hello_mme.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-mme-bench"
+path = "src/bin/mme_bench.rs"
+required-features = ["link-synapse"]
