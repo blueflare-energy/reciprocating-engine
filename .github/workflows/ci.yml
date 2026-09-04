@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['.github/badges/**']
+  pull_request:
+    branches: [main]
+
+# Least privilege by default: every job gets a read-only token. Only the
+# `badges` job (which commits rendered SVGs back to main) widens this.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  ci:
+    name: build / test / coverage
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.cov.outputs.coverage }}
+      tests: ${{ steps.cov.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: format
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+      - name: build
+        run: cargo build --workspace --locked
+      - name: test + coverage
+        id: cov
+        run: |
+          cargo llvm-cov --workspace --locked --json --output-path cov.json 2>&1 | tee testout.txt
+          passed=$(grep -hoE '[0-9]+ passed' testout.txt | awk '{s+=$1} END{print s+0}')
+          pct=$(python3 -c "import json;print(round(json.load(open('cov.json'))['data'][0]['totals']['lines']['percent'],1))")
+          echo "coverage=$pct" >> "$GITHUB_OUTPUT"
+          echo "tests=$passed" >> "$GITHUB_OUTPUT"
+          echo "tests passed: $passed | line coverage: ${pct}%"
+
+  badges:
+    name: badges
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tokei
+      - name: render badges
+        env:
+          COVERAGE: ${{ needs.ci.outputs.coverage }}
+          TESTS: ${{ needs.ci.outputs.tests }}
+        run: |
+          set -euo pipefail
+          code=$(tokei crates tools --output json | python3 -c "import json,sys;print(json.load(sys.stdin)['Total']['code'])")
+          loc=$(python3 -c "c=$code;print(f'{c/1000:.1f}K' if c>=1000 else str(c))")
+          crates=$(ls -d crates/*/ | wc -l | tr -d ' ')
+          deps=$(cargo metadata --format-version 1 --locked | python3 -c "import json,sys;m=json.load(sys.stdin);ws=set(m['workspace_members']);print(sum(1 for p in m['packages'] if p['id'] not in ws))")
+          covcol=$(python3 -c "c=float('${COVERAGE:-0}' or 0);print('#4c1' if c>=80 else '#dfb317' if c>=60 else '#e05d44')")
+          mkdir -p .github/badges
+          python3 tools/mkbadge.py "lines of code" "$loc"            "#007ec6"  .github/badges/loc.svg
+          python3 tools/mkbadge.py "crates"        "$crates"         "#007ec6"  .github/badges/crates.svg
+          python3 tools/mkbadge.py "dependencies"  "$deps"           "#007ec6"  .github/badges/deps.svg
+          python3 tools/mkbadge.py "tests"         "${TESTS} passing" "#4c1"    .github/badges/tests.svg
+          python3 tools/mkbadge.py "coverage"      "${COVERAGE}%"    "$covcol"  .github/badges/coverage.svg
+          python3 tools/mkbadge.py "code quality"  "A"               "#4c1"     .github/badges/quality.svg
+      - name: commit badges
+        run: |
+          git config user.name 'blueflare-ci'
+          git config user.email 'ci@blueflare.energy'
+          git add .github/badges/*.svg
+          if ! git diff --cached --quiet; then
+            git commit -m "ci: update badges [skip ci]"
+            git push
+          fi

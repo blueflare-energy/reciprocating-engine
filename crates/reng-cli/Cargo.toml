@@ -1,0 +1,17 @@
+[package]
+name = "reng-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line interface for the Reciprocating Engine."
+
+[[bin]]
+name = "reng"
+path = "src/main.rs"
+
+[dependencies]
+reng-core = { path = "../reng-core", version = "0.0.1" }
+reng-hal = { path = "../reng-hal", version = "0.0.1" }
+clap.workspace = true

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/blueflare-energy/reciprocating-engine"
+homepage = "https://github.com/blueflare-energy/reciprocating-engine"
+authors = ["BlueFlare Energy Solutions Inc."]
+description = "An open inference engine for Intel Gaudi2 accelerators, written in Rust."
+keywords = ["gaudi", "habana", "inference", "llm", "accelerator"]
+categories = ["hardware-support", "science"]
+
+[workspace.dependencies]
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

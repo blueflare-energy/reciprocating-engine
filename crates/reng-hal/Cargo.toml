@@ -1,0 +1,15 @@
+[package]
+name = "reng-hal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware abstraction layer for Intel Gaudi2 accelerators."
+
+[dependencies]
+reng-core = { path = "../reng-core", version = "0.0.1" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
