@@ -36,3 +36,8 @@ required-features = ["link-synapse"]
 name = "reng-softmax-test"
 path = "src/bin/softmax_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-attn-test"
+path = "src/bin/attn_test.rs"
+required-features = ["link-synapse"]

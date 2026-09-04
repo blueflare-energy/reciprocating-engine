@@ -59,6 +59,12 @@ mod ops;
 pub use ops::{softmax_bf16, softmax_cpu};
 
 #[cfg(feature = "link-synapse")]
+mod attn;
+
+#[cfg(feature = "link-synapse")]
+pub use attn::{attention_bf16, attention_cpu};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as
