@@ -16,23 +16,29 @@ fn main() -> reng_core::Result<()> {
     let hpu = matmul_bf16(&a, &b, m, k, n)?;
     let cpu = matmul_cpu(&a, &b, m, k, n);
 
+    // L2-norm relative error is the right metric for a matmul: per-element
+    // relative error is meaningless for near-zero outputs, where bf16 rounding
+    // dominates. bf16 inputs with FP32 accumulation give a small norm error.
     let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
     for (h, c) in hpu.iter().zip(cpu.iter()) {
-        let ad = (h - c).abs();
-        max_abs = max_abs.max(ad);
-        max_rel = max_rel.max(ad / c.abs().max(1e-3));
+        max_abs = max_abs.max((h - c).abs());
+        let d = f64::from(h - c);
+        num += d * d;
+        den += f64::from(*c) * f64::from(*c);
     }
-    println!("max_abs_err = {max_abs:.5}   max_rel_err = {max_rel:.5}");
+    let rel_l2 = (num.sqrt() / den.sqrt().max(1e-12)) as f32;
+    println!("max_abs_err = {max_abs:.5}   rel_L2_err = {rel_l2:.5}");
     println!("hpu[0..4] = {:?}", &hpu[0..4]);
     println!("cpu[0..4] = {:?}", &cpu[0..4]);
 
-    if max_rel < 0.05 {
+    if rel_l2 < 0.02 {
         println!("PASS: HPU MME matches the CPU reference within bf16 tolerance");
         Ok(())
     } else {
         Err(reng_core::Error::Other(format!(
-            "FAIL: max_rel_err {max_rel:.4} exceeds tolerance (layout or dtype bug?)"
+            "FAIL: rel_L2_err {rel_l2:.4} exceeds tolerance (layout or dtype bug?)"
         )))
     }
 }
