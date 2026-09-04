@@ -44,7 +44,13 @@ pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 }
 
 #[cfg(feature = "link-synapse")]
-mod ffi;
+pub(crate) mod ffi;
+
+#[cfg(feature = "link-synapse")]
+mod chain;
+
+#[cfg(feature = "link-synapse")]
+pub use chain::{matmul_chain_bf16, matmul_chain_cpu};
 
 #[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;

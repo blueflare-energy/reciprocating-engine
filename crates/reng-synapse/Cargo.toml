@@ -26,3 +26,8 @@ required-features = ["link-synapse"]
 name = "reng-mme-bench"
 path = "src/bin/mme_bench.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-mme-chain"
+path = "src/bin/mme_chain.rs"
+required-features = ["link-synapse"]
