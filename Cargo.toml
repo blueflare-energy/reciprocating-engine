@@ -18,6 +18,7 @@ categories = ["hardware-support", "science"]
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
+serde_json = "1"
 
 [profile.release]
 lto = "thin"

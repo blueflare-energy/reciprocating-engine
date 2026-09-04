@@ -14,4 +14,5 @@ path = "src/main.rs"
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
 reng-hal = { path = "../reng-hal", version = "0.0.1" }
+reng-ceiling = { path = "../reng-ceiling", version = "0.0.1" }
 clap.workspace = true
