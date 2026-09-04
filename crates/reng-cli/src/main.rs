@@ -1,11 +1,12 @@
 //! `reng`: the command-line entry point for the Reciprocating Engine.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use reng_ceiling::{
-    Bottleneck, Ceiling, HardwareSpec, Precision, decode_ceiling, fits, model_from_hf_config,
-    prefill_ceiling, vram_bytes,
+    Bottleneck, Ceiling, HardwareSpec, Precision, ceiling_grid, decode_ceiling, fits,
+    model_from_hf_config, prefill_ceiling, vram_bytes,
 };
 use reng_hal::enumerate_devices;
 
@@ -20,7 +21,7 @@ struct Cli {
 enum Cmd {
     /// List Gaudi2 accelerators visible to the host.
     Devices,
-    /// Compute first-principles prefill and decode ceilings for a model.
+    /// Compute first-principles prefill and decode ceilings for one scenario.
     Ceiling {
         /// Path to a HuggingFace config.json.
         #[arg(long)]
@@ -44,6 +45,27 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         cards: u32,
     },
+    /// Print a context-by-batch grid of ceilings (Chart 1/2).
+    Grid {
+        /// Path to a HuggingFace config.json.
+        #[arg(long)]
+        config: PathBuf,
+        /// Largest context to chart; halves down to 256.
+        #[arg(long, default_value_t = 32768)]
+        max_context: u32,
+        /// Weight precision.
+        #[arg(long, default_value = "bf16")]
+        precision: String,
+        /// KV-cache precision.
+        #[arg(long, default_value = "bf16")]
+        kv_precision: String,
+        /// Number of cards (tensor-parallel, idealized linear scaling).
+        #[arg(long, default_value_t = 1)]
+        cards: u32,
+        /// Which ceiling to chart: prefill or decode.
+        #[arg(long, default_value = "decode")]
+        mode: String,
+    },
 }
 
 fn main() -> reng_core::Result<()> {
@@ -58,6 +80,21 @@ fn main() -> reng_core::Result<()> {
             kv_precision,
             cards,
         } => ceiling(&config, seq, ctx, batch, &precision, &kv_precision, cards),
+        Cmd::Grid {
+            config,
+            max_context,
+            precision,
+            kv_precision,
+            cards,
+            mode,
+        } => grid(
+            &config,
+            max_context,
+            &precision,
+            &kv_precision,
+            cards,
+            &mode,
+        ),
     }
 }
 
@@ -89,8 +126,7 @@ fn ceiling(
     kv_precision: &str,
     cards: u32,
 ) -> reng_core::Result<()> {
-    let json = std::fs::read_to_string(config)?;
-    let model = model_from_hf_config(&json)?;
+    let model = model_from_hf_config(&std::fs::read_to_string(config)?)?;
     let hw = HardwareSpec::gaudi2();
     let prec = Precision::parse(precision)?;
     let kv = Precision::parse(kv_precision)?;
@@ -124,14 +160,97 @@ fn ceiling(
 }
 
 fn print_ceiling(c: &Ceiling) {
-    let bn = match c.bottleneck {
-        Bottleneck::Compute => "compute (MME)",
-        Bottleneck::HbmBandwidth => "HBM bandwidth",
-    };
     println!(
-        "  {:>12.1} tok/s   {:>9.3} ms   bottleneck: {bn}   AI={:.1} FLOP/byte",
+        "  {:>12.1} tok/s   {:>9.3} ms   bottleneck: {}   AI={:.1} FLOP/byte",
         c.tokens_per_s,
         c.latency_s * 1e3,
+        bottleneck_name(c.bottleneck),
         c.arithmetic_intensity,
     );
+}
+
+fn grid(
+    config: &Path,
+    max_context: u32,
+    precision: &str,
+    kv_precision: &str,
+    cards: u32,
+    mode: &str,
+) -> reng_core::Result<()> {
+    let model = model_from_hf_config(&std::fs::read_to_string(config)?)?;
+    let hw = HardwareSpec::gaudi2();
+    let prec = Precision::parse(precision)?;
+    let kv = Precision::parse(kv_precision)?;
+    let decode = match mode {
+        "decode" => true,
+        "prefill" => false,
+        other => {
+            return Err(reng_core::Error::Other(format!(
+                "mode must be prefill or decode, got {other:?}"
+            )));
+        }
+    };
+
+    let cells = ceiling_grid(&hw, &model, prec, kv, max_context, cards);
+    println!(
+        "{} ceiling (tok/s) for {} on {cards} x {} [{precision} weights, {kv_precision} KV]",
+        if decode { "decode" } else { "prefill" },
+        model.name,
+        hw.name,
+    );
+    if cells.is_empty() {
+        println!("  (model does not fit in aggregate HBM at any batch/context)");
+        return Ok(());
+    }
+
+    let contexts: Vec<u32> = {
+        let s: BTreeSet<u32> = cells.iter().map(|c| c.context).collect();
+        s.iter().rev().copied().collect::<Vec<_>>()
+    };
+    let batches: BTreeSet<u32> = cells.iter().map(|c| c.batch).collect();
+
+    // Header: batch\ctx, then one column per context.
+    print!("{:>7} ", "batch\\ctx");
+    for c in &contexts {
+        print!("{:>10}", human(f64::from(*c)));
+    }
+    println!();
+
+    for b in &batches {
+        print!("{b:>7} ");
+        for c in &contexts {
+            match cells.iter().find(|x| x.batch == *b && x.context == *c) {
+                Some(cell) => {
+                    let ce: &Ceiling = if decode { &cell.decode } else { &cell.prefill };
+                    let mark = match ce.bottleneck {
+                        Bottleneck::Compute => 'C',
+                        Bottleneck::HbmBandwidth => 'H',
+                    };
+                    print!("{:>9}{}", human(ce.tokens_per_s), mark);
+                }
+                None => print!("{:>10}", "-"),
+            }
+        }
+        println!();
+    }
+    println!("(C = compute-bound, H = HBM-bandwidth-bound; blank = exceeds HBM)");
+    Ok(())
+}
+
+fn bottleneck_name(b: Bottleneck) -> &'static str {
+    match b {
+        Bottleneck::Compute => "compute (MME)",
+        Bottleneck::HbmBandwidth => "HBM bandwidth",
+    }
+}
+
+/// Human-readable count: 1_500 -> "1.5k", 2_300_000 -> "2.3M".
+fn human(x: f64) -> String {
+    if x >= 1e6 {
+        format!("{:.1}M", x / 1e6)
+    } else if x >= 1e3 {
+        format!("{:.1}k", x / 1e3)
+    } else {
+        format!("{x:.0}")
+    }
 }

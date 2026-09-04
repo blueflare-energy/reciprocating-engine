@@ -323,6 +323,82 @@ pub fn fits(
     vram_bytes(model, prec, kv, batch, ctx_len) <= hw.hbm_bytes * u64::from(n_cards)
 }
 
+impl HardwareSpec {
+    /// Idealized linear scaling to `n` cards in tensor parallel: peak compute,
+    /// HBM bandwidth, and HBM capacity all multiply by `n`. This ignores
+    /// interconnect and synchronization overhead, so the result is an upper
+    /// bound on aggregate throughput.
+    #[must_use]
+    pub fn scaled(&self, n: u32) -> HardwareSpec {
+        let n = f64::from(n.max(1));
+        HardwareSpec {
+            name: self.name,
+            flops_bf16: self.flops_bf16 * n,
+            flops_fp16: self.flops_fp16 * n,
+            flops_fp8: self.flops_fp8 * n,
+            flops_fp32: self.flops_fp32 * n,
+            hbm_bytes: (self.hbm_bytes as f64 * n) as u64,
+            hbm_bw: self.hbm_bw * n,
+            sram_bytes: (self.sram_bytes as f64 * n) as u64,
+            pcie_bw: self.pcie_bw,
+        }
+    }
+}
+
+/// One cell of a ceiling grid: a (batch, context) scenario and its ceilings.
+#[derive(Debug, Clone)]
+pub struct GridCell {
+    pub batch: u32,
+    pub context: u32,
+    pub prefill: Ceiling,
+    pub decode: Ceiling,
+    pub vram_bytes: u64,
+}
+
+/// Compute a context-by-batch grid of ceilings on `n_cards` (tensor-parallel,
+/// idealized linear scaling).
+///
+/// Context runs as a descending power-of-two series from `max_context` down to
+/// 256; batch runs 1, 2, 4, ... and stops for a given context once the scenario
+/// no longer fits in aggregate HBM. Only fitting cells are returned. Prefill
+/// uses a prompt of `context` tokens at a 0% cache hit; decode uses a KV cache
+/// of `context` tokens.
+#[must_use]
+pub fn ceiling_grid(
+    hw: &HardwareSpec,
+    model: &ModelShape,
+    prec: Precision,
+    kv: Precision,
+    max_context: u32,
+    n_cards: u32,
+) -> Vec<GridCell> {
+    let agg = hw.scaled(n_cards);
+    let mut cells = Vec::new();
+    let mut ctx = max_context;
+    while ctx >= 256 {
+        let mut batch = 1u32;
+        loop {
+            let vram = vram_bytes(model, prec, kv, batch, ctx);
+            if vram > agg.hbm_bytes {
+                break;
+            }
+            cells.push(GridCell {
+                batch,
+                context: ctx,
+                prefill: prefill_ceiling(&agg, model, prec, kv, batch, ctx),
+                decode: decode_ceiling(&agg, model, prec, kv, batch, ctx),
+                vram_bytes: vram,
+            });
+            if batch >= 1024 {
+                break;
+            }
+            batch *= 2;
+        }
+        ctx /= 2;
+    }
+    cells
+}
+
 /// Build a [`ModelShape`] from a HuggingFace `config.json` string.
 ///
 /// # Errors
@@ -500,5 +576,22 @@ mod tests {
         assert_eq!(moe.n_experts, 64);
         assert_eq!(moe.top_k, 6);
         assert_eq!(moe.shared_experts, 2);
+    }
+
+    #[test]
+    fn grid_fits_and_scales() {
+        let hw = HardwareSpec::gaudi2();
+        let m = dense_7b();
+        let cells = ceiling_grid(&hw, &m, Precision::Bf16, Precision::Bf16, 8192, 1);
+        assert!(!cells.is_empty());
+        // Every returned cell fits in one card's HBM.
+        assert!(cells.iter().all(|c| c.vram_bytes <= hw.hbm_bytes));
+        // Eight cards admit at least as many fitting cells as one.
+        let cells8 = ceiling_grid(&hw, &m, Precision::Bf16, Precision::Bf16, 8192, 8);
+        assert!(cells8.len() >= cells.len());
+        // Aggregate decode ceiling on 8 cards beats a single card.
+        let d1 = decode_ceiling(&hw, &m, Precision::Bf16, Precision::Bf16, 1, 2048);
+        let d8 = decode_ceiling(&hw.scaled(8), &m, Precision::Bf16, Precision::Bf16, 1, 2048);
+        assert!(d8.tokens_per_s > d1.tokens_per_s * 5.0);
     }
 }
