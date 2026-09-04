@@ -1,0 +1,23 @@
+[package]
+name = "reng-synapse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust FFI to the Intel Gaudi SynapseAI graph API, with a minimal MME matmul."
+build = "build.rs"
+
+[features]
+# Off by default so the crate builds as a plain rlib on hosts without the
+# Habana libraries (for example hosted CI). Enable it on a Gaudi host to link
+# libSynapse and build the `reng-hello-mme` binary.
+link-synapse = []
+
+[dependencies]
+reng-core = { path = "../reng-core", version = "0.0.1" }
+
+[[bin]]
+name = "reng-hello-mme"
+path = "src/bin/hello_mme.rs"
+required-features = ["link-synapse"]
