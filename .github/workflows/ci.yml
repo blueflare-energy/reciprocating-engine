@@ -70,7 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           code=$(tokei crates tools --output json | python3 -c "import json,sys;print(json.load(sys.stdin)['Total']['code'])")
-          loc=$(python3 -c "c=$code;print(f'{c/1000:.1f}K' if c>=1000 else str(c))")
+          loc=$(python3 -c "c=$code;print(f'{c/1000:.1f}K')")
           crates=$(ls -d crates/*/ | wc -l | tr -d ' ')
           deps=$(cargo metadata --format-version 1 --locked | python3 -c "import json,sys;m=json.load(sys.stdin);ws=set(m['workspace_members']);print(sum(1 for p in m['packages'] if p['id'] not in ws))")
           covcol=$(python3 -c "c=float('${COVERAGE:-0}' or 0);print('#4c1' if c>=80 else '#dfb317' if c>=60 else '#e05d44')")
