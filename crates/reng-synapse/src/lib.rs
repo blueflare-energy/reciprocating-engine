@@ -158,6 +158,18 @@ pub fn matmul_bf16(
         core::ptr::null()
     ));
 
+    // The recipe validates persistent tensors at launch by id, so retrieve the
+    // ids the compiler assigned to A, B, and C by name.
+    let name_ptrs: [*const core::ffi::c_char; 3] =
+        [names[0].as_ptr(), names[1].as_ptr(), names[2].as_ptr()];
+    let mut ids: [u64; 3] = [0; 3];
+    syn!(synTensorRetrieveIds(
+        recipe,
+        name_ptrs.as_ptr(),
+        ids.as_mut_ptr(),
+        3
+    ));
+
     let mut dev: synDeviceId = 0;
     syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
 
@@ -216,22 +228,22 @@ pub fn matmul_bf16(
     ));
     syn!(synStreamSynchronize(stream));
 
-    let mk = |name: &CString, addr: u64, dims: [u64; 2]| {
+    let mk = |name: &CString, addr: u64, dims: [u64; 2], id: u64| {
         let mut ti = synLaunchTensorInfo {
             tensor_name: name.as_ptr(),
             tensor_address: addr,
             tensor_type: SYN_TENSOR_DATA,
             tensor_size: [0; HABANA_DIM_MAX],
-            tensor_id: 0,
+            tensor_id: id,
         };
         ti.tensor_size[0] = dims[0];
         ti.tensor_size[1] = dims[1];
         ti
     };
     let infos = [
-        mk(&names[0], dev_a, sizes[0]),
-        mk(&names[1], dev_b, sizes[1]),
-        mk(&names[2], dev_c, sizes[2]),
+        mk(&names[0], dev_a, sizes[0], ids[0]),
+        mk(&names[1], dev_b, sizes[1], ids[1]),
+        mk(&names[2], dev_c, sizes[2], ids[2]),
     ];
     syn!(synLaunch(stream, infos.as_ptr(), 3, ws_addr, recipe, 0));
     syn!(synStreamSynchronize(stream));

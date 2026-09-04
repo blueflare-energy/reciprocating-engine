@@ -130,6 +130,12 @@ unsafe extern "C" {
         inputLayouts: *const *const c_char,
         outputLayouts: *const *const c_char,
     ) -> synStatus;
+    pub fn synTensorRetrieveIds(
+        pRecipeHandle: synRecipeHandle,
+        tensorNames: *const *const c_char,
+        tensorIds: *mut u64,
+        numOfTensors: u32,
+    ) -> synStatus;
     pub fn synWorkspaceGetSize(
         pWorkspaceSize: *mut u64,
         recipeHandle: synRecipeHandle,
