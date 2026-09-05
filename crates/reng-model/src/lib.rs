@@ -409,12 +409,8 @@ impl<'a> Generator<'a> {
     }
 
     /// Forget the cached prefix.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the device memset fails.
-    pub fn reset(&mut self) -> Result<()> {
-        self.model.reset()
+    pub fn reset(&mut self) {
+        self.model.reset();
     }
 
     /// Append `ids` to the sequence (any length that fits the cache; fed in
@@ -496,7 +492,7 @@ impl<'a> BatchedGenerator<'a> {
     /// Panics if `ids` is empty or would overflow the cache.
     pub fn prefill(&mut self, b: usize, ids: &[u32]) -> Result<Vec<f32>> {
         assert!(!ids.is_empty());
-        self.model.reset(b)?;
+        self.model.reset(b);
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.prefill(b, &x)
     }

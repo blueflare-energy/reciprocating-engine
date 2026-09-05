@@ -12,13 +12,12 @@
 //! is batched over heads in 4-D tensors (`[.., heads-per-group, groups]`)
 //! so each step of it is one node for all heads.
 //!
-//! With a KV cache (see `cached.rs`) each layer reads per-head cache tensors
-//! `[head_dim, capacity]` and writes updated ones: the block's keys
-//! (after RoPE) and values are placed at their positions by a gemm with a
-//! 0/1 placement matrix and added to the cache read. Attention runs over
-//! the whole updated cache with a mask that admits positions up to each
-//! query's own. Every step of that data path is MME or TPC work inside the
-//! recipe; no DMA node touches the cache.
+//! With a KV cache (see `cached.rs`) each layer updates its cache tensors
+//! `[head_dim, capacity + 1, 1, kv_heads]` in place: an ONNX ScatterND
+//! update writes the block's rotated keys and values at their positions
+//! (index tensor uploaded per step). Attention runs over the whole cache
+//! with a mask that admits positions up to each query's own. No DMA node
+//! touches the cache.
 //!
 //! Launch and readback (including the completion protocol) live in
 //! `runtime.rs`. Diagnostic environment switches (all off by default):
@@ -76,6 +75,26 @@ pub(crate) fn make_tensor(
     dtype: core::ffi::c_int,
     persistent: bool,
 ) -> Result<(synTensor, CString)> {
+    let section = if persistent {
+        let mut sec: synSectionHandle = core::ptr::null_mut();
+        syn!(synSectionCreate(&mut sec, 0, graph));
+        syn!(synSectionSetPersistent(sec, true));
+        sec
+    } else {
+        core::ptr::null_mut()
+    };
+    make_tensor_in(graph, name, sizes, dtype, section)
+}
+
+/// Create a tensor; a non-null `section` makes it persistent in that section
+/// (at offset 0), so two tensors in one section alias the same memory.
+pub(crate) fn make_tensor_in(
+    graph: synGraphHandle,
+    name: &str,
+    sizes: &[u64],
+    dtype: core::ffi::c_int,
+    section: synSectionHandle,
+) -> Result<(synTensor, CString)> {
     let cname = CString::new(name).unwrap();
     let mut t: synTensor = core::ptr::null_mut();
     syn!(synTensorHandleCreate(
@@ -84,11 +103,8 @@ pub(crate) fn make_tensor(
         SYN_TENSOR_DATA,
         cname.as_ptr()
     ));
-    if persistent {
-        let mut sec: synSectionHandle = core::ptr::null_mut();
-        syn!(synSectionCreate(&mut sec, 0, graph));
-        syn!(synSectionSetPersistent(sec, true));
-        syn!(synTensorAssignToSection(t, sec, 0));
+    if !section.is_null() {
+        syn!(synTensorAssignToSection(t, section, 0));
     }
     let mut geo = synTensorGeometry {
         sizes: [0; HABANA_DIM_MAX],
@@ -114,6 +130,12 @@ pub(crate) struct Gb {
     pub scratch_sizes: Vec<Vec<u64>>,
     /// Whether each scratch tensor is f32 (else bf16); sizes count elements.
     pub scratch_f32: Vec<bool>,
+    /// For a scratch tensor that shares another scratch tensor's section
+    /// (in-place update), that tensor's name; the runtime binds both to one
+    /// buffer.
+    pub scratch_alias: Vec<Option<String>>,
+    /// Section of each scratch tensor (by name), for aliasing.
+    scratch_sections: std::collections::HashMap<String, synSectionHandle>,
     /// Node ids in creation order (a valid topological order for our graphs).
     node_ids: Vec<synNodeId>,
 }
@@ -136,6 +158,8 @@ impl Gb {
             scratch_names: Vec::new(),
             scratch_sizes: Vec::new(),
             scratch_f32: Vec::new(),
+            scratch_alias: Vec::new(),
+            scratch_sections: std::collections::HashMap::new(),
             node_ids: Vec::new(),
         })
     }
@@ -180,10 +204,34 @@ impl Gb {
         sizes: &[u64],
         dtype: core::ffi::c_int,
     ) -> Result<synTensor> {
-        let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
+        let mut sec: synSectionHandle = core::ptr::null_mut();
+        syn!(synSectionCreate(&mut sec, 0, self.graph));
+        syn!(synSectionSetPersistent(sec, true));
+        let (t, cname) = make_tensor_in(self.graph, name, sizes, dtype, sec)?;
+        self.scratch_sections.insert(name.to_owned(), sec);
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
         self.scratch_f32.push(dtype == SYN_TYPE_F32);
+        self.scratch_alias.push(None);
+        Ok(t)
+    }
+
+    /// A persistent bf16 tensor in the same section (same memory) as the
+    /// scratch tensor named `of`: the output side of an in-place update.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `of` is not a scratch tensor of this graph.
+    pub fn scratch_alias(&mut self, name: &str, sizes: &[u64], of: &str) -> Result<synTensor> {
+        let sec = *self
+            .scratch_sections
+            .get(of)
+            .unwrap_or_else(|| panic!("no scratch tensor named {of}"));
+        let (t, cname) = make_tensor_in(self.graph, name, sizes, SYN_TYPE_BF16, sec)?;
+        self.scratch_names.push(cname);
+        self.scratch_sizes.push(sizes.to_vec());
+        self.scratch_f32.push(false);
+        self.scratch_alias.push(Some(of.to_owned()));
         Ok(t)
     }
 
@@ -249,17 +297,20 @@ pub(crate) struct Shared {
     /// (broadcast over heads).
     pub mask: Option<synTensor>,
     /// KV-cache capacity in positions. When set, every layer gets cache
-    /// input and output tensors (see [`cache_names`]) of `capacity`
-    /// positions, which is also the key axis of the scores.
+    /// input and output tensors (see [`cache_names`]) of `capacity + 1`
+    /// positions (the last is a trash slot padded rows are written to),
+    /// which is also the key axis of the scores.
     pub cache: Option<usize>,
-    /// The placement matrix input (`[tokens, capacity, 1, 1]` device sizes:
-    /// row r of the block goes to the position whose entry is 1).
-    pub place: Option<synTensor>,
+    /// The int32 scatter indices input, `[3, tokens * groups]` device sizes:
+    /// update `r + tokens * g` (row r of KV head g) goes to ONNX index
+    /// `(g, 0, position)` of the `[hd, keys, 1, groups]` cache.
+    pub kidx: Option<synTensor>,
 }
 
 /// Persistent tensor names of layer `li`'s cache state:
 /// `(k_cache_in, v_cache_in, k_cache_out, v_cache_out)`, each
-/// `[head_dim, capacity, 1, n_kv_heads]` (keys after RoPE).
+/// `[head_dim, capacity + 1, 1, n_kv_heads]` (keys after RoPE); the "out"
+/// tensors alias the "in" ones (in-place scatter).
 #[must_use]
 pub fn cache_names(li: usize) -> (String, String, String, String) {
     (
@@ -276,6 +327,13 @@ pub fn cache_names(li: usize) -> (String, String, String, String) {
 struct TransposeParams {
     permutation: [u32; 5],
     tensor_dim: u32,
+}
+
+/// `ns_ScatterNdUpdateKernel::Params`: 0 = non-deterministic on duplicate
+/// indices (the padded rows all hit the trash slot, whose value is unused).
+#[repr(C)]
+struct ScatterNdUpdateParams {
+    mode: i32,
 }
 
 /// Append one decoder layer reading `x` and return its output tensor. When
@@ -314,8 +372,9 @@ pub(crate) fn build_layer(
         hpg_us as u64,
         nkv as u64,
     );
-    // Key axis of the score matrices: the block alone, or the whole cache.
-    let keys = sh.cache.map_or(t, |c| c as u64);
+    // Key axis of the score matrices: the block alone, or the whole cache
+    // (its usable positions plus the trash slot).
+    let keys = sh.cache.map_or(t, |c| c as u64 + 1);
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
 
@@ -421,6 +480,11 @@ pub(crate) fn build_layer(
         (&raw const tr).cast::<c_void>(),
         core::mem::size_of::<TransposeParams>() as u32,
     );
+    let scatter = ScatterNdUpdateParams { mode: 0 };
+    let psc = (
+        (&raw const scatter).cast::<c_void>(),
+        core::mem::size_of::<ScatterNdUpdateParams>() as u32,
+    );
     let none = (core::ptr::null::<c_void>(), 0u32);
 
     gb.node(
@@ -511,46 +575,35 @@ pub(crate) fn build_layer(
     )?;
 
     // Keys and values attention reads: the block's own, or the cache updated
-    // with the block: `cache_out = cache_in + place @ block` (see cached.rs).
-    let (k_full, v_full) = if let Some(place) = sh.place {
+    // in place with the block: an ONNX ScatterND update writes each real row
+    // of the rotated keys and of the values at its position (padded rows go
+    // to the trash slot); the "out" tensor aliases the "in" one, so only the
+    // written rows move (see cached.rs).
+    let (k_full, v_full) = if let Some(kidx) = sh.kidx {
         let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
         let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups])?;
         let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups])?;
-        let kco = gb.scratch(&n_kco, &[hd, keys, 1, groups])?;
-        let vco = gb.scratch(&n_vco, &[hd, keys, 1, groups])?;
-        let kp = gb.mid(&p("kp"), &[hd, keys, 1, groups], bf)?;
-        let vp = gb.mid(&p("vp"), &[hd, keys, 1, groups], bf)?;
+        let kco = gb.scratch_alias(&n_kco, &[hd, keys, 1, groups], &n_kci)?;
+        let vco = gb.scratch_alias(&n_vco, &[hd, keys, 1, groups], &n_vci)?;
+        let kru = gb.mid(&p("kru"), &[hd, t * groups], bf)?;
+        let vu = gb.mid(&p("vu"), &[hd, t * groups], bf)?;
+        gb.node("reshape", &p("kr_updates"), &[t_kr], &[kru], none.0, none.1)?;
+        gb.node("reshape", &p("v_updates"), &[t_v], &[vu], none.0, none.1)?;
         gb.node(
-            "batch_gemm",
-            &p("k_place"),
-            &[place, t_kr],
-            &[kp],
-            pg.0,
-            pg.1,
-        )?;
-        gb.node(
-            "batch_gemm",
-            &p("v_place"),
-            &[place, t_v],
-            &[vp],
-            pg.0,
-            pg.1,
-        )?;
-        gb.node(
-            "add_fwd_bf16",
-            &p("k_cache"),
-            &[kci, kp],
+            "scatter_nd_update_fwd_bf16",
+            &p("k_scatter"),
+            &[kci, kidx, kru],
             &[kco],
-            none.0,
-            none.1,
+            psc.0,
+            psc.1,
         )?;
         gb.node(
-            "add_fwd_bf16",
-            &p("v_cache"),
-            &[vci, vp],
+            "scatter_nd_update_fwd_bf16",
+            &p("v_scatter"),
+            &[vci, kidx, vu],
             &[vco],
-            none.0,
-            none.1,
+            psc.0,
+            psc.1,
         )?;
         (kco, vco)
     } else {
@@ -683,8 +736,10 @@ pub(crate) struct SharedBatched {
     pub cos: synTensor,
     /// Additive mask per sequence, `[keys, 1, 1, 1, B]`.
     pub mask: synTensor,
-    /// Placement per sequence, `[1, keys, 1, 1, B]`.
-    pub place: synTensor,
+    /// Int32 scatter indices, `[4, groups * B]`: update `g + groups * b`
+    /// goes to ONNX index `(b, g, 0, position_b)` of the
+    /// `[hd, keys, 1, groups, B]` cache.
+    pub kidx: synTensor,
     pub capacity: usize,
     pub batch: usize,
 }
@@ -719,7 +774,7 @@ pub(crate) fn build_layer_batched(
         hd_us as u64,
         hpg_us as u64,
         nkv as u64,
-        sh.capacity as u64,
+        sh.capacity as u64 + 1,
         sh.batch as u64,
     );
     let bf = SYN_TYPE_BF16;
@@ -754,10 +809,10 @@ pub(crate) fn build_layer_batched(
     let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
     let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups, b])?;
     let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups, b])?;
-    let kco = gb.scratch(&n_kco, &[hd, keys, 1, groups, b])?;
-    let vco = gb.scratch(&n_vco, &[hd, keys, 1, groups, b])?;
-    let t_kp = gb.mid(&p("kp"), &[hd, keys, 1, groups, b], bf)?;
-    let t_vp = gb.mid(&p("vp"), &[hd, keys, 1, groups, b], bf)?;
+    let kco = gb.scratch_alias(&n_kco, &[hd, keys, 1, groups, b], &n_kci)?;
+    let vco = gb.scratch_alias(&n_vco, &[hd, keys, 1, groups, b], &n_vci)?;
+    let t_kru = gb.mid(&p("kru"), &[hd, groups * b], bf)?;
+    let t_vu = gb.mid(&p("vu"), &[hd, groups * b], bf)?;
     let t_sc = gb.mid(&p("scores"), &[keys, 1, hpg, groups, b], bf)?;
     let t_masked = gb.mid(&p("masked"), &[keys, 1, hpg, groups, b], bf)?;
     let t_pr = gb.mid(&p("probs"), &[keys, 1, hpg, groups, b], bf)?;
@@ -810,6 +865,11 @@ pub(crate) fn build_layer_batched(
     let ps = (
         (&raw const sm).cast::<c_void>(),
         core::mem::size_of::<synSoftmaxParams>() as u32,
+    );
+    let scatter = ScatterNdUpdateParams { mode: 0 };
+    let psc = (
+        (&raw const scatter).cast::<c_void>(),
+        core::mem::size_of::<ScatterNdUpdateParams>() as u32,
     );
     let none = (core::ptr::null::<c_void>(), 0u32);
 
@@ -881,36 +941,29 @@ pub(crate) fn build_layer_batched(
         pr.1,
     )?;
     gb.node(
-        "batch_gemm",
-        &p("k_place"),
-        &[sh.place, t_kr],
-        &[t_kp],
-        pg.0,
-        pg.1,
+        "reshape",
+        &p("kr_updates"),
+        &[t_kr],
+        &[t_kru],
+        none.0,
+        none.1,
     )?;
+    gb.node("reshape", &p("v_updates"), &[t_v], &[t_vu], none.0, none.1)?;
     gb.node(
-        "batch_gemm",
-        &p("v_place"),
-        &[sh.place, t_v],
-        &[t_vp],
-        pg.0,
-        pg.1,
-    )?;
-    gb.node(
-        "add_fwd_bf16",
-        &p("k_cache"),
-        &[kci, t_kp],
+        "scatter_nd_update_fwd_bf16",
+        &p("k_scatter"),
+        &[kci, sh.kidx, t_kru],
         &[kco],
-        none.0,
-        none.1,
+        psc.0,
+        psc.1,
     )?;
     gb.node(
-        "add_fwd_bf16",
-        &p("v_cache"),
-        &[vci, t_vp],
+        "scatter_nd_update_fwd_bf16",
+        &p("v_scatter"),
+        &[vci, sh.kidx, t_vu],
         &[vco],
-        none.0,
-        none.1,
+        psc.0,
+        psc.1,
     )?;
     gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
     gb.node(
@@ -1118,7 +1171,7 @@ fn build_stack(
         cos: t_cos,
         mask: t_mask,
         cache: None,
-        place: None,
+        kidx: None,
     };
     let persist = env_on("RENG_PERSIST_LAYERS");
     let mut cur = t_x;

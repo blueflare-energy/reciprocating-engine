@@ -119,7 +119,7 @@ fn main() -> reng_core::Result<()> {
         for _ in 0..a.warmup {
             g.feed(&prompt)?;
             g.feed(&prompt[..1])?;
-            g.reset()?;
+            g.reset();
         }
         let t1 = Instant::now();
         g.feed(&prompt)?;

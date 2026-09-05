@@ -3,16 +3,13 @@
 //!
 //! Each launch processes a block of `rows` positions (the real tokens first,
 //! zero rows after them) starting at the current position. Every layer keeps
-//! key and value caches `[head_dim, capacity, 1, n_kv_heads]` on the device
-//! as two buffers: the recipe reads one and writes the other as
-//! `cache_out = cache_in + place @ block`, where `place` is a 0/1 matrix
-//! uploaded per step that sends block row r to position pos + r; the buffers
-//! swap roles every launch. Attention runs over the whole updated cache with
-//! an additive mask that admits positions up to each query's own. All cache
-//! data movement is done by the MME and TPC inside the recipe: on this stack
-//! a DMA reading freshly compute-written memory can return stale bytes, so
-//! neither a `memcpy` node nor a copy issued between launches is used.
-//! Nothing but the logits crosses the PCIe bus per step.
+//! key and value caches `[head_dim, capacity + 1, 1, n_kv_heads]` on the
+//! device, updated in place by a ScatterND node: an int32 index tensor
+//! uploaded per step sends block row r of KV head g to position pos + r
+//! (padded rows to the trash slot at `capacity`), and the node's output
+//! tensor aliases its input, so only the written rows move. Attention runs
+//! over the whole cache with an additive mask that admits positions up to
+//! each query's own. Nothing but the logits crosses the PCIe bus per step.
 //!
 //! A prompt is fed as one or more full blocks and each generated token as a
 //! block of one real row. The block size is a compile-time shape of a recipe,
@@ -20,13 +17,11 @@
 //! steps, sharing the weights and the cache buffers (`Runtime::new_with`).
 
 use crate::f32_to_bf16;
-use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer, cache_names};
+use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer};
+use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::Runtime;
 use reng_core::Result;
 use std::time::Instant;
-
-/// bf16 1.0.
-const BF16_ONE: u16 = 0x3F80;
 
 /// Per-step input indices of one compiled recipe.
 struct Inputs {
@@ -34,7 +29,7 @@ struct Inputs {
     sin: usize,
     cos: usize,
     mask: usize,
-    place: usize,
+    kidx: usize,
 }
 
 /// A compiled decoder recipe with its resident weights and KV cache, plus an
@@ -55,10 +50,6 @@ pub struct CachedModel {
     /// RoPE tables `[capacity, head_dim]`.
     sin: Vec<f32>,
     cos: Vec<f32>,
-    /// Per layer: the two K buffers and the two V buffers.
-    slots: Vec<([u64; 2], [u64; 2])>,
-    /// Which buffer of each pair the next launch reads (the other is written).
-    parity: usize,
 }
 
 impl CachedModel {
@@ -107,14 +98,6 @@ impl CachedModel {
         } else {
             None
         };
-        let mut slots = Vec::with_capacity(m.layers.len());
-        for li in 0..m.layers.len() {
-            let (kci, vci, kco, vco) = cache_names(li);
-            slots.push((
-                [rt.addr(&kci), rt.addr(&kco)],
-                [rt.addr(&vci), rt.addr(&vco)],
-            ));
-        }
         Ok(Self {
             dec,
             rt,
@@ -128,8 +111,6 @@ impl CachedModel {
             pos: 0,
             sin: sin.to_vec(),
             cos: cos.to_vec(),
-            slots,
-            parity: 0,
         })
     }
 
@@ -143,20 +124,26 @@ impl CachedModel {
         capacity: usize,
     ) -> Result<(Gb, crate::runtime::Out)> {
         let hd = hidden / m.layers[0].n_heads;
-        let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64);
+        let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64 + 1);
         let mut gb = Gb::new()?;
         // Per-step inputs; their contents are replaced before every launch.
         let t_x = gb.input("X", &[h, t], &vec![0.0; rows * hidden])?;
         let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
-        let t_mask = gb.input("MASK", &[keys, t, 1, 1], &vec![0.0; rows * capacity])?;
-        let t_place = gb.input("PLACE", &[t, keys, 1, 1], &vec![0.0; rows * capacity])?;
+        let groups = m.layers[0].n_kv_heads as u64;
+        let t_mask = gb.input("MASK", &[keys, t, 1, 1], &vec![0.0; rows * (capacity + 1)])?;
+        let t_kidx = gb.input_raw(
+            "KIDX",
+            &[3, t * groups],
+            SYN_TYPE_INT32,
+            &vec![0u8; 3 * 4 * rows * groups as usize],
+        )?;
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
             mask: Some(t_mask),
             cache: Some(capacity),
-            place: Some(t_place),
+            kidx: Some(t_kidx),
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {
@@ -172,7 +159,7 @@ impl CachedModel {
             sin: rt.input_index("SIN"),
             cos: rt.input_index("COS"),
             mask: rt.input_index("MASK"),
-            place: rt.input_index("PLACE"),
+            kidx: rt.input_index("KIDX"),
         }
     }
 
@@ -200,22 +187,11 @@ impl CachedModel {
         self.capacity
     }
 
-    /// Forget the cached prefix. Both cache buffers are zeroed, since the
-    /// placement adds into them.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the device memset fails.
-    pub fn reset(&mut self) -> Result<()> {
-        let bytes = (self.head_dim * self.capacity * self.n_kv * 2) as u64;
-        for (k, v) in &self.slots {
-            for &a in k.iter().chain(v.iter()) {
-                self.rt.zero(a, bytes)?;
-            }
-        }
-        self.rt.fence()?;
+    /// Forget the cached prefix. The cache contents need no clearing (the
+    /// mask never admits positions at or beyond the current one), so this
+    /// is free.
+    pub fn reset(&mut self) {
         self.pos = 0;
-        Ok(())
     }
 
     /// Process `x` (`[n, hidden]` embeddings for positions `pos..pos+n`,
@@ -280,41 +256,37 @@ impl CachedModel {
         }
         // Mask laid out like the scores, [key (FCD), query]: query row q sits
         // at cache position pos + q and may see every position up to its own
-        // (padding rows past the cache end see everything; they are discarded).
-        // Built directly in bf16: these are the largest per-step uploads.
-        let keys = c;
+        // (padding rows past the cache end see everything but the trash slot;
+        // they are discarded). Built directly in bf16: the largest per-step
+        // upload.
+        let keys = c + 1;
         let neg = f32_to_bf16(MASK_NEG);
         let mut mb = vec![neg; p * keys];
         for q in 0..p {
-            mb[q * keys..q * keys + (pos + q + 1).min(keys)].fill(0);
+            mb[q * keys..q * keys + (pos + q + 1).min(c)].fill(0);
         }
-        // Placement, host row-major [position, row] (device sizes [row,
-        // position]): real block row r lands at position pos + r (< capacity
-        // by the assert above). Padding rows must not be placed: their keys
-        // and values are zero at layer 0 but not deeper (a padded query's
-        // attention is a uniform average of the cached values), and anything
-        // placed at a future position would be summed into the real token
-        // written there later.
-        let mut pb = vec![0u16; keys * p];
-        for r in 0..n {
-            pb[(pos + r) * p + r] = BF16_ONE;
+        // Scatter indices, ONNX triples (g, 0, position) for update r + p * g
+        // (row r of KV head g): real rows go to pos + r (< capacity by the
+        // assert above), padded rows to the trash slot. Padded rows must not
+        // land on real positions: their keys and values are zero at layer 0
+        // but not deeper (a padded query's attention is a uniform average of
+        // the cached values).
+        let mut ib: Vec<u8> = Vec::with_capacity(12 * p * self.n_kv);
+        for g in 0..self.n_kv {
+            for r in 0..p {
+                let target = if r < n { pos + r } else { c };
+                for v in [g as i32, 0i32, target as i32] {
+                    ib.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
         let trace = std::env::var("RENG_STEP_TRACE").is_ok();
         let t0 = Instant::now();
-        // Read the cache buffer written by the previous launch, write the other.
-        let (rd, wr) = (self.parity, 1 - self.parity);
-        for (li, (k, v)) in self.slots.iter().enumerate() {
-            let (kci, vci, kco, vco) = cache_names(li);
-            rt.rebind(&kci, k[rd]);
-            rt.rebind(&kco, k[wr]);
-            rt.rebind(&vci, v[rd]);
-            rt.rebind(&vco, v[wr]);
-        }
         rt.upload(ix.x, &xb)?;
         rt.upload(ix.sin, &sb)?;
         rt.upload(ix.cos, &cb)?;
         rt.upload_bf16(ix.mask, &mb)?;
-        rt.upload_bf16(ix.place, &pb)?;
+        rt.upload_raw(ix.kidx, &ib)?;
         rt.fence()?;
         let t_upload = t0.elapsed();
         let logits = if last_only {
@@ -329,7 +301,6 @@ impl CachedModel {
                 (t0.elapsed() - t_upload).as_secs_f64() * 1e3
             );
         }
-        self.parity = wr;
         self.pos += n;
         debug_assert_eq!(logits.len(), if last_only { 1 } else { n } * self.vocab);
         Ok(logits)

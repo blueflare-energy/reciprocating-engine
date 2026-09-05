@@ -257,7 +257,10 @@ impl Runtime {
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
             let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
-            let d = if let Some(d) = shared(&gb.scratch_names[k], sizes) {
+            let d = if let Some(of) = &gb.scratch_alias[k] {
+                // The output side of an in-place update: same memory.
+                addrs[of.as_str()]
+            } else if let Some(d) = shared(&gb.scratch_names[k], sizes) {
                 d
             } else {
                 let mut d = 0u64;
@@ -363,8 +366,28 @@ impl Runtime {
         Ok(())
     }
 
+    /// Replace a raw (non-bf16) input's bytes (index tensors).
+    pub fn upload_raw(&mut self, idx: usize, bytes: &[u8]) -> Result<()> {
+        let expect = self.gb.raw[idx].as_ref().map_or(0, Vec::len);
+        assert_eq!(bytes.len(), expect, "raw input {idx} size");
+        let hb = self.host_bufs[idx];
+        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
+        // SAFETY: hb holds `expect` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), hb.cast::<u8>(), bytes.len());
+        }
+        syn!(synMemCopyAsync(
+            self.stream,
+            hb as u64,
+            bytes.len() as u64,
+            self.dev_bufs[idx],
+            SYN_HOST_TO_DRAM
+        ));
+        Ok(())
+    }
+
     /// Replace input `idx`'s contents with bf16 data already in device format
-    /// (for the large 0/1 and mask patterns that need no conversion).
+    /// (for the large mask patterns that need no conversion).
     pub fn upload_bf16(&mut self, idx: usize, data: &[u16]) -> Result<()> {
         assert_eq!(data.len(), self.gb.data[idx].len());
         let hb = self.host_bufs[idx];
@@ -485,18 +508,6 @@ impl Runtime {
             .iter()
             .position(|n| n.to_str().unwrap() == name)
             .unwrap_or_else(|| panic!("no input named {name}"))
-    }
-
-    /// Zero `bytes` of device memory at `addr` (a DMA write; call
-    /// [`Runtime::fence`] before the next launch reads it).
-    pub fn zero(&self, addr: u64, bytes: u64) -> Result<()> {
-        syn!(synMemsetD32Async(
-            addr,
-            0,
-            (bytes / 4) as usize,
-            self.stream
-        ));
-        Ok(())
     }
 
     /// Bind persistent tensor `name` to device address `addr` for the next

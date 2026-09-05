@@ -151,7 +151,7 @@ fn main() -> reng_core::Result<()> {
     println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
 
     for (b, &n) in prompts.iter().enumerate() {
-        bm.reset(b)?;
+        bm.reset(b);
         let t1 = Instant::now();
         bm.prefill(b, &inputs[b][..n * hidden])?;
         println!(
