@@ -1,0 +1,61 @@
+name: bench
+
+# Throughput on real Gaudi2 hardware, recorded on every merge to main. Runs on
+# a self-hosted runner labelled `gaudi2`; the runner's environment provides
+# RENG_MODEL_DIR (a Hugging Face model directory) and RENG_DEVICE (the accel
+# index to use), so nothing machine-specific lives in this file. Fork pull
+# requests never reach this job: it only runs on pushes to main and manual
+# dispatch.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/bench.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One benchmark at a time on the card.
+concurrency:
+  group: bench-gaudi2
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: gaudi2 throughput
+    runs-on: [self-hosted, gaudi2]
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: cargo build --release --locked -p reng-model --features link-synapse --bin reng-bench
+      - name: run
+        run: |
+          set -euo pipefail
+          : "${RENG_MODEL_DIR:?the runner must export RENG_MODEL_DIR}"
+          HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
+            ./target/release/reng-bench "$RENG_MODEL_DIR" bench.json --prompt 128 --new 64
+          cat bench.json
+      - name: record
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Gaudi2 inference
+          tool: customBiggerIsBetter
+          output-file-path: bench.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          summary-always: true
+          # A drop below two thirds of the previous value is flagged in the
+          # job summary; nothing fails, the chart is the record.
+          alert-threshold: '150%'
+          comment-on-alert: false
+          fail-on-alert: false

@@ -14,6 +14,7 @@ link-synapse = ["reng-synapse/link-synapse"]
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
 reng-synapse = { path = "../reng-synapse", version = "0.0.1" }
+reng-ceiling = { path = "../reng-ceiling", version = "0.0.1" }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,4 +27,9 @@ required-features = ["link-synapse"]
 [[bin]]
 name = "reng-generate"
 path = "src/bin/generate.rs"
+required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-bench"
+path = "src/bin/bench.rs"
 required-features = ["link-synapse"]

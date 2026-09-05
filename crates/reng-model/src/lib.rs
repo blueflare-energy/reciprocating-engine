@@ -380,8 +380,12 @@ impl<'a> Generator<'a> {
     }
 
     /// Forget the cached prefix.
-    pub fn reset(&mut self) {
-        self.model.reset();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device memset fails.
+    pub fn reset(&mut self) -> Result<()> {
+        self.model.reset()
     }
 
     /// Append `ids` to the sequence (any length that fits the cache; fed in

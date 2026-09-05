@@ -2,12 +2,17 @@
 //! cache capacity, launched once per block of new tokens.
 //!
 //! Each launch processes a block of `rows` positions (the real tokens first,
-//! zero rows after them) starting at the current position. Every layer
-//! attends over `cache prefix ++ block` with an additive mask that admits the
-//! filled part of the cache and the causal part of the block, and writes the
-//! block's per-head rotated keys and values to device-resident outputs. After
-//! the launch those rows are copied on the device into the cache at the
-//! block's position, so nothing but the logits crosses the PCIe bus per step.
+//! zero rows after them) starting at the current position. Every layer keeps
+//! per-head key and value caches `[head_dim, capacity + rows]` on the device
+//! as two buffers: the recipe reads one and writes the other as
+//! `cache_out = cache_in + place @ block`, where `place` is a 0/1 matrix
+//! uploaded per step that sends block row r to position pos + r; the buffers
+//! swap roles every launch. Attention runs over the whole updated cache with
+//! an additive mask that admits positions up to each query's own. All cache
+//! data movement is done by the MME and TPC inside the recipe: on this stack
+//! a DMA reading freshly compute-written memory can return stale bytes, so
+//! neither a `memcpy` node nor a copy issued between launches is used.
+//! Nothing but the logits crosses the PCIe bus per step.
 //!
 //! A prompt is fed as one or more full blocks and each generated token as a
 //! block of one real row. The block size is a compile-time shape of the
@@ -17,6 +22,7 @@
 use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer, cache_names};
 use crate::runtime::Runtime;
 use reng_core::Result;
+use std::time::Instant;
 
 /// A compiled decoder recipe with its resident weights and KV cache.
 pub struct CachedModel {
@@ -26,6 +32,7 @@ pub struct CachedModel {
     hidden: usize,
     vocab: usize,
     head_dim: usize,
+    n_kv: usize,
     pos: usize,
     /// RoPE tables `[capacity, head_dim]`.
     sin: Vec<f32>,
@@ -34,8 +41,11 @@ pub struct CachedModel {
     ix_sin: usize,
     ix_cos: usize,
     ix_mask: usize,
-    /// Device addresses `(k_cache, v_cache, k_new, v_new)` per layer and KV head.
-    slots: Vec<(u64, u64, u64, u64)>,
+    ix_place: usize,
+    /// Per layer and KV head: the two K buffers and the two V buffers.
+    slots: Vec<([u64; 2], [u64; 2])>,
+    /// Which buffer of each pair the next launch reads (the other is written).
+    parity: usize,
 }
 
 impl CachedModel {
@@ -81,11 +91,13 @@ impl CachedModel {
         let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_mask = gb.input("MASK", &[keys, t], &vec![0.0; rows * (capacity + rows)])?;
+        let t_place = gb.input("PLACE", &[t, keys], &vec![0.0; rows * (capacity + rows)])?;
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
             mask: Some(t_mask),
             cache: Some(capacity),
+            place: Some(t_place),
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {
@@ -96,8 +108,11 @@ impl CachedModel {
         let mut slots = Vec::with_capacity(m.layers.len() * l0.n_kv_heads);
         for li in 0..m.layers.len() {
             for g in 0..l0.n_kv_heads {
-                let (kc, vc, kn, vn) = cache_names(li, g);
-                slots.push((rt.addr(&kc), rt.addr(&vc), rt.addr(&kn), rt.addr(&vn)));
+                let (kci, vci, kco, vco) = cache_names(li, g);
+                slots.push((
+                    [rt.addr(&kci), rt.addr(&kco)],
+                    [rt.addr(&vci), rt.addr(&vco)],
+                ));
             }
         }
         Ok(Self {
@@ -105,16 +120,19 @@ impl CachedModel {
             ix_sin: rt.input_index("SIN"),
             ix_cos: rt.input_index("COS"),
             ix_mask: rt.input_index("MASK"),
+            ix_place: rt.input_index("PLACE"),
             rt,
             rows,
             capacity,
             hidden,
             vocab,
             head_dim: hd,
+            n_kv: l0.n_kv_heads,
             pos: 0,
             sin: sin.to_vec(),
             cos: cos.to_vec(),
             slots,
+            parity: 0,
         })
     }
 
@@ -136,10 +154,22 @@ impl CachedModel {
         self.capacity
     }
 
-    /// Forget the cached prefix. The cache contents need no clearing: the
-    /// mask never admits positions at or beyond the current one.
-    pub fn reset(&mut self) {
+    /// Forget the cached prefix. Both cache buffers are zeroed, since the
+    /// placement adds into them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the device memset fails.
+    pub fn reset(&mut self) -> Result<()> {
+        let bytes = (self.head_dim * (self.capacity + self.rows) * 2) as u64;
+        for (k, v) in &self.slots {
+            for &a in k.iter().chain(v.iter()) {
+                self.rt.zero(a, bytes)?;
+            }
+        }
+        self.rt.settle()?;
         self.pos = 0;
+        Ok(())
     }
 
     /// Process `x` (`[n, hidden]` embeddings for positions `pos..pos+n`,
@@ -178,30 +208,50 @@ impl CachedModel {
                 cb[r * hd..(r + 1) * hd].copy_from_slice(&self.cos[src..src + hd]);
             }
         }
-        // Mask laid out like the scores, [key (FCD), query]: the filled cache
-        // prefix is open, the rest of the cache closed, the block causal.
+        // Mask laid out like the scores, [key (FCD), query]: query row q sits
+        // at cache position pos + q and may see every position up to its own.
         let keys = c + p;
         let mut mb = vec![MASK_NEG; p * keys];
         for q in 0..p {
-            let row = &mut mb[q * keys..(q + 1) * keys];
-            row[..pos].fill(0.0);
-            row[c..=c + q].fill(0.0);
+            mb[q * keys..q * keys + pos + q + 1].fill(0.0);
+        }
+        // Placement, host row-major [position, row] (device sizes [row,
+        // position]): real block row r lands at position pos + r. Padding rows
+        // must not be placed: their keys and values are zero at layer 0 but
+        // not deeper (a padded query's attention is a uniform average of the
+        // cached values), and anything placed at a future position would be
+        // summed into the real token written there later.
+        let mut pb = vec![0.0f32; keys * p];
+        for r in 0..n {
+            pb[(pos + r) * p + r] = 1.0;
+        }
+        let trace = std::env::var("RENG_STEP_TRACE").is_ok();
+        let t0 = Instant::now();
+        // Read the cache buffer written by the previous launch, write the other.
+        let (rd, wr) = (self.parity, 1 - self.parity);
+        for (li_g, (k, v)) in self.slots.iter().enumerate() {
+            let (kci, vci, kco, vco) = cache_names(li_g / self.n_kv, li_g % self.n_kv);
+            self.rt.rebind(&kci, k[rd]);
+            self.rt.rebind(&kco, k[wr]);
+            self.rt.rebind(&vci, v[rd]);
+            self.rt.rebind(&vco, v[wr]);
         }
         self.rt.upload(self.ix_x, &xb)?;
         self.rt.upload(self.ix_sin, &sb)?;
         self.rt.upload(self.ix_cos, &cb)?;
         self.rt.upload(self.ix_mask, &mb)?;
+        self.rt.upload(self.ix_place, &pb)?;
+        self.rt.fence_uploads(self.ix_place)?;
+        let t_upload = t0.elapsed();
         let logits = self.rt.launch_and_read(n)?;
-
-        // Append the block's keys and values: rows are contiguous in the
-        // [head_dim (FCD), position] layout, so one copy per tensor.
-        let row_bytes = (hd * 2) as u64;
-        let (src_bytes, dst_off) = ((n as u64) * row_bytes, (pos as u64) * row_bytes);
-        for &(kc, vc, kn, vn) in &self.slots {
-            self.rt.copy_d2d(kn, 0, kc, dst_off, src_bytes)?;
-            self.rt.copy_d2d(vn, 0, vc, dst_off, src_bytes)?;
+        if trace {
+            eprintln!(
+                "step trace: uploads {:.2} ms, launch+readback {:.2} ms",
+                t_upload.as_secs_f64() * 1e3,
+                (t0.elapsed() - t_upload).as_secs_f64() * 1e3
+            );
         }
-        self.rt.sync()?;
+        self.parity = wr;
         self.pos += n;
         debug_assert_eq!(logits.len(), n * self.vocab);
         Ok(logits)

@@ -3,11 +3,24 @@
 //! can be launched many times (the KV-cache decode loop); the one-shot paths
 //! build one, launch it once, and drop it.
 //!
-//! Readback: on this stack the stream and device syncs return before a deep
-//! recipe has finished writing its output, so the output is pre-filled with a
-//! NaN sentinel and copied down until no sentinel remains (exact completion,
-//! since every output element is written exactly once), then re-read until
-//! two reads spaced by a short window agree.
+//! Readback protocol. On this stack `synStreamSynchronize` returns before
+//! the work it covers has landed: a deep recipe can still be writing its
+//! output, and a device-to-host copy can still be in flight, so a plain
+//! read of the pinned host buffer shows whatever was there before (zeros on
+//! a fresh buffer, the previous step's data on a reused one). Two sentinels
+//! make the read exact without any timed wait:
+//!
+//! 1. the device output is pre-filled with one NaN pattern before launch,
+//!    so an element that still shows it was not written by the recipe;
+//! 2. the host buffer is filled with a different NaN pattern before every
+//!    copy, so an element that still shows it was not written by the DMA.
+//!
+//! After the copy the host spins until no host sentinel remains, then
+//! repeats the copy while any device sentinel remains. Every element of the
+//! output is written exactly once by the recipe (its last writer is an MME
+//! gemm or a TPC kernel) and exactly once by the copy, so "no sentinel of
+//! either kind" is completion. `RENG_STABILITY_MS` adds a diagnostic
+//! re-read-until-stable pass on top.
 
 use crate::ffi::*;
 use crate::model::Gb;
@@ -30,18 +43,30 @@ macro_rules! syn {
     }};
 }
 
-/// bf16 quiet-NaN pattern the output buffer is pre-filled with before launch.
-/// The recipe writes every output element exactly once and never produces this
-/// exact NaN, so "no sentinel left" is an exact completion test for the
-/// readback (the stream and device syncs return before deep recipes finish).
+/// bf16 quiet-NaN pattern the DEVICE output buffer is pre-filled with before
+/// launch. The recipe writes every output element exactly once and never
+/// produces this exact NaN, so "none left" means the recipe has written the
+/// whole output.
 const SENTINEL_BF16: u16 = 0x7FC1;
 const SENTINEL_D32: u32 = 0x7FC1_7FC1;
+/// A second quiet-NaN pattern the HOST buffer is filled with before every
+/// device-to-host copy; "none left" means the copy has landed. Distinct from
+/// the device sentinel so the two conditions stay separable.
+const HOST_SENTINEL_BF16: u16 = 0x7FC2;
 /// Upper bound on waiting for a recipe's output to complete.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
-/// Spacing between the consecutive readbacks that must agree before the
-/// output is trusted. Measured: a 5 ms settle after the stream sync was always
-/// enough for a 4-layer graph whose plain readback was wrong 4 times in 4.
-const STABILITY_WINDOW: Duration = Duration::from_millis(5);
+
+/// Diagnostic re-read window (`RENG_STABILITY_MS`, fractional): when set,
+/// after both sentinels are gone the output is re-read until two reads
+/// spaced by this many milliseconds are byte-identical. Used to prove that
+/// the sentinel protocol alone is complete.
+fn stability_window() -> Option<Duration> {
+    std::env::var("RENG_STABILITY_MS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(Duration::from_secs_f64)
+        .map(|d| d / 1000)
+}
 
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
@@ -90,6 +115,8 @@ pub(crate) struct Runtime {
     stream: synStreamHandle,
     recipe: synRecipeHandle,
     infos: Vec<synLaunchTensorInfo>,
+    /// Index into `infos` per persistent tensor, by name.
+    info_index: HashMap<String, usize>,
     /// Device buffer per persistent tensor, by name.
     addrs: HashMap<String, u64>,
     /// Pinned host staging buffer per uploaded input, by input index.
@@ -97,6 +124,9 @@ pub(crate) struct Runtime {
     dev_bufs: Vec<u64>,
     d_out: u64,
     h_out: *mut c_void,
+    /// Pinned buffer for [`Runtime::fence_uploads`], grown on demand.
+    h_fence: *mut c_void,
+    fence_bytes: u64,
     out: Out,
     dws: u64,
 }
@@ -139,6 +169,7 @@ impl Runtime {
         let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in);
         let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + n_scratch + 1);
         let mut addrs = HashMap::with_capacity(n_in + n_scratch + 1);
+        let mut info_index = HashMap::with_capacity(n_in + n_scratch + 1);
         for (idx, data) in gb.data.iter().enumerate() {
             let bytes = (data.len() * 2) as u64;
             let mut d = 0u64;
@@ -159,18 +190,23 @@ impl Runtime {
                 d,
                 SYN_HOST_TO_DRAM
             ));
+            info_index.insert(gb.names[idx].to_str().unwrap().to_owned(), infos.len());
             infos.push(launch_info(&gb.names[idx], d, ids[idx], &gb.sizes[idx]));
             addrs.insert(gb.names[idx].to_str().unwrap().to_owned(), d);
             dev_bufs.push(d);
             host_bufs.push(hb);
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
-            let bytes = sizes.iter().product::<u64>() * 2;
+            let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
             let mut d = 0u64;
             syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
             // Device-resident state starts as zeros (finite, so a masked-out
             // stale cache row can never poison a softmax).
             syn!(synMemsetD32Async(d, 0, (bytes / 4) as usize, stream));
+            info_index.insert(
+                gb.scratch_names[k].to_str().unwrap().to_owned(),
+                infos.len(),
+            );
             infos.push(launch_info(&gb.scratch_names[k], d, ids[n_in + k], sizes));
             addrs.insert(gb.scratch_names[k].to_str().unwrap().to_owned(), d);
             dev_bufs.push(d);
@@ -180,6 +216,7 @@ impl Runtime {
         syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
         let mut h_out: *mut c_void = core::ptr::null_mut();
         syn!(synHostMalloc(dev, out_bytes, 0, &mut h_out));
+        info_index.insert(out.name.to_str().unwrap().to_owned(), infos.len());
         infos.push(launch_info(
             &out.name,
             d_out,
@@ -190,9 +227,15 @@ impl Runtime {
 
         let mut ws = 0u64;
         syn!(synWorkspaceGetSize(&mut ws, recipe));
+        // Diagnostic: `RENG_WS_SLACK_MB` over-allocates the workspace.
+        let slack = std::env::var("RENG_WS_SLACK_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            << 20;
         let mut dws = 0u64;
-        if ws > 0 {
-            syn!(synDeviceMalloc(dev, ws, 0, 0, &mut dws));
+        if ws + slack > 0 {
+            syn!(synDeviceMalloc(dev, ws + slack, 0, 0, &mut dws));
         }
         syn!(synStreamSynchronize(stream));
         Ok(Self {
@@ -201,11 +244,14 @@ impl Runtime {
             stream,
             recipe,
             infos,
+            info_index,
             addrs,
             host_bufs,
             dev_bufs,
             d_out,
             h_out,
+            h_fence: core::ptr::null_mut(),
+            fence_bytes: 0,
             out,
             dws,
         })
@@ -242,6 +288,90 @@ impl Runtime {
         Ok(())
     }
 
+    /// Wait until input `idx` (the last one uploaded) is visible on the
+    /// device: copy it back with the host sentinel and spin until the copy
+    /// has landed and equals the staged data. Host-to-device copies on the
+    /// stream are executed in order, so once the last one is visible all of
+    /// them are. Needed because the stream sync returns before DMA copies
+    /// have landed on this stack, and a launch issued right after them would
+    /// otherwise compute on the previous step's inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data never appears.
+    pub fn fence_uploads(&mut self, idx: usize) -> Result<()> {
+        syn!(synStreamSynchronize(self.stream));
+        let n = self.gb.data[idx].len();
+        let bytes = (n * 2) as u64;
+        if self.h_fence.is_null() || self.fence_bytes < bytes {
+            if !self.h_fence.is_null() {
+                unsafe { synHostFree(self.dev, self.h_fence, 0) };
+            }
+            let mut vb: *mut c_void = core::ptr::null_mut();
+            syn!(synHostMalloc(self.dev, bytes, 0, &mut vb));
+            self.h_fence = vb;
+            self.fence_bytes = bytes;
+        }
+        let vb = self.h_fence;
+        let started = Instant::now();
+        let mut copies = 0u32;
+        loop {
+            // SAFETY: vb holds at least n bf16 elements.
+            unsafe {
+                for j in 0..n {
+                    *vb.cast::<u16>().add(j) = HOST_SENTINEL_BF16;
+                }
+            }
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.dev_bufs[idx],
+                bytes,
+                vb as u64,
+                SYN_DRAM_TO_HOST
+            ));
+            syn!(synStreamSynchronize(self.stream));
+            copies += 1;
+            // Wait for this copy to land, then compare.
+            loop {
+                // SAFETY: as above.
+                let pending = unsafe {
+                    let p = vb.cast::<u16>();
+                    (0..n).any(|j| core::ptr::read_volatile(p.add(j)) == HOST_SENTINEL_BF16)
+                };
+                if !pending {
+                    break;
+                }
+                if started.elapsed() > READBACK_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "fence: copy of input {idx} did not land within {READBACK_TIMEOUT:?}"
+                    )));
+                }
+                std::hint::spin_loop();
+            }
+            // SAFETY: both buffers hold n bf16 elements.
+            let differs = unsafe {
+                let (p, q) = (vb.cast::<u16>(), self.host_bufs[idx].cast::<u16>());
+                (0..n).filter(|&j| *p.add(j) != *q.add(j)).count()
+            };
+            if differs == 0 {
+                break;
+            }
+            if started.elapsed() > READBACK_TIMEOUT {
+                return Err(Error::Other(format!(
+                    "fence: upload of input {idx} never became visible ({differs} elements differ)"
+                )));
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        if copies > 1 && env_on("RENG_READBACK_TRACE") {
+            eprintln!(
+                "fence: input {idx} visible after {copies} copies ({:?})",
+                started.elapsed()
+            );
+        }
+        Ok(())
+    }
+
     /// Index of the input named `name`.
     ///
     /// # Panics
@@ -255,41 +385,48 @@ impl Runtime {
             .unwrap_or_else(|| panic!("no input named {name}"))
     }
 
-    /// Enqueue a device-to-device copy of `bytes` from `src + src_off` to
-    /// `dst + dst_off` (byte offsets) on the launch stream.
-    pub fn copy_d2d(
-        &self,
-        src: u64,
-        src_off: u64,
-        dst: u64,
-        dst_off: u64,
-        bytes: u64,
-    ) -> Result<()> {
-        syn!(synMemCopyAsync(
-            self.stream,
-            src + src_off,
-            bytes,
-            dst + dst_off,
-            SYN_DRAM_TO_DRAM
+    /// Zero `bytes` of device memory at `addr` (a DMA write; call
+    /// [`Runtime::settle`] before the next launch reads it).
+    pub fn zero(&self, addr: u64, bytes: u64) -> Result<()> {
+        syn!(synMemsetD32Async(
+            addr,
+            0,
+            (bytes / 4) as usize,
+            self.stream
         ));
         Ok(())
     }
 
-    /// Wait for everything enqueued on the launch stream.
-    pub fn sync(&self) -> Result<()> {
+    /// Wait for the stream and then a few milliseconds more, for the rare
+    /// paths where a DMA write must be visible to the next launch.
+    pub fn settle(&self) -> Result<()> {
         syn!(synStreamSynchronize(self.stream));
+        std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
 
+    /// Bind persistent tensor `name` to device address `addr` for the next
+    /// launches (the KV cache swaps its read and write buffers).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a persistent tensor of this graph.
+    pub fn rebind(&mut self, name: &str, addr: u64) {
+        let idx = self.info_index[name];
+        self.infos[idx].tensor_address = addr;
+    }
+
     /// Launch the recipe and read back the first `rows` outermost rows of the
-    /// output as f32, using the sentinel + stability protocol on that range.
+    /// output as f32 (see the module docs for the two-sentinel protocol).
     #[allow(clippy::too_many_lines)]
     pub fn launch_and_read(&mut self, rows: usize) -> Result<Vec<f32>> {
         let n_out = rows * self.out.row_elems();
         assert!(n_out <= self.out.elems());
         let out_bytes = (n_out * 2) as u64;
         let (stream, dev, d_out, h_out) = (self.stream, self.dev, self.d_out, self.h_out);
-        // Pre-fill the output with the completion sentinel (see SENTINEL_BF16).
+        let trace = env_on("RENG_STEP_TRACE");
+        let t0 = Instant::now();
+        // Pre-fill the device output with the recipe-completion sentinel.
         syn!(synMemsetD32Async(
             d_out,
             SENTINEL_D32,
@@ -297,6 +434,7 @@ impl Runtime {
             stream
         ));
         syn!(synStreamSynchronize(stream));
+        let t_memset = t0.elapsed();
 
         syn!(synLaunch(
             stream,
@@ -307,6 +445,7 @@ impl Runtime {
             0
         ));
         syn!(synStreamSynchronize(stream));
+        let t_launch = t0.elapsed() - t_memset;
         if env_on("RENG_DEVSYNC") {
             syn!(synDeviceSynchronize(dev));
         }
@@ -317,8 +456,18 @@ impl Runtime {
             std::thread::sleep(Duration::from_millis(ms));
         }
 
-        // Readback with completion polling.
+        // One complete copy: fill the host buffer with the copy sentinel,
+        // copy, then wait until the DMA has replaced every element (the
+        // stream sync returns before the copy has landed on this stack).
+        let started = Instant::now();
         let read_once = |s: synStreamHandle| -> Result<()> {
+            // SAFETY: h_out holds at least n_out bf16 elements.
+            unsafe {
+                let p = h_out.cast::<u16>();
+                for j in 0..n_out {
+                    *p.add(j) = HOST_SENTINEL_BF16;
+                }
+            }
             syn!(synMemCopyAsync(
                 s,
                 d_out,
@@ -327,7 +476,22 @@ impl Runtime {
                 SYN_DRAM_TO_HOST
             ));
             syn!(synStreamSynchronize(s));
-            Ok(())
+            loop {
+                // SAFETY: as above; the DMA writes each element exactly once.
+                let pending = unsafe {
+                    let p = h_out.cast::<u16>();
+                    (0..n_out).any(|j| core::ptr::read_volatile(p.add(j)) == HOST_SENTINEL_BF16)
+                };
+                if !pending {
+                    return Ok(());
+                }
+                if started.elapsed() > READBACK_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "device-to-host copy did not complete within {READBACK_TIMEOUT:?}"
+                    )));
+                }
+                std::hint::spin_loop();
+            }
         };
         // SAFETY (closure body): h_out holds n_out bf16 elements for the whole call.
         let incomplete = || -> usize {
@@ -351,7 +515,6 @@ impl Runtime {
         } else {
             read_once(stream)?;
         }
-        let started = Instant::now();
         let mut polls = 0u32;
         let mut left = incomplete();
         while left > 0 {
@@ -360,35 +523,34 @@ impl Runtime {
                     "recipe output incomplete after {READBACK_TIMEOUT:?}: {left} of {n_out} elements unwritten"
                 )));
             }
-            std::thread::sleep(Duration::from_millis(2));
+            std::thread::sleep(Duration::from_micros(200));
             read_once(stream)?;
             polls += 1;
             left = incomplete();
         }
-        // Stability: the recipe's final writes keep landing for a few
-        // milliseconds after the sync returns, and an intermediate write can have
-        // already replaced the sentinel, so also require two consecutive reads
-        // spaced by the measured window to be byte-identical.
+        // Diagnostic stability check (see `stability_window`).
         let snapshot = |buf: *mut c_void, n: usize| -> Vec<u16> {
             // SAFETY: buf holds n bf16 elements.
             unsafe { std::slice::from_raw_parts(buf.cast::<u16>(), n).to_vec() }
         };
-        let mut prev = snapshot(h_out, n_out);
         let mut stable_polls = 0u32;
-        loop {
-            if started.elapsed() > READBACK_TIMEOUT {
-                return Err(Error::Other(format!(
-                    "recipe output did not stabilise within {READBACK_TIMEOUT:?}"
-                )));
+        if let Some(window) = stability_window() {
+            let mut prev = snapshot(h_out, n_out);
+            loop {
+                if started.elapsed() > READBACK_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "recipe output did not stabilise within {READBACK_TIMEOUT:?}"
+                    )));
+                }
+                std::thread::sleep(window);
+                read_once(stream)?;
+                let cur = snapshot(h_out, n_out);
+                stable_polls += 1;
+                if cur == prev {
+                    break;
+                }
+                prev = cur;
             }
-            std::thread::sleep(STABILITY_WINDOW);
-            read_once(stream)?;
-            let cur = snapshot(h_out, n_out);
-            stable_polls += 1;
-            if cur == prev {
-                break;
-            }
-            prev = cur;
         }
         if (polls > 0 || stable_polls > 1) && env_on("RENG_READBACK_TRACE") {
             eprintln!(
@@ -396,7 +558,18 @@ impl Runtime {
                 started.elapsed()
             );
         }
-
+        if trace {
+            eprintln!(
+                "step trace: memset {:.2} ms, launch+sync {:.2} ms, readback {:.2} ms ({polls} polls, {stable_polls} stability reads, {} KiB)",
+                t_memset.as_secs_f64() * 1e3,
+                t_launch.as_secs_f64() * 1e3,
+                started.elapsed().as_secs_f64() * 1e3,
+                out_bytes / 1024
+            );
+        }
+        if env_on("RENG_DUMP_SCRATCH") {
+            self.dump_scratch()?;
+        }
         let mut result = vec![0.0f32; n_out];
         // SAFETY: h_out holds n_out bf16 elements just copied back.
         unsafe {
@@ -409,6 +582,54 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// Diagnostic: after a long settle, copy every scratch tensor down and
+    /// print its zero fraction and largest magnitude, in creation order.
+    fn dump_scratch(&self) -> Result<()> {
+        syn!(synStreamSynchronize(self.stream));
+        std::thread::sleep(Duration::from_millis(100));
+        let n_in = self.gb.names.len();
+        for (k, sizes) in self.gb.scratch_sizes.iter().enumerate() {
+            let elems = sizes.iter().product::<u64>() as usize;
+            let f32s = self.gb.scratch_f32[k];
+            let bytes = (elems * if f32s { 4 } else { 2 }) as u64;
+            let mut hb: *mut c_void = core::ptr::null_mut();
+            syn!(synHostMalloc(self.dev, bytes, 0, &mut hb));
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.dev_bufs[n_in + k],
+                bytes,
+                hb as u64,
+                SYN_DRAM_TO_HOST
+            ));
+            syn!(synStreamSynchronize(self.stream));
+            let (mut zeros, mut max) = (0usize, 0.0f32);
+            // SAFETY: hb holds `elems` elements of the recorded dtype.
+            unsafe {
+                for j in 0..elems {
+                    let v = if f32s {
+                        *hb.cast::<f32>().add(j)
+                    } else {
+                        bf16_to_f32(*hb.cast::<u16>().add(j))
+                    };
+                    if v == 0.0 {
+                        zeros += 1;
+                    }
+                    max = max.max(v.abs());
+                }
+                synHostFree(self.dev, hb, 0);
+            }
+            eprintln!(
+                "dump {:<14} {:>9} elems  zeros {:>5.1}%  max {max:.3e}",
+                self.gb.scratch_names[k].to_str().unwrap(),
+                elems,
+                100.0 * zeros as f64 / elems as f64
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         unsafe {
@@ -417,6 +638,9 @@ impl Drop for Runtime {
                 synHostFree(self.dev, hb, 0);
             }
             synHostFree(self.dev, self.h_out, 0);
+            if !self.h_fence.is_null() {
+                synHostFree(self.dev, self.h_fence, 0);
+            }
             for &d in &self.dev_bufs {
                 synDeviceFree(self.dev, d, 0);
             }

@@ -1,6 +1,7 @@
 # Reciprocating Engine
 
 [![ci](https://github.com/blueflare-energy/reciprocating-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/blueflare-energy/reciprocating-engine/actions/workflows/ci.yml)
+[![bench](https://github.com/blueflare-energy/reciprocating-engine/actions/workflows/bench.yml/badge.svg)](https://blueflare-energy.github.io/reciprocating-engine/dev/bench/)
 ![lines of code](.github/badges/loc.svg)
 ![crates](.github/badges/crates.svg)
 ![dependencies](.github/badges/deps.svg)
@@ -81,7 +82,12 @@ cargo test --workspace
 ```
 
 Correctness and clippy/format checks run in CI on every push and pull request.
-Hardware tests and benchmarks run on a Gaudi2 host, not on the hosted runners.
+Hardware tests run on a Gaudi2 host, not on the hosted runners. The `bench`
+workflow runs `reng-bench` on a self-hosted Gaudi2 runner after every merge
+to main and appends the result to the
+[benchmark history](https://blueflare-energy.github.io/reciprocating-engine/dev/bench/)
+(prefill and decode tok/s, and each as a percentage of the roofline ceiling
+from `reng-ceiling`).
 
 ## License
 

@@ -2,7 +2,7 @@
 //! compiled recipe (a full block, a partial block, then single rows) must
 //! produce the same logits as the CPU reference over the whole sequence.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_rows]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size]`.
 
 use reng_synapse::{CachedModel, LayerWeights, ModelWeights, model_forward_cpu};
 use std::time::Instant;
@@ -61,9 +61,11 @@ fn main() -> reng_core::Result<()> {
     );
     let (vocab, n_layers, n_kv_heads) = (arg(5, 512usize), arg(6, 2usize), arg(7, 2usize));
     let capacity = arg(8, 512usize);
-    // Blocks: one full block, one of 8 rows, then `tail_rows` single rows.
+    // Blocks: one full block, one of 8 rows, then `tail_rows` blocks of
+    // `tail_size` rows (default 1: single-token decode steps).
     let tail_rows = arg(9, 3usize);
-    let tokens = rows + 8 + tail_rows;
+    let tail_size = arg(10, 1usize);
+    let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
         tokens <= capacity,
         "sequence {tokens} exceeds capacity {capacity}"
@@ -143,7 +145,7 @@ fn main() -> reng_core::Result<()> {
     println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
 
     let mut blocks: Vec<usize> = vec![rows, 8];
-    blocks.extend(std::iter::repeat_n(1, tail_rows));
+    blocks.extend(std::iter::repeat_n(tail_size, tail_rows));
     let mut hpu: Vec<f32> = Vec::with_capacity(tokens * vocab);
     let mut start = 0;
     for (bi, &n) in blocks.iter().enumerate() {
@@ -165,11 +167,15 @@ fn main() -> reng_core::Result<()> {
     let mut agree = 0usize;
     let mut worst_block = 0.0f32;
     start = 0;
+    let mut per_block: Vec<String> = Vec::new();
     for &n in &blocks {
         let (lo, hi) = (start * vocab, (start + n) * vocab);
-        worst_block = worst_block.max(rel_l2(&hpu[lo..hi], &cpu[lo..hi]));
+        let r = rel_l2(&hpu[lo..hi], &cpu[lo..hi]);
+        worst_block = worst_block.max(r);
+        per_block.push(format!("{r:.3}"));
         start += n;
     }
+    println!("per-block rel_L2: {}", per_block.join(" "));
     for tk in 0..tokens {
         let argmax = |v: &[f32]| {
             v[tk * vocab..(tk + 1) * vocab]

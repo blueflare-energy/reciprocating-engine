@@ -10,11 +10,13 @@
 //! Grouped-query attention is supported: query head `j` uses K/V head
 //! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention.
 //!
-//! With a KV cache (see `cached.rs`) each layer also reads per-head cache
-//! tensors `[head_dim, capacity]` and writes the block's new per-head keys and
-//! values to device-resident outputs; attention runs over the concatenation
-//! of cache and block with a mask that admits the filled cache prefix and the
-//! causal part of the block.
+//! With a KV cache (see `cached.rs`) each layer reads per-head cache tensors
+//! `[head_dim, capacity + rows]` and writes updated ones: the block's keys
+//! (after RoPE) and values are placed at their positions by a gemm with a
+//! 0/1 placement matrix and added to the cache read. Attention runs over
+//! the whole updated cache with a mask that admits positions up to each
+//! query's own. Every step of that data path is MME or TPC work inside the
+//! recipe; no DMA node touches the cache.
 //!
 //! Launch and readback (including the completion protocol) live in
 //! `runtime.rs`. Diagnostic environment switches (all off by default):
@@ -111,6 +113,8 @@ pub(crate) struct Gb {
     pub data: Vec<Vec<f32>>,
     pub scratch_names: Vec<CString>,
     pub scratch_sizes: Vec<Vec<u64>>,
+    /// Whether each scratch tensor is f32 (else bf16); sizes count elements.
+    pub scratch_f32: Vec<bool>,
     /// Node ids in creation order (a valid topological order for our graphs).
     node_ids: Vec<synNodeId>,
 }
@@ -127,6 +131,7 @@ impl Gb {
             data: Vec::new(),
             scratch_names: Vec::new(),
             scratch_sizes: Vec::new(),
+            scratch_f32: Vec::new(),
             node_ids: Vec::new(),
         })
     }
@@ -144,17 +149,33 @@ impl Gb {
     /// A persistent bf16 tensor that gets its own device buffer at launch but
     /// is neither uploaded nor read back (device-resident intermediate).
     pub fn scratch(&mut self, name: &str, sizes: &[u64]) -> Result<synTensor> {
-        let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
+        self.scratch_typed(name, sizes, SYN_TYPE_BF16)
+    }
+
+    fn scratch_typed(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        dtype: core::ffi::c_int,
+    ) -> Result<synTensor> {
+        let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
+        self.scratch_f32.push(dtype == SYN_TYPE_F32);
         Ok(t)
     }
 
-    /// A graph-internal tensor.
-    pub fn mid(&self, name: &str, sizes: &[u64], dtype: core::ffi::c_int) -> Result<synTensor> {
+    /// A graph-internal tensor. Diagnostic `RENG_PERSIST_ALL` makes every
+    /// intermediate a persistent scratch tensor instead, so a run can be
+    /// dumped tensor by tensor (`RENG_DUMP_SCRATCH`).
+    pub fn mid(&mut self, name: &str, sizes: &[u64], dtype: core::ffi::c_int) -> Result<synTensor> {
+        if env_on("RENG_PERSIST_ALL") {
+            return self.scratch_typed(name, sizes, dtype);
+        }
         Ok(make_tensor(self.graph, name, sizes, dtype, false)?.0)
     }
 
+    /// Append a node and return its id (for explicit dependency edges).
     pub fn node(
         &mut self,
         guid: &str,
@@ -163,7 +184,7 @@ impl Gb {
         outs: &[synTensor],
         params: *const c_void,
         params_size: u32,
-    ) -> Result<()> {
+    ) -> Result<synNodeId> {
         let g = CString::new(guid).unwrap();
         let n = CString::new(name).unwrap();
         let mut id: synNodeId = 0;
@@ -182,7 +203,7 @@ impl Gb {
             core::ptr::null(),
         ));
         self.node_ids.push(id);
-        Ok(())
+        Ok(id)
     }
 
     /// Diagnostic (`RENG_SERIALIZE`): an explicit control dependency from every
@@ -205,21 +226,24 @@ pub(crate) struct Shared {
     /// Additive mask laid out like the score matrix, `[keys, queries]`.
     pub mask: Option<synTensor>,
     /// KV-cache capacity in positions. When set, every layer gets per-head
-    /// cache inputs and per-head new-K/V outputs (see [`cache_names`]), and
-    /// the key axis of the scores is `capacity + tokens`.
+    /// cache input and output tensors (see [`cache_names`]) of
+    /// `capacity + tokens` positions, which is also the key axis of the scores.
     pub cache: Option<usize>,
+    /// The placement matrix input (`[tokens, capacity + tokens]` device
+    /// sizes: row r of the block goes to the position whose entry is 1).
+    pub place: Option<synTensor>,
 }
 
 /// Persistent tensor names of layer `li`'s cache state for KV head `g`:
-/// `(k_cache, v_cache, k_new, v_new)`. The caches are `[head_dim, capacity]`,
-/// the new tensors `[head_dim, tokens]` (keys after RoPE).
+/// `(k_cache_in, v_cache_in, k_cache_out, v_cache_out)`, each
+/// `[head_dim, capacity + tokens]` (keys after RoPE).
 #[must_use]
 pub fn cache_names(li: usize, g: usize) -> (String, String, String, String) {
     (
-        format!("l{li}_kc{g}"),
-        format!("l{li}_vc{g}"),
-        format!("l{li}_kn{g}"),
-        format!("l{li}_vn{g}"),
+        format!("l{li}_kci{g}"),
+        format!("l{li}_vci{g}"),
+        format!("l{li}_kco{g}"),
+        format!("l{li}_vco{g}"),
     )
 }
 
@@ -256,8 +280,6 @@ pub(crate) fn build_layer(
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
     let t_wq = gb.input(&p("wq"), &[h, h], &wq_scaled)?;
-    let t_wk = gb.input(&p("wk"), &[kvd, h], w.wk)?;
-    let t_wv = gb.input(&p("wv"), &[kvd, h], w.wv)?;
     let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
     let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
     let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
@@ -266,8 +288,6 @@ pub(crate) fn build_layer(
     let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
     let t_q = gb.mid(&p("q"), &[h, t], bf)?;
-    let t_k = gb.mid(&p("k"), &[kvd, t], bf)?;
-    let t_v = gb.mid(&p("v"), &[kvd, t], bf)?;
     let t_attn = gb.mid(&p("attn"), &[h, t], bf)?;
     let t_o = gb.mid(&p("o"), &[h, t], bf)?;
     let t_h = gb.mid(&p("h"), &[h, t], bf)?;
@@ -284,7 +304,9 @@ pub(crate) fn build_layer(
         None => gb.mid(&p("out"), &[h, t], bf)?,
     };
 
-    // Key axis of the score matrices: the cache prefix (if any) plus the block.
+    // Key axis of the score matrices: the block alone, or the whole cache
+    // (`capacity + rows` positions: a block that starts near the end of the
+    // usable capacity spills its padding rows into the slack).
     let keys = sh.cache.map_or(t, |c| c as u64 + t);
     let rms = RmsNormParams {
         epsilon: w.eps,
@@ -294,7 +316,6 @@ pub(crate) fn build_layer(
     };
     let rope = RopeParams { offset: 0, mode: 0 };
     let axis0 = AxisParams { axis: 0 };
-    let axis1 = AxisParams { axis: 1 };
     let gemm = synGEMMParams {
         transpose_a: false,
         transpose_b: false,
@@ -314,10 +335,6 @@ pub(crate) fn build_layer(
     );
     let pax = (
         (&raw const axis0).cast::<c_void>(),
-        core::mem::size_of::<AxisParams>() as u32,
-    );
-    let pax1 = (
-        (&raw const axis1).cast::<c_void>(),
         core::mem::size_of::<AxisParams>() as u32,
     );
     let pg = (
@@ -343,13 +360,8 @@ pub(crate) fn build_layer(
         prm.1,
     )?;
     gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q], pg.0, pg.1)?;
-    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
-    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
-
-    // Per-head slices (split only when there is more than one slice). With a
-    // cache, the per-head values and rotated keys of this block are
-    // device-resident outputs the caller copies into the cache after launch.
-    let heads = |gb: &Gb, pre: &str, count: usize| -> Result<Vec<synTensor>> {
+    // Per-head query slices (split only when there is more than one slice).
+    let heads = |gb: &mut Gb, pre: &str, count: usize| -> Result<Vec<synTensor>> {
         (0..count)
             .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
             .collect()
@@ -361,74 +373,127 @@ pub(crate) fn build_layer(
     } else {
         vec![t_q]
     };
-    let ks = if nkv > 1 {
-        let k_h = heads(gb, "k", nkv)?;
-        gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
-        k_h
-    } else {
-        vec![t_k]
-    };
-    let vs = if sh.cache.is_some() {
-        let mut v_h = Vec::with_capacity(nkv);
-        for g in 0..nkv {
-            v_h.push(gb.scratch(&cache_names(li, g).3, &[hd, t])?);
-        }
-        if nkv > 1 {
-            gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
-        } else {
-            gb.node("memcpy", &p("v_new"), &[t_v], &v_h, none.0, none.1)?;
-        }
-        v_h
-    } else if nkv > 1 {
-        let v_h = heads(gb, "v", nkv)?;
-        gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
-        v_h
-    } else {
-        vec![t_v]
-    };
-    // Rotated keys per KV head, then the full key/value ranges attention
-    // runs over: the block alone, or cache prefix ++ block.
+    // Keys and values per KV head. Without a cache they come from one K and
+    // one V projection split per head; the rotated keys and the values of the
+    // block are graph-internal. With a cache each KV head has its own K and V
+    // projection, and the block's rotated keys and values are placed into the
+    // cache by compute engines only: `cache_out = cache_in + place(block)`,
+    // where `place` is a gemm with the caller's 0/1 placement matrix (block
+    // row r goes to position pos + r). The caller binds `cache_in` and
+    // `cache_out` to two buffers and swaps them every launch. Attention then
+    // reads the whole updated cache. No DMA touches cache data: on this stack
+    // a DMA reading freshly compute-written memory can return stale bytes.
     let mut k_full: Vec<synTensor> = Vec::with_capacity(nkv);
     let mut v_full: Vec<synTensor> = Vec::with_capacity(nkv);
-    for (g, &kg) in ks.iter().enumerate() {
-        let (n_kc, n_vc, n_kn, _) = cache_names(li, g);
-        let kr = match sh.cache {
-            Some(_) => gb.scratch(&n_kn, &[hd, t])?,
-            None => gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?,
-        };
-        gb.node(
-            "rope_st2_fwd_bf16",
-            &p(&format!("rope_k{g}")),
-            &[kg, sh.sin, sh.cos],
-            &[kr],
-            pr.0,
-            pr.1,
-        )?;
-        if let Some(cap) = sh.cache {
-            let c = cap as u64;
-            let kc = gb.scratch(&n_kc, &[hd, c])?;
-            let vc = gb.scratch(&n_vc, &[hd, c])?;
-            let kf = gb.mid(&p(&format!("kf{g}")), &[hd, keys], bf)?;
-            let vf = gb.mid(&p(&format!("vf{g}")), &[hd, keys], bf)?;
+    if let Some(place) = sh.place {
+        for g in 0..nkv {
+            // Column block g of the [hidden, kvd] projections, as [hidden, hd].
+            let cols = |m: &[f32]| -> Vec<f32> {
+                (0..hidden)
+                    .flat_map(|r| {
+                        m[r * nkv * hd_us + g * hd_us..r * nkv * hd_us + (g + 1) * hd_us]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            };
+            let t_wk_g = gb.input(&p(&format!("wk{g}")), &[hd, h], &cols(w.wk))?;
+            let t_wv_g = gb.input(&p(&format!("wv{g}")), &[hd, h], &cols(w.wv))?;
+            let (n_kc_in, n_vc_in, n_kc_out, n_vc_out) = cache_names(li, g);
+            let kc_in = gb.scratch(&n_kc_in, &[hd, keys])?;
+            let vc_in = gb.scratch(&n_vc_in, &[hd, keys])?;
+            let kc_out = gb.scratch(&n_kc_out, &[hd, keys])?;
+            let vc_out = gb.scratch(&n_vc_out, &[hd, keys])?;
+            let k_g = gb.mid(&p(&format!("k{g}")), &[hd, t], bf)?;
+            let kn = gb.mid(&p(&format!("kn{g}")), &[hd, t], bf)?;
+            let vn = gb.mid(&p(&format!("vn{g}")), &[hd, t], bf)?;
+            let kp = gb.mid(&p(&format!("kp{g}")), &[hd, keys], bf)?;
+            let vp = gb.mid(&p(&format!("vp{g}")), &[hd, keys], bf)?;
             gb.node(
-                "concat",
-                &p(&format!("kcat{g}")),
-                &[kc, kr],
-                &[kf],
-                pax1.0,
-                pax1.1,
+                "gemm",
+                &p(&format!("k_proj{g}")),
+                &[t_n1, t_wk_g],
+                &[k_g],
+                pg.0,
+                pg.1,
             )?;
             gb.node(
-                "concat",
-                &p(&format!("vcat{g}")),
-                &[vc, vs[g]],
-                &[vf],
-                pax1.0,
-                pax1.1,
+                "rope_st2_fwd_bf16",
+                &p(&format!("rope_k{g}")),
+                &[k_g, sh.sin, sh.cos],
+                &[kn],
+                pr.0,
+                pr.1,
             )?;
-            k_full.push(kf);
-            v_full.push(vf);
+            gb.node(
+                "gemm",
+                &p(&format!("v_proj{g}")),
+                &[t_n1, t_wv_g],
+                &[vn],
+                pg.0,
+                pg.1,
+            )?;
+            // placed[position, hd] = place[position, row] @ block[row, hd]
+            gb.node(
+                "gemm",
+                &p(&format!("k_place{g}")),
+                &[place, kn],
+                &[kp],
+                pg.0,
+                pg.1,
+            )?;
+            gb.node(
+                "gemm",
+                &p(&format!("v_place{g}")),
+                &[place, vn],
+                &[vp],
+                pg.0,
+                pg.1,
+            )?;
+            gb.node(
+                "add_fwd_bf16",
+                &p(&format!("k_cache{g}")),
+                &[kc_in, kp],
+                &[kc_out],
+                none.0,
+                none.1,
+            )?;
+            gb.node(
+                "add_fwd_bf16",
+                &p(&format!("v_cache{g}")),
+                &[vc_in, vp],
+                &[vc_out],
+                none.0,
+                none.1,
+            )?;
+            k_full.push(kc_out);
+            v_full.push(vc_out);
+        }
+    } else {
+        let t_wk = gb.input(&p("wk"), &[kvd, h], w.wk)?;
+        let t_wv = gb.input(&p("wv"), &[kvd, h], w.wv)?;
+        let t_k = gb.mid(&p("k"), &[kvd, t], bf)?;
+        let t_v = gb.mid(&p("v"), &[kvd, t], bf)?;
+        gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
+        gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
+        let (ks, vs) = if nkv > 1 {
+            let (k_h, v_h) = (heads(gb, "k", nkv)?, heads(gb, "v", nkv)?);
+            gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
+            gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
+            (k_h, v_h)
         } else {
+            (vec![t_k], vec![t_v])
+        };
+        for (g, &kg) in ks.iter().enumerate() {
+            let kr = gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?;
+            gb.node(
+                "rope_st2_fwd_bf16",
+                &p(&format!("rope_k{g}")),
+                &[kg, sh.sin, sh.cos],
+                &[kr],
+                pr.0,
+                pr.1,
+            )?;
             k_full.push(kr);
             v_full.push(vs[g]);
         }
@@ -581,6 +646,14 @@ pub(crate) fn build_head(
     let t_nf = gb.mid("nf", &[h, t], bf)?;
     let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
     let (t_logits, n_logits) = make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?;
+    // Diagnostic `RENG_TPC_OUT`: route the logits through a TPC identity
+    // (add 0) so a TPC kernel, not the MME, is the output's last writer.
+    let tpc_out = env_on("RENG_TPC_OUT");
+    let t_lg = if tpc_out {
+        gb.mid("lg", &[v, t], bf)?
+    } else {
+        t_logits
+    };
     let rms = RmsNormParams {
         epsilon: m.layers[0].eps,
         fused_gamma_beta: false,
@@ -603,10 +676,21 @@ pub(crate) fn build_head(
         "gemm",
         "lm_head",
         &[t_nf, t_lm],
-        &[t_logits],
+        &[t_lg],
         (&raw const gemm).cast::<c_void>(),
         core::mem::size_of::<synGEMMParams>() as u32,
     )?;
+    if tpc_out {
+        let t_zero = gb.input("ZERO", &[v, t], &vec![0.0; vocab * tokens])?;
+        gb.node(
+            "add_fwd_bf16",
+            "logits_out",
+            &[t_lg, t_zero],
+            &[t_logits],
+            core::ptr::null(),
+            0,
+        )?;
+    }
     Ok(Out {
         name: n_logits,
         sizes: vec![v, t],
@@ -663,6 +747,7 @@ fn build_stack(
         cos: t_cos,
         mask: t_mask,
         cache: None,
+        place: None,
     };
     let persist = env_on("RENG_PERSIST_LAYERS");
     let mut cur = t_x;
@@ -732,14 +817,15 @@ pub fn model_probe_bf16(
     assert!(upto < m.layers.len());
     assert_eq!(x.len(), tokens * hidden);
     let (t, h) = (tokens as u64, hidden as u64);
-    // Build the stack, then expose the last layer's output through a memcpy
-    // into a dedicated persistent tensor that is read back.
+    // Build the stack, then expose the last layer's output through a TPC
+    // identity into a dedicated persistent tensor that is read back.
     let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, upto, None)?;
     let (t_probe, n_probe) = make_tensor(gb.graph, "PROBE", &[h, t], SYN_TYPE_BF16, true)?;
+    let t_zero = gb.input("ZERO", &[h, t], &vec![0.0; hidden * tokens])?;
     gb.node(
-        "memcpy",
+        "add_fwd_bf16",
         "probe_out",
-        &[cur],
+        &[cur, t_zero],
         &[t_probe],
         core::ptr::null(),
         0,
