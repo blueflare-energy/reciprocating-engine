@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788605162611,
+  "lastUpdate": 1788605301248,
   "repoUrl": "https://github.com/blueflare-energy/reciprocating-engine",
   "entries": {
     "Gaudi2 inference": [
@@ -606,6 +606,172 @@ window.BENCHMARK_DATA = {
           {
             "name": "SmolLM2-360M decode % of ceiling (b8)",
             "value": 8.618594106405157,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "noah@it.bluefla.re",
+            "name": "Noah"
+          },
+          "committer": {
+            "email": "noah@it.bluefla.re",
+            "name": "bfe-noah"
+          },
+          "distinct": true,
+          "id": "a302066b221f0c359ed9c8b76631d695327a59dd",
+          "message": "reng-batched-test: complete the probe inputs (fixes --all-targets build)\n\nThe three single-input probes lacked the new raw field. The ScatterND probe\nnow also tries scatter_nd_update_fwd_bf16 and scatter_nd_fwd_bf16 with their\nparameter structs from perf_lib_layer_params.h.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VUoyvmdyW73XuUwedpKuqZ",
+          "timestamp": "2026-09-05T04:44:55-06:00",
+          "tree_id": "3e8433e2f1d94ad2f36e6ced91b0f8dc28bdad6b",
+          "url": "https://github.com/blueflare-energy/reciprocating-engine/commit/a302066b221f0c359ed9c8b76631d695327a59dd"
+        },
+        "date": 1788605300489,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 38667.66920654849,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 3.352704721773081,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b1)",
+            "value": 665.9986284174497,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 1.40 ms; ceiling 8986 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b1)",
+            "value": 7.411508487645162,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 30131.393177634654,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 2.6125615081849456,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b8)",
+            "value": 2475.923218332664,
+            "unit": "tok/s",
+            "extra": "ctx ~144; median step 2.88 ms; ceiling 66328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b8)",
+            "value": 3.7328562607206757,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill tok/s (b1)",
+            "value": 16761.135745033793,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90959 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill % of ceiling (b1)",
+            "value": 18.427189901578192,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B decode tok/s (b1)",
+            "value": 287.1585870044057,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 3.43 ms; ceiling 709 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B decode % of ceiling (b1)",
+            "value": 40.48360990706344,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill tok/s (b1)",
+            "value": 8767.202627852548,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90959 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill % of ceiling (b1)",
+            "value": 9.638661137681071,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B decode tok/s (b8)",
+            "value": 914.7021030169739,
+            "unit": "tok/s",
+            "extra": "ctx ~144; median step 8.21 ms; ceiling 5371 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B decode % of ceiling (b8)",
+            "value": 17.029533978869797,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M prefill tok/s (b1)",
+            "value": 28537.966531653845,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 430320 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M prefill % of ceiling (b1)",
+            "value": 6.631804088570583,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M decode tok/s (b1)",
+            "value": 553.3257057961171,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 1.76 ms; ceiling 3356 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M decode % of ceiling (b1)",
+            "value": 16.488451979155315,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M prefill tok/s (b1)",
+            "value": 21696.10532238728,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 430320 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M prefill % of ceiling (b1)",
+            "value": 5.041856077007862,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M decode tok/s (b8)",
+            "value": 2252.1903122631957,
+            "unit": "tok/s",
+            "extra": "ctx ~144; median step 3.20 ms; ceiling 25431 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M decode % of ceiling (b8)",
+            "value": 8.855972658268847,
             "unit": "%",
             "extra": "HbmBandwidth bound"
           }
