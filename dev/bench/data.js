@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788603048153,
+  "lastUpdate": 1788603284049,
   "repoUrl": "https://github.com/blueflare-energy/reciprocating-engine",
   "entries": {
     "Gaudi2 inference": [
@@ -136,6 +136,52 @@ window.BENCHMARK_DATA = {
           {
             "name": "SmolLM2-135M decode % of ceiling (b1)",
             "value": 4.393043190537673,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "noah@it.bluefla.re",
+            "name": "Noah"
+          },
+          "committer": {
+            "email": "noah@it.bluefla.re",
+            "name": "bfe-noah"
+          },
+          "distinct": true,
+          "id": "44b29de96bf743522f03ff07de548313bf2ab628",
+          "message": "reng-synapse: batched attention, one node per step for all heads\n\nAttention now runs on 4-D tensors [.., heads-per-group, groups]: the Q/K/V\nprojections are batch_gemms of the normalised input (broadcast) against\nper-head weight blocks, RoPE runs once on Q and once on K with one 2-D\ntable, the KV cache is one [head_dim, capacity, 1, groups] tensor per layer\nupdated by one placement batch_gemm and one add for K and for V, scores and\ncontext are single batch_gemms whose size-1 dim broadcasts each KV head over\nits group, the mask add broadcasts over heads, and one transpose brings the\nper-head context back to [hidden, tokens]. A decoder layer is 28 nodes\ninstead of ~80.\n\nAll correctness checks unchanged: single- and multi-head layer tests,\n2- and 4-layer synthetic models, 40 single-token cache steps (top-1\n304/304), SmolLM2-135M teacher-forced 7/8 exact plus one bf16 near-tie.\nSmolLM2 decode: 613 tok/s at 1.56 ms per step (6.8% of the HBM ceiling),\nfrom 397; the 30-layer recipe compiles in 4.7 s instead of 7.\n\nreng-bench now warms the prefill recipe as well before measuring.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VUoyvmdyW73XuUwedpKuqZ",
+          "timestamp": "2026-09-05T04:14:11-06:00",
+          "tree_id": "0162a53960d388a4e3336a15a2c37499ea72b01d",
+          "url": "https://github.com/blueflare-energy/reciprocating-engine/commit/44b29de96bf743522f03ff07de548313bf2ab628"
+        },
+        "date": 1788603283239,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 5702.347442604091,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 0.4944256426185535,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b1)",
+            "value": 606.5587826683675,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 1.59 ms; ceiling 8986 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b1)",
+            "value": 6.75003727362712,
             "unit": "%",
             "extra": "HbmBandwidth bound"
           }
