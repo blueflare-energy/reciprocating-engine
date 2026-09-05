@@ -32,3 +32,17 @@ mismatch fails unless the engine's token is within `--margin` logits
 (default 0.5) of the reference's best candidate in the reference's f32
 logits; such candidates are within bf16 rounding of each other and the
 mismatch is reported as a near-tie.
+
+## Runner checks
+
+The `bench` workflow runs `reng-generate --ref` on the self-hosted runner
+before it records any throughput, for every line of
+`$RENG_ORACLE_DIR/prompts.txt`:
+
+```text
+<model_dir> <gen8 reference json> <prompt ids...>
+```
+
+Each reference is a `generate.py` output for that model and prompt, kept
+next to the file. The step is skipped when the runner does not export
+`RENG_ORACLE_DIR`.
