@@ -70,9 +70,9 @@ against the `reng-ceiling` roofline:
 | SmolLM2-360M | 605 (18.0%) | 5423 (21.3%) | 29983 (21.1%) | |
 | Qwen2.5-0.5B | 756 (30.6%) | 5745 (29.4%) | 37094 (26.1%) | |
 | Qwen2.5-1.5B | 404 (51.0%) | 3141 (50.0%) | 19745 (42.2%) | |
-| SmolLM2-1.7B | 370 (52.1%) | 2972 (55.3%) | 13887 (46.4%) | 30.6k (25.7%) |
-| Qwen2.5-3B | 247 (62.2%) | 1931 (61.2%) | 12735 (52.9%) | |
-| Qwen2.5-7B | 133 (76.6%) | 1051 (76.2%) | 7372 (69.0%) | |
+| SmolLM2-1.7B | 370 (52.1%) | 2972 (55.3%) | 13887 (46.4%) | 35.2k (29.5%) |
+| Qwen2.5-3B | 247 (62.2%) | 1931 (61.2%) | 12735 (52.9%) | 35.3k (52.9%) |
+| Qwen2.5-7B | 133 (76.6%) | 1051 (76.2%) | 7372 (69.0%) | 18.5k (62.5%) |
 
 Decode percentages are against the HBM roofline, prefill against the MME
 roofline. The `bench` workflow regenerates the decode-versus-batch table
