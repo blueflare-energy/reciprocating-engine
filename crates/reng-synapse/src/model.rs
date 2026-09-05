@@ -404,10 +404,10 @@ pub(crate) fn build_layer(
     // (N = all heads at once; the same buffers the batched decode recipe
     // binds by name) followed by a transpose into the head layout: a
     // batch_gemm over per-head blocks runs each head as an N = hd gemm,
-    // which the MME executes at a fraction of its rate. Small models (few
-    // heads, narrow hidden) lose more to the transposes than they gain, so
-    // they keep the per-head form; `RENG_HEAD_BLOCKS` forces it.
-    let head_blocks = env_on("RENG_HEAD_BLOCKS") || hidden < 1024;
+    // which the MME executes at a fraction of its rate (12% of a 1.7B
+    // prefill; a wash for a 135M model). Diagnostic `RENG_HEAD_BLOCKS`
+    // keeps the per-head form.
+    let head_blocks = env_on("RENG_HEAD_BLOCKS");
     let (t_wq, t_wk, t_wv) = if head_blocks {
         (
             gb.input(

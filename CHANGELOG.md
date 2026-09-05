@@ -41,10 +41,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   output is a second buffer, alternating buffers per block: the in-place
   form runs the block's rows serially (0.16 ms per layer and cache at 1024
   rows, a third of the layer). SmolLM2-1.7B prefill at 1024 tokens goes
-  from 31.2k to 35.2k tok/s. Attention projections of models with hidden
-  size 1024 and up are plain gemms over the natural weights (shared with
-  the batched decode recipe) plus a transpose into the head layout instead
-  of per-head batch_gemms, which the MME runs at N = head_dim.
+  from 31.2k to 35.2k tok/s. Attention projections are plain gemms over
+  the natural weights (shared with the batched decode recipe) plus a
+  transpose into the head layout instead of per-head batch_gemms, which
+  the MME runs at N = head_dim.
 - `reng-attn-bench` and `reng-scatter-bench` time attention gemm
   orientations and cache-write kernels standalone.
 - Capacity buckets for batched decode: the recipes are compiled for the
