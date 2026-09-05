@@ -1,7 +1,7 @@
 //! Verify a full synthetic decoder-only model (L fused layers + final norm +
-//! LM head, one recipe, causal) against a CPU reference.
+//! LM head, one recipe, causal, optional GQA) against a CPU reference.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-model-test -- [tokens] [hidden] [inter] [n_heads] [vocab] [layers] [causal 0/1]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-model-test -- [tokens] [hidden] [inter] [n_heads] [vocab] [layers] [causal 0/1] [n_kv_heads]`.
 
 use reng_synapse::{LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu};
 
@@ -38,7 +38,9 @@ fn main() -> reng_core::Result<()> {
         arg(4, 2usize),
     );
     let (vocab, n_layers, causal) = (arg(5, 512usize), arg(6, 2usize), arg(7, 1usize) != 0);
+    let n_kv_heads = arg(8, n_heads);
     let hd = hidden / n_heads;
+    let kvd = n_kv_heads * hd;
     let half = hd / 2;
     let fan = 1.0 / (hidden as f32).sqrt();
     let fan_i = 1.0 / (inter as f32).sqrt();
@@ -63,8 +65,8 @@ fn main() -> reng_core::Result<()> {
                 .map(|i| 1.1 - (((i + 2 * l) % 5) as f32) * 0.04)
                 .collect(),
             wq: seq(hidden * hidden, 5 + l, 1, 17, fan),
-            wk: seq(hidden * hidden, 11 + l, 4, 19, fan),
-            wv: seq(hidden * hidden, 13 + l, 2, 21, fan),
+            wk: seq(hidden * kvd, 11 + l, 4, 19, fan),
+            wv: seq(hidden * kvd, 13 + l, 2, 21, fan),
             wo: seq(hidden * hidden, 3 + l, 5, 29, fan),
             wg: seq(hidden * inter, 17 + l, 6, 31, fan),
             wu: seq(hidden * inter, 19 + l, 7, 37, fan),
@@ -75,6 +77,7 @@ fn main() -> reng_core::Result<()> {
         .iter()
         .map(|o| LayerWeights {
             n_heads,
+            n_kv_heads,
             g1: &o.g1,
             g2: &o.g2,
             wq: &o.wq,
@@ -99,7 +102,7 @@ fn main() -> reng_core::Result<()> {
     };
 
     println!(
-        "fused model: layers={n_layers}, tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, vocab={vocab}, causal={causal}"
+        "fused model: layers={n_layers}, tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads}, vocab={vocab}, causal={causal}"
     );
     let hpu = model_forward_bf16(&x, &m, tokens, hidden, inter, vocab, causal)?;
     let cpu = model_forward_cpu(&x, &m, tokens, hidden, inter, vocab, causal);

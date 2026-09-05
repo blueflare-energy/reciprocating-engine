@@ -4,9 +4,11 @@
 //! `[tokens, vocab]` logits are read back.
 //!
 //! The graph is assembled by a small builder that appends layers, so the same
-//! code path serves a 2-layer synthetic model and a real 32-layer one. The
+//! code path serves a 2-layer synthetic model and a real 30-layer one. The
 //! embedding gather is done on the host (a row copy per token; trivially exact
 //! and cheap), so the graph starts from `[tokens, hidden]` activations.
+//! Grouped-query attention is supported: query head `j` uses K/V head
+//! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention.
 
 use crate::LayerWeights;
 use crate::ffi::*;
@@ -165,9 +167,17 @@ fn build_layer(
     hidden: usize,
     inter: usize,
 ) -> Result<synTensor> {
-    let nh = w.n_heads;
+    let (nh, nkv) = (w.n_heads, w.n_kv_heads);
+    assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
     let hd_us = hidden / nh;
-    let (t, h, i, hd) = (tokens as u64, hidden as u64, inter as u64, hd_us as u64);
+    let n_rep = nh / nkv;
+    let (t, h, i, hd, kvd) = (
+        tokens as u64,
+        hidden as u64,
+        inter as u64,
+        hd_us as u64,
+        (nkv * hd_us) as u64,
+    );
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
 
@@ -175,8 +185,8 @@ fn build_layer(
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
     let t_wq = gb.input(&p("wq"), &[h, h], &wq_scaled)?;
-    let t_wk = gb.input(&p("wk"), &[h, h], w.wk)?;
-    let t_wv = gb.input(&p("wv"), &[h, h], w.wv)?;
+    let t_wk = gb.input(&p("wk"), &[kvd, h], w.wk)?;
+    let t_wv = gb.input(&p("wv"), &[kvd, h], w.wv)?;
     let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
     let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
     let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
@@ -185,8 +195,8 @@ fn build_layer(
     let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
     let t_q = gb.mid(&p("q"), &[h, t], bf)?;
-    let t_k = gb.mid(&p("k"), &[h, t], bf)?;
-    let t_v = gb.mid(&p("v"), &[h, t], bf)?;
+    let t_k = gb.mid(&p("k"), &[kvd, t], bf)?;
+    let t_v = gb.mid(&p("v"), &[kvd, t], bf)?;
     let t_attn = gb.mid(&p("attn"), &[h, t], bf)?;
     let t_o = gb.mid(&p("o"), &[h, t], bf)?;
     let t_h = gb.mid(&p("h"), &[h, t], bf)?;
@@ -255,41 +265,52 @@ fn build_layer(
     gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
     gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
 
-    // Per-head slices (only created when there is more than one head).
-    let (qs, ks, vs): (Vec<synTensor>, Vec<synTensor>, Vec<synTensor>) = if nh > 1 {
-        let mk = |gb: &Gb, pre: &str| -> Result<Vec<synTensor>> {
-            (0..nh)
-                .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
-                .collect()
-        };
-        let (q_h, k_h, v_h) = (mk(gb, "q")?, mk(gb, "k")?, mk(gb, "v")?);
+    // Per-head slices (split only when there is more than one slice).
+    let heads = |gb: &Gb, pre: &str, count: usize| -> Result<Vec<synTensor>> {
+        (0..count)
+            .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
+            .collect()
+    };
+    let qs = if nh > 1 {
+        let q_h = heads(gb, "q", nh)?;
         gb.node("split", &p("split_q"), &[t_q], &q_h, pax.0, pax.1)?;
+        q_h
+    } else {
+        vec![t_q]
+    };
+    let (ks, vs) = if nkv > 1 {
+        let (k_h, v_h) = (heads(gb, "k", nkv)?, heads(gb, "v", nkv)?);
         gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
         gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
-        (q_h, k_h, v_h)
+        (k_h, v_h)
     } else {
-        (vec![t_q], vec![t_k], vec![t_v])
+        (vec![t_k], vec![t_v])
     };
+    let mut kr_h: Vec<synTensor> = Vec::with_capacity(nkv);
+    for (g, &kg) in ks.iter().enumerate() {
+        let kr = gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p(&format!("rope_k{g}")),
+            &[kg, sh.sin, sh.cos],
+            &[kr],
+            pr.0,
+            pr.1,
+        )?;
+        kr_h.push(kr);
+    }
     let mut at_h: Vec<synTensor> = Vec::with_capacity(nh);
-    for j in 0..nh {
+    for (j, &qj) in qs.iter().enumerate() {
+        let g = j / n_rep;
         let qr = gb.mid(&p(&format!("qr{j}")), &[hd, t], bf)?;
-        let kr = gb.mid(&p(&format!("kr{j}")), &[hd, t], bf)?;
         let sc = gb.mid(&p(&format!("scores{j}")), &[t, t], bf)?;
         let pr_t = gb.mid(&p(&format!("probs{j}")), &[t, t], bf)?;
         let at = gb.mid(&p(&format!("attn{j}")), &[hd, t], bf)?;
         gb.node(
             "rope_st2_fwd_bf16",
             &p(&format!("rope_q{j}")),
-            &[qs[j], sh.sin, sh.cos],
+            &[qj, sh.sin, sh.cos],
             &[qr],
-            pr.0,
-            pr.1,
-        )?;
-        gb.node(
-            "rope_st2_fwd_bf16",
-            &p(&format!("rope_k{j}")),
-            &[ks[j], sh.sin, sh.cos],
-            &[kr],
             pr.0,
             pr.1,
         )?;
@@ -297,7 +318,7 @@ fn build_layer(
         gb.node(
             "gemm",
             &p(&format!("qk{j}")),
-            &[qr, kr],
+            &[qr, kr_h[g]],
             &[sc],
             pgt.0,
             pgt.1,
@@ -327,7 +348,7 @@ fn build_layer(
         gb.node(
             "gemm",
             &p(&format!("av{j}")),
-            &[pr_t, vs[j]],
+            &[pr_t, vs[g]],
             &[at],
             pg.0,
             pg.1,
@@ -409,7 +430,7 @@ fn build_layer(
     Ok(t_out)
 }
 
-/// Whole-model weights. All layers share `layers[0]`'s `n_heads`, `eps`, and
+/// Whole-model weights. All layers share `layers[0]`'s head counts, `eps`, and
 /// RoPE caches (`sin`/`cos`, `[tokens, head_dim]`).
 pub struct ModelWeights<'a> {
     pub layers: Vec<LayerWeights<'a>>,
@@ -421,8 +442,8 @@ pub struct ModelWeights<'a> {
 
 /// Run the full forward pass on `x` (`[tokens, hidden]` embeddings, row-major)
 /// and return logits `[tokens, vocab]` as f32. With `causal`, key positions
-/// after the query are masked out in every layer. Every dimension (`hidden`,
-/// `head_dim`, `inter`, `vocab`, `tokens`) should be at least 128.
+/// after the query are masked out in every layer. `hidden`, `inter`, and
+/// `vocab` should be at least 128 (per-head sizes may be smaller).
 ///
 /// # Errors
 ///
@@ -645,7 +666,7 @@ pub fn model_forward_bf16(
     Ok(out)
 }
 
-/// One decoder layer on the CPU (f32), with optional causal masking.
+/// One decoder layer on the CPU (f32), with optional causal masking and GQA.
 #[must_use]
 pub fn layer_cpu(
     x: &[f32],
@@ -655,8 +676,10 @@ pub fn layer_cpu(
     inter: usize,
     causal: bool,
 ) -> Vec<f32> {
-    let nh = w.n_heads;
+    let (nh, nkv) = (w.n_heads, w.n_kv_heads);
     let hd = hidden / nh;
+    let kvd = nkv * hd;
+    let n_rep = nh / nkv;
     let rmsnorm = |src: &[f32], g: &[f32]| -> Vec<f32> {
         let mut o = vec![0.0f32; tokens * hidden];
         for tk in 0..tokens {
@@ -669,6 +692,7 @@ pub fn layer_cpu(
         }
         o
     };
+    // a[tokens, kin] @ mtx[kin, kout] -> [tokens, kout]
     let matmul = |a: &[f32], mtx: &[f32], kin: usize, kout: usize| -> Vec<f32> {
         let mut o = vec![0.0f32; tokens * kout];
         for tk in 0..tokens {
@@ -681,10 +705,12 @@ pub fn layer_cpu(
         }
         o
     };
-    let rope_head = |src: &[f32], head: usize, out: &mut [f32]| {
+    // Rotate-half RoPE on head `head` of a [tokens, stride] tensor, in place
+    // into `out` (same layout).
+    let rope_head = |src: &[f32], stride: usize, head: usize, out: &mut [f32]| {
         let half = hd / 2;
         for tk in 0..tokens {
-            let b = tk * hidden + head * hd;
+            let b = tk * stride + head * hd;
             let c = tk * hd;
             for d in 0..hd {
                 let rot = if d < half {
@@ -700,23 +726,27 @@ pub fn layer_cpu(
     let n1 = rmsnorm(x, w.g1);
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
     let q = matmul(&n1, &wq_scaled, hidden, hidden);
-    let k = matmul(&n1, w.wk, hidden, hidden);
-    let v = matmul(&n1, w.wv, hidden, hidden);
+    let k = matmul(&n1, w.wk, hidden, kvd);
+    let v = matmul(&n1, w.wv, hidden, kvd);
     let mut qr = vec![0.0f32; tokens * hidden];
-    let mut kr = vec![0.0f32; tokens * hidden];
+    let mut kr = vec![0.0f32; tokens * kvd];
     for head in 0..nh {
-        rope_head(&q, head, &mut qr);
-        rope_head(&k, head, &mut kr);
+        rope_head(&q, hidden, head, &mut qr);
+    }
+    for g in 0..nkv {
+        rope_head(&k, kvd, g, &mut kr);
     }
     let mut attn = vec![0.0f32; tokens * hidden];
     let mut scores = vec![0.0f32; tokens];
     for head in 0..nh {
-        let off = head * hd;
+        let g = head / n_rep;
+        let qoff = head * hd;
+        let koff = g * hd;
         for qi in 0..tokens {
             let limit = if causal { qi + 1 } else { tokens };
             for (ki, s) in scores.iter_mut().enumerate().take(limit) {
                 *s = (0..hd)
-                    .map(|d| qr[qi * hidden + off + d] * kr[ki * hidden + off + d])
+                    .map(|d| qr[qi * hidden + qoff + d] * kr[ki * kvd + koff + d])
                     .sum();
             }
             let m = scores[..limit]
@@ -731,7 +761,7 @@ pub fn layer_cpu(
             for (ki, s) in scores[..limit].iter().enumerate() {
                 let pr = s / sum;
                 for d in 0..hd {
-                    attn[qi * hidden + off + d] += pr * v[ki * hidden + off + d];
+                    attn[qi * hidden + qoff + d] += pr * v[ki * kvd + koff + d];
                 }
             }
         }

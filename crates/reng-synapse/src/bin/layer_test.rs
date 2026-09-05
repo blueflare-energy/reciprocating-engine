@@ -1,8 +1,9 @@
-//! Verify one fused multi-head transformer decoder layer against a CPU
-//! reference: RMSNorm -> QKV -> per-head RoPE + attention (split/concat) ->
-//! O-proj -> residual -> RMSNorm -> SwiGLU MLP -> residual, all in one recipe.
+//! Verify one fused multi-head (optionally grouped-query) transformer decoder
+//! layer against a CPU reference: RMSNorm -> QKV -> per-head RoPE + attention
+//! (split/concat) -> O-proj -> residual -> RMSNorm -> SwiGLU MLP -> residual,
+//! all in one recipe.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-layer-test -- [tokens] [hidden] [inter] [n_heads]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-layer-test -- [tokens] [hidden] [inter] [n_heads] [n_kv_heads]`.
 
 use reng_synapse::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu};
 
@@ -26,7 +27,9 @@ fn main() -> reng_core::Result<()> {
         arg(3, 512usize),
         arg(4, 2usize),
     );
+    let n_kv_heads = arg(5, n_heads);
     let hd = hidden / n_heads;
+    let kvd = n_kv_heads * hd;
     let half = hd / 2;
     let fan = 1.0 / (hidden as f32).sqrt();
     let fan_i = 1.0 / (inter as f32).sqrt();
@@ -35,8 +38,8 @@ fn main() -> reng_core::Result<()> {
     let g1: Vec<f32> = (0..hidden).map(|i| 0.9 + ((i % 7) as f32) * 0.03).collect();
     let g2: Vec<f32> = (0..hidden).map(|i| 1.1 - ((i % 5) as f32) * 0.04).collect();
     let wq = seq(hidden * hidden, 5, 1, 17, fan);
-    let wk = seq(hidden * hidden, 11, 4, 19, fan);
-    let wv = seq(hidden * hidden, 13, 2, 21, fan);
+    let wk = seq(hidden * kvd, 11, 4, 19, fan);
+    let wv = seq(hidden * kvd, 13, 2, 21, fan);
     let wo = seq(hidden * hidden, 3, 5, 29, fan);
     let wg = seq(hidden * inter, 17, 6, 31, fan);
     let wu = seq(hidden * inter, 19, 7, 37, fan);
@@ -53,6 +56,7 @@ fn main() -> reng_core::Result<()> {
     }
     let w = LayerWeights {
         n_heads,
+        n_kv_heads,
         g1: &g1,
         g2: &g2,
         wq: &wq,
@@ -69,7 +73,7 @@ fn main() -> reng_core::Result<()> {
     };
 
     println!(
-        "fused decoder layer: tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads} (head_dim {hd})"
+        "fused decoder layer: tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads} (head_dim {hd})"
     );
     let hpu = decoder_layer_bf16(&x, &w, tokens, hidden, inter)?;
     let cpu = decoder_layer_cpu(&x, &w, tokens, hidden, inter);
