@@ -1,0 +1,783 @@
+//! A full decoder-only transformer forward pass as ONE fused SynapseAI recipe:
+//! `L` decoder layers, a final RMSNorm, and the LM head, with a causal mask.
+//! One graph, one launch; activations stay in HBM and only the
+//! `[tokens, vocab]` logits are read back.
+//!
+//! The graph is assembled by a small builder that appends layers, so the same
+//! code path serves a 2-layer synthetic model and a real 32-layer one. The
+//! embedding gather is done on the host (a row copy per token; trivially exact
+//! and cheap), so the graph starts from `[tokens, hidden]` activations.
+
+use crate::LayerWeights;
+use crate::ffi::*;
+use crate::{bf16_to_f32, f32_to_bf16};
+use core::ffi::c_void;
+use reng_core::{Error, Result};
+use std::ffi::CString;
+
+macro_rules! syn {
+    ($call:expr) => {{
+        let st = unsafe { $call };
+        if st != SYN_SUCCESS {
+            return Err(Error::Other(format!(
+                concat!(stringify!($call), " -> synStatus {}"),
+                st
+            )));
+        }
+    }};
+}
+
+#[repr(C)]
+struct RmsNormParams {
+    epsilon: f32,
+    fused_gamma_beta: bool,
+    use_stages: bool,
+    bwd_mode: i32,
+}
+
+#[repr(C)]
+struct RopeParams {
+    offset: u32,
+    mode: i32,
+}
+
+#[repr(C)]
+struct AxisParams {
+    axis: u32,
+}
+
+/// Additive attention-mask value for disallowed keys; `exp` of it underflows
+/// to exactly zero in bf16 softmax while staying representable.
+const MASK_NEG: f32 = -30000.0;
+
+fn make_tensor(
+    graph: synGraphHandle,
+    name: &str,
+    sizes: &[u64],
+    dtype: core::ffi::c_int,
+    persistent: bool,
+) -> Result<(synTensor, CString)> {
+    let cname = CString::new(name).unwrap();
+    let mut t: synTensor = core::ptr::null_mut();
+    syn!(synTensorHandleCreate(
+        &mut t,
+        graph,
+        SYN_TENSOR_DATA,
+        cname.as_ptr()
+    ));
+    if persistent {
+        let mut sec: synSectionHandle = core::ptr::null_mut();
+        syn!(synSectionCreate(&mut sec, 0, graph));
+        syn!(synSectionSetPersistent(sec, true));
+        syn!(synTensorAssignToSection(t, sec, 0));
+    }
+    let mut geo = synTensorGeometry {
+        sizes: [0; HABANA_DIM_MAX],
+        dims: sizes.len() as u32,
+    };
+    geo.sizes[..sizes.len()].copy_from_slice(sizes);
+    syn!(synTensorSetGeometry(t, &geo, SYN_GEOMETRY_SIZES));
+    syn!(synTensorSetDeviceDataType(t, dtype));
+    Ok((t, cname))
+}
+
+/// Accumulates a graph: persistent inputs (with their host data), internal
+/// tensors, and nodes. Launch plumbing lives in [`model_forward_bf16`].
+struct Gb {
+    graph: synGraphHandle,
+    names: Vec<CString>,
+    sizes: Vec<Vec<u64>>,
+    data: Vec<Vec<f32>>,
+}
+
+impl Gb {
+    fn new() -> Result<Self> {
+        syn!(synInitialize());
+        let mut graph: synGraphHandle = core::ptr::null_mut();
+        syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
+        Ok(Self {
+            graph,
+            names: Vec::new(),
+            sizes: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    /// A persistent bf16 input tensor whose host data is uploaded at launch.
+    fn input(&mut self, name: &str, sizes: &[u64], data: &[f32]) -> Result<synTensor> {
+        debug_assert_eq!(sizes.iter().product::<u64>() as usize, data.len());
+        let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
+        self.names.push(cname);
+        self.sizes.push(sizes.to_vec());
+        self.data.push(data.to_vec());
+        Ok(t)
+    }
+
+    /// A graph-internal tensor.
+    fn mid(&self, name: &str, sizes: &[u64], dtype: core::ffi::c_int) -> Result<synTensor> {
+        Ok(make_tensor(self.graph, name, sizes, dtype, false)?.0)
+    }
+
+    fn node(
+        &self,
+        guid: &str,
+        name: &str,
+        ins: &[synTensor],
+        outs: &[synTensor],
+        params: *const c_void,
+        params_size: u32,
+    ) -> Result<()> {
+        let g = CString::new(guid).unwrap();
+        let n = CString::new(name).unwrap();
+        syn!(synNodeCreate(
+            self.graph,
+            ins.as_ptr(),
+            outs.as_ptr(),
+            ins.len() as u32,
+            outs.len() as u32,
+            params,
+            params_size,
+            g.as_ptr(),
+            n.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+        Ok(())
+    }
+}
+
+/// Shared per-graph tensors a layer needs besides its own weights.
+struct Shared {
+    sin: synTensor,
+    cos: synTensor,
+    mask: Option<synTensor>,
+}
+
+/// Append one decoder layer reading `x` and return its output tensor.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn build_layer(
+    gb: &mut Gb,
+    li: usize,
+    x: synTensor,
+    w: &LayerWeights<'_>,
+    sh: &Shared,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+) -> Result<synTensor> {
+    let nh = w.n_heads;
+    let hd_us = hidden / nh;
+    let (t, h, i, hd) = (tokens as u64, hidden as u64, inter as u64, hd_us as u64);
+    let bf = SYN_TYPE_BF16;
+    let p = |s: &str| format!("l{li}_{s}");
+
+    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
+    let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
+    let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
+    let t_wq = gb.input(&p("wq"), &[h, h], &wq_scaled)?;
+    let t_wk = gb.input(&p("wk"), &[h, h], w.wk)?;
+    let t_wv = gb.input(&p("wv"), &[h, h], w.wv)?;
+    let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
+    let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
+    let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
+    let t_wd = gb.input(&p("wd"), &[h, i], w.wd)?;
+
+    let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
+    let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
+    let t_q = gb.mid(&p("q"), &[h, t], bf)?;
+    let t_k = gb.mid(&p("k"), &[h, t], bf)?;
+    let t_v = gb.mid(&p("v"), &[h, t], bf)?;
+    let t_attn = gb.mid(&p("attn"), &[h, t], bf)?;
+    let t_o = gb.mid(&p("o"), &[h, t], bf)?;
+    let t_h = gb.mid(&p("h"), &[h, t], bf)?;
+    let t_n2 = gb.mid(&p("n2"), &[h, t], bf)?;
+    let t_inv2 = gb.mid(&p("inv2"), &[1, t], SYN_TYPE_F32)?;
+    let t_gate = gb.mid(&p("gate"), &[i, t], bf)?;
+    let t_up = gb.mid(&p("up"), &[i, t], bf)?;
+    let t_sg = gb.mid(&p("sg"), &[i, t], bf)?;
+    let t_silu = gb.mid(&p("silu"), &[i, t], bf)?;
+    let t_gated = gb.mid(&p("gated"), &[i, t], bf)?;
+    let t_down = gb.mid(&p("down"), &[h, t], bf)?;
+    let t_out = gb.mid(&p("out"), &[h, t], bf)?;
+
+    let rms = RmsNormParams {
+        epsilon: w.eps,
+        fused_gamma_beta: false,
+        use_stages: false,
+        bwd_mode: 0,
+    };
+    let rope = RopeParams { offset: 0, mode: 0 };
+    let axis0 = AxisParams { axis: 0 };
+    let gemm = synGEMMParams {
+        transpose_a: false,
+        transpose_b: false,
+    };
+    let gemm_bt = synGEMMParams {
+        transpose_a: false,
+        transpose_b: true,
+    };
+    let sm = synSoftmaxParams { dim: 0 };
+    let prm = (
+        (&raw const rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    );
+    let pr = (
+        (&raw const rope).cast::<c_void>(),
+        core::mem::size_of::<RopeParams>() as u32,
+    );
+    let pax = (
+        (&raw const axis0).cast::<c_void>(),
+        core::mem::size_of::<AxisParams>() as u32,
+    );
+    let pg = (
+        (&raw const gemm).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    );
+    let pgt = (
+        (&raw const gemm_bt).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    );
+    let ps = (
+        (&raw const sm).cast::<c_void>(),
+        core::mem::size_of::<synSoftmaxParams>() as u32,
+    );
+    let none = (core::ptr::null::<c_void>(), 0u32);
+
+    gb.node(
+        "rms_norm_fwd_bf16",
+        &p("norm1"),
+        &[x, t_g1],
+        &[t_n1, t_inv1],
+        prm.0,
+        prm.1,
+    )?;
+    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q], pg.0, pg.1)?;
+    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
+    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
+
+    // Per-head slices (only created when there is more than one head).
+    let (qs, ks, vs): (Vec<synTensor>, Vec<synTensor>, Vec<synTensor>) = if nh > 1 {
+        let mk = |gb: &Gb, pre: &str| -> Result<Vec<synTensor>> {
+            (0..nh)
+                .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
+                .collect()
+        };
+        let (q_h, k_h, v_h) = (mk(gb, "q")?, mk(gb, "k")?, mk(gb, "v")?);
+        gb.node("split", &p("split_q"), &[t_q], &q_h, pax.0, pax.1)?;
+        gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
+        gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
+        (q_h, k_h, v_h)
+    } else {
+        (vec![t_q], vec![t_k], vec![t_v])
+    };
+    let mut at_h: Vec<synTensor> = Vec::with_capacity(nh);
+    for j in 0..nh {
+        let qr = gb.mid(&p(&format!("qr{j}")), &[hd, t], bf)?;
+        let kr = gb.mid(&p(&format!("kr{j}")), &[hd, t], bf)?;
+        let sc = gb.mid(&p(&format!("scores{j}")), &[t, t], bf)?;
+        let pr_t = gb.mid(&p(&format!("probs{j}")), &[t, t], bf)?;
+        let at = gb.mid(&p(&format!("attn{j}")), &[hd, t], bf)?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p(&format!("rope_q{j}")),
+            &[qs[j], sh.sin, sh.cos],
+            &[qr],
+            pr.0,
+            pr.1,
+        )?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p(&format!("rope_k{j}")),
+            &[ks[j], sh.sin, sh.cos],
+            &[kr],
+            pr.0,
+            pr.1,
+        )?;
+        // scores[query, key] = qr @ kr^T with K in its natural [seq, head_dim] layout.
+        gb.node(
+            "gemm",
+            &p(&format!("qk{j}")),
+            &[qr, kr],
+            &[sc],
+            pgt.0,
+            pgt.1,
+        )?;
+        let sm_in = if let Some(mask) = sh.mask {
+            let masked = gb.mid(&p(&format!("masked{j}")), &[t, t], bf)?;
+            gb.node(
+                "add_fwd_bf16",
+                &p(&format!("mask{j}")),
+                &[sc, mask],
+                &[masked],
+                none.0,
+                none.1,
+            )?;
+            masked
+        } else {
+            sc
+        };
+        gb.node(
+            "softmax_fwd_bf16",
+            &p(&format!("softmax{j}")),
+            &[sm_in],
+            &[pr_t],
+            ps.0,
+            ps.1,
+        )?;
+        gb.node(
+            "gemm",
+            &p(&format!("av{j}")),
+            &[pr_t, vs[j]],
+            &[at],
+            pg.0,
+            pg.1,
+        )?;
+        at_h.push(at);
+    }
+    let attn_full = if nh > 1 {
+        gb.node("concat", &p("merge_heads"), &at_h, &[t_attn], pax.0, pax.1)?;
+        t_attn
+    } else {
+        at_h[0]
+    };
+    gb.node("gemm", &p("o_proj"), &[attn_full, t_wo], &[t_o], pg.0, pg.1)?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("res1"),
+        &[x, t_o],
+        &[t_h],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "rms_norm_fwd_bf16",
+        &p("norm2"),
+        &[t_h, t_g2],
+        &[t_n2, t_inv2],
+        prm.0,
+        prm.1,
+    )?;
+    gb.node(
+        "gemm",
+        &p("gate_proj"),
+        &[t_n2, t_wg],
+        &[t_gate],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pg.0, pg.1)?;
+    gb.node(
+        "sigmoid_fwd_bf16",
+        &p("sig"),
+        &[t_gate],
+        &[t_sg],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("silu"),
+        &[t_gate, t_sg],
+        &[t_silu],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gate_x_up"),
+        &[t_silu, t_up],
+        &[t_gated],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "gemm",
+        &p("down_proj"),
+        &[t_gated, t_wd],
+        &[t_down],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("res2"),
+        &[t_h, t_down],
+        &[t_out],
+        none.0,
+        none.1,
+    )?;
+    Ok(t_out)
+}
+
+/// Whole-model weights. All layers share `layers[0]`'s `n_heads`, `eps`, and
+/// RoPE caches (`sin`/`cos`, `[tokens, head_dim]`).
+pub struct ModelWeights<'a> {
+    pub layers: Vec<LayerWeights<'a>>,
+    /// Final RMSNorm gain, length `hidden`.
+    pub final_gamma: &'a [f32],
+    /// LM head stored `[hidden, vocab]`.
+    pub lm_head: &'a [f32],
+}
+
+/// Run the full forward pass on `x` (`[tokens, hidden]` embeddings, row-major)
+/// and return logits `[tokens, vocab]` as f32. With `causal`, key positions
+/// after the query are masked out in every layer. Every dimension (`hidden`,
+/// `head_dim`, `inter`, `vocab`, `tokens`) should be at least 128.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+///
+/// # Panics
+///
+/// Panics if `layers` is empty or any buffer length disagrees with the sizes.
+#[allow(clippy::too_many_lines)]
+pub fn model_forward_bf16(
+    x: &[f32],
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    causal: bool,
+) -> Result<Vec<f32>> {
+    assert!(!m.layers.is_empty());
+    assert_eq!(x.len(), tokens * hidden);
+    assert_eq!(m.final_gamma.len(), hidden);
+    assert_eq!(m.lm_head.len(), hidden * vocab);
+    let l0 = &m.layers[0];
+    let hd = hidden / l0.n_heads;
+    assert_eq!(l0.sin.len(), tokens * hd);
+    let (t, h, hd64, v) = (tokens as u64, hidden as u64, hd as u64, vocab as u64);
+    let bf = SYN_TYPE_BF16;
+
+    let mut gb = Gb::new()?;
+    let t_x = gb.input("X", &[h, t], x)?;
+    let t_sin = gb.input("SIN", &[hd64, t], l0.sin)?;
+    let t_cos = gb.input("COS", &[hd64, t], l0.cos)?;
+    // Causal mask laid out like the score matrix: [key (FCD), query].
+    let mask_host: Vec<f32> = (0..tokens * tokens)
+        .map(|idx| {
+            let (q, k) = (idx / tokens, idx % tokens);
+            if k <= q { 0.0 } else { MASK_NEG }
+        })
+        .collect();
+    let t_mask = if causal {
+        Some(gb.input("MASK", &[t, t], &mask_host)?)
+    } else {
+        None
+    };
+    let sh = Shared {
+        sin: t_sin,
+        cos: t_cos,
+        mask: t_mask,
+    };
+
+    let mut cur = t_x;
+    for (li, lw) in m.layers.iter().enumerate() {
+        cur = build_layer(&mut gb, li, cur, lw, &sh, tokens, hidden, inter)?;
+    }
+
+    // Final norm + LM head -> logits (the only persistent output).
+    let t_gf = gb.input("GF", &[h], m.final_gamma)?;
+    let t_lm = gb.input("LM", &[v, h], m.lm_head)?;
+    let t_nf = gb.mid("nf", &[h, t], bf)?;
+    let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
+    let (t_logits, n_logits) = make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?;
+    let rms = RmsNormParams {
+        epsilon: l0.eps,
+        fused_gamma_beta: false,
+        use_stages: false,
+        bwd_mode: 0,
+    };
+    let gemm = synGEMMParams {
+        transpose_a: false,
+        transpose_b: false,
+    };
+    gb.node(
+        "rms_norm_fwd_bf16",
+        "final_norm",
+        &[cur, t_gf],
+        &[t_nf, t_invf],
+        (&raw const rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    )?;
+    gb.node(
+        "gemm",
+        "lm_head",
+        &[t_nf, t_lm],
+        &[t_logits],
+        (&raw const gemm).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    )?;
+
+    let graph = gb.graph;
+    let mut recipe: synRecipeHandle = core::ptr::null_mut();
+    syn!(synGraphCompile(
+        &mut recipe,
+        graph,
+        CString::new("model").unwrap().as_ptr(),
+        core::ptr::null()
+    ));
+
+    let mut name_ptrs: Vec<*const core::ffi::c_char> =
+        gb.names.iter().map(|n| n.as_ptr()).collect();
+    name_ptrs.push(n_logits.as_ptr());
+    let mut ids = vec![0u64; name_ptrs.len()];
+    syn!(synTensorRetrieveIds(
+        recipe,
+        name_ptrs.as_ptr(),
+        ids.as_mut_ptr(),
+        name_ptrs.len() as u32
+    ));
+
+    let mut dev: synDeviceId = 0;
+    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let mut stream: synStreamHandle = core::ptr::null_mut();
+    syn!(synStreamCreateGeneric(&mut stream, dev, 0));
+
+    let n_in = gb.names.len();
+    let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + 1);
+    let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in + 1);
+    let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + 1);
+    for idx in 0..n_in {
+        let data = &gb.data[idx];
+        let bytes = (data.len() * 2) as u64;
+        let mut d = 0u64;
+        syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
+        let mut hb: *mut c_void = core::ptr::null_mut();
+        syn!(synHostMalloc(dev, bytes, 0, &mut hb));
+        // SAFETY: hb holds data.len() bf16 elements.
+        unsafe {
+            let pb = hb.cast::<u16>();
+            for (j, &val) in data.iter().enumerate() {
+                *pb.add(j) = f32_to_bf16(val);
+            }
+        }
+        syn!(synMemCopyAsync(
+            stream,
+            hb as u64,
+            bytes,
+            d,
+            SYN_HOST_TO_DRAM
+        ));
+        let mut ti = synLaunchTensorInfo {
+            tensor_name: gb.names[idx].as_ptr(),
+            tensor_address: d,
+            tensor_type: SYN_TENSOR_DATA,
+            tensor_size: [0; HABANA_DIM_MAX],
+            tensor_id: ids[idx],
+        };
+        let sz = &gb.sizes[idx];
+        ti.tensor_size[..sz.len()].copy_from_slice(sz);
+        infos.push(ti);
+        dev_bufs.push(d);
+        host_bufs.push(hb);
+    }
+    let out_bytes = (tokens * vocab * 2) as u64;
+    let mut d_out = 0u64;
+    syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
+    let mut h_out: *mut c_void = core::ptr::null_mut();
+    syn!(synHostMalloc(dev, out_bytes, 0, &mut h_out));
+    let mut ti = synLaunchTensorInfo {
+        tensor_name: n_logits.as_ptr(),
+        tensor_address: d_out,
+        tensor_type: SYN_TENSOR_DATA,
+        tensor_size: [0; HABANA_DIM_MAX],
+        tensor_id: ids[n_in],
+    };
+    ti.tensor_size[0] = v;
+    ti.tensor_size[1] = t;
+    infos.push(ti);
+
+    let mut ws = 0u64;
+    syn!(synWorkspaceGetSize(&mut ws, recipe));
+    let mut dws = 0u64;
+    if ws > 0 {
+        syn!(synDeviceMalloc(dev, ws, 0, 0, &mut dws));
+    }
+    syn!(synStreamSynchronize(stream));
+
+    syn!(synLaunch(
+        stream,
+        infos.as_ptr(),
+        infos.len() as u32,
+        dws,
+        recipe,
+        0
+    ));
+    syn!(synStreamSynchronize(stream));
+    syn!(synMemCopyAsync(
+        stream,
+        d_out,
+        out_bytes,
+        h_out as u64,
+        SYN_DRAM_TO_HOST
+    ));
+    syn!(synStreamSynchronize(stream));
+
+    let mut out = vec![0.0f32; tokens * vocab];
+    // SAFETY: h_out holds tokens*vocab bf16 elements just copied back.
+    unsafe {
+        let po = h_out.cast::<u16>();
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = bf16_to_f32(*po.add(j));
+        }
+    }
+
+    unsafe {
+        for hb in host_bufs {
+            synHostFree(dev, hb, 0);
+        }
+        synHostFree(dev, h_out, 0);
+        for d in dev_bufs {
+            synDeviceFree(dev, d, 0);
+        }
+        synDeviceFree(dev, d_out, 0);
+        if dws != 0 {
+            synDeviceFree(dev, dws, 0);
+        }
+        synStreamDestroy(stream);
+        synRecipeDestroy(recipe);
+        synGraphDestroy(graph);
+        synDeviceRelease(dev);
+        synDestroy();
+    }
+    Ok(out)
+}
+
+/// One decoder layer on the CPU (f32), with optional causal masking.
+#[must_use]
+pub fn layer_cpu(
+    x: &[f32],
+    w: &LayerWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    causal: bool,
+) -> Vec<f32> {
+    let nh = w.n_heads;
+    let hd = hidden / nh;
+    let rmsnorm = |src: &[f32], g: &[f32]| -> Vec<f32> {
+        let mut o = vec![0.0f32; tokens * hidden];
+        for tk in 0..tokens {
+            let b = tk * hidden;
+            let ms = src[b..b + hidden].iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+            let inv = 1.0 / (ms + w.eps).sqrt();
+            for f in 0..hidden {
+                o[b + f] = src[b + f] * inv * g[f];
+            }
+        }
+        o
+    };
+    let matmul = |a: &[f32], mtx: &[f32], kin: usize, kout: usize| -> Vec<f32> {
+        let mut o = vec![0.0f32; tokens * kout];
+        for tk in 0..tokens {
+            for p in 0..kin {
+                let av = a[tk * kin + p];
+                for c in 0..kout {
+                    o[tk * kout + c] += av * mtx[p * kout + c];
+                }
+            }
+        }
+        o
+    };
+    let rope_head = |src: &[f32], head: usize, out: &mut [f32]| {
+        let half = hd / 2;
+        for tk in 0..tokens {
+            let b = tk * hidden + head * hd;
+            let c = tk * hd;
+            for d in 0..hd {
+                let rot = if d < half {
+                    -src[b + d + half]
+                } else {
+                    src[b + d - half]
+                };
+                out[b + d] = src[b + d] * w.cos[c + d] + rot * w.sin[c + d];
+            }
+        }
+    };
+
+    let n1 = rmsnorm(x, w.g1);
+    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
+    let q = matmul(&n1, &wq_scaled, hidden, hidden);
+    let k = matmul(&n1, w.wk, hidden, hidden);
+    let v = matmul(&n1, w.wv, hidden, hidden);
+    let mut qr = vec![0.0f32; tokens * hidden];
+    let mut kr = vec![0.0f32; tokens * hidden];
+    for head in 0..nh {
+        rope_head(&q, head, &mut qr);
+        rope_head(&k, head, &mut kr);
+    }
+    let mut attn = vec![0.0f32; tokens * hidden];
+    let mut scores = vec![0.0f32; tokens];
+    for head in 0..nh {
+        let off = head * hd;
+        for qi in 0..tokens {
+            let limit = if causal { qi + 1 } else { tokens };
+            for (ki, s) in scores.iter_mut().enumerate().take(limit) {
+                *s = (0..hd)
+                    .map(|d| qr[qi * hidden + off + d] * kr[ki * hidden + off + d])
+                    .sum();
+            }
+            let m = scores[..limit]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in &mut scores[..limit] {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            for (ki, s) in scores[..limit].iter().enumerate() {
+                let pr = s / sum;
+                for d in 0..hd {
+                    attn[qi * hidden + off + d] += pr * v[ki * hidden + off + d];
+                }
+            }
+        }
+    }
+    let o = matmul(&attn, w.wo, hidden, hidden);
+    let hres: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
+    let n2 = rmsnorm(&hres, w.g2);
+    let gate = matmul(&n2, w.wg, hidden, inter);
+    let up = matmul(&n2, w.wu, hidden, inter);
+    let gated: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+        .collect();
+    let down = matmul(&gated, w.wd, inter, hidden);
+    hres.iter().zip(&down).map(|(a, b)| a + b).collect()
+}
+
+/// CPU reference for [`model_forward_bf16`]: logits `[tokens, vocab]`.
+#[must_use]
+pub fn model_forward_cpu(
+    x: &[f32],
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    causal: bool,
+) -> Vec<f32> {
+    let mut cur = x.to_vec();
+    for lw in &m.layers {
+        cur = layer_cpu(&cur, lw, tokens, hidden, inter, causal);
+    }
+    let eps = m.layers[0].eps;
+    let mut logits = vec![0.0f32; tokens * vocab];
+    for tk in 0..tokens {
+        let b = tk * hidden;
+        let ms = cur[b..b + hidden].iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for p in 0..hidden {
+            let nv = cur[b + p] * inv * m.final_gamma[p];
+            for c in 0..vocab {
+                logits[tk * vocab + c] += nv * m.lm_head[p * vocab + c];
+            }
+        }
+    }
+    logits
+}

@@ -98,6 +98,12 @@ mod heads;
 pub use heads::{AxisParams, split_rotate_concat_bf16, split_rotate_concat_cpu};
 
 #[cfg(feature = "link-synapse")]
+mod model;
+
+#[cfg(feature = "link-synapse")]
+pub use model::{ModelWeights, layer_cpu, model_forward_bf16, model_forward_cpu};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as
