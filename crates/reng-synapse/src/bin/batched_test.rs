@@ -208,6 +208,7 @@ fn case_softmax4d() -> reng_core::Result<f32> {
             name: "X",
             sizes: &[n as u64, m as u64, g as u64, h as u64],
             data: &x,
+            raw: None,
         }],
         &[n as u64, m as u64, g as u64, h as u64],
         pp,
@@ -303,6 +304,7 @@ fn case_transpose() -> reng_core::Result<f32> {
             name: "X",
             sizes: &[hd as u64, heads as u64, rows as u64],
             data: &x,
+            raw: None,
         }],
         &[hd as u64, rows as u64, heads as u64],
         pp,
@@ -336,6 +338,7 @@ fn case_slice() -> reng_core::Result<f32> {
             name: "X",
             sizes: &[hd as u64, rows as u64, n as u64, g as u64],
             data: &x,
+            raw: None,
         }],
         &[hd as u64, rows as u64, keep as u64, g as u64],
         pp,
@@ -525,12 +528,32 @@ fn case_scatter_nd() -> reng_core::Result<f32> {
             c[d + hd * (pos + keys * g)] = bf16(updates[d + hd * g]);
         }
     }
+    // Parameter structs of the candidate kernels (perf_lib_layer_params.h).
+    #[repr(C)]
+    struct ScatterNdUpdateParams {
+        mode: i32,
+    }
+    #[repr(C)]
+    struct ScatterNdParams {
+        orig_indices_dims: i32,
+        orig_indices_shape: [i32; 5],
+    }
+    let upd = ScatterNdUpdateParams { mode: 0 };
+    let nd = ScatterNdParams {
+        orig_indices_dims: 2,
+        orig_indices_shape: [3, n as i32, 0, 0, 0],
+    };
+    let (p_upd, s_upd) = params(&upd);
+    let (p_nd, s_nd) = params(&nd);
+    let none: (*const c_void, u32) = (core::ptr::null(), 0);
     let mut last_err = String::new();
-    for guid in [
-        "scatter_nd_onnx_fwd_bf16",
-        "scatter_nd_splice_fwd_bf16",
-        "scatter_nd_element_fwd_bf16",
-        "scatter_nd_fwd_bf16",
+    for (guid, (pp, ps)) in [
+        ("scatter_nd_update_fwd_bf16", (p_upd, s_upd)),
+        ("scatter_nd_update_fwd_bf16", none),
+        ("scatter_nd_fwd_bf16", (p_nd, s_nd)),
+        ("scatter_nd_onnx_fwd_bf16", none),
+        ("scatter_nd_splice_fwd_bf16", none),
+        ("scatter_nd_element_fwd_bf16", none),
     ] {
         let res = run_node(
             guid,
@@ -555,20 +578,23 @@ fn case_scatter_nd() -> reng_core::Result<f32> {
                 },
             ],
             &[hd as u64, keys as u64, 1, groups as u64],
-            core::ptr::null(),
-            0,
+            pp,
+            ps,
         );
         match res {
             Ok(hpu) => {
                 let r = rel(&hpu, &c);
-                println!("  {guid}: rel_L2={r:.4}");
+                println!("  {guid} (params {ps} B): rel_L2={r:.4}");
                 if r < 0.02 {
                     return Ok(r);
                 }
             }
             Err(e) => {
                 let msg = e.to_string();
-                println!("  {guid}: rejected ({})", &msg[..msg.len().min(60)]);
+                println!(
+                    "  {guid} (params {ps} B): rejected ({})",
+                    &msg[..msg.len().min(60)]
+                );
                 last_err = msg;
             }
         }
