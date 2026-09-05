@@ -59,12 +59,30 @@ jobs:
           ./target/release/reng-cache-test 64 256 512 4 512 2 2 512 3 16 1
           ./target/release/reng-batch-test 256 576 1536 9 512 4 3 512 6 3
           RENG_MIN_CAP=64 ./target/release/reng-batch-test 256 256 512 4 512 2 2 512 6 3
+          # The reference prompts are spread round-robin over the cards in
+          # RENG_CHECK_MODULES (colon-separated module ids; default: the
+          # runner's own RENG_MODULE_ID) and checked concurrently, one
+          # process per card at a time.
           if [ -n "${RENG_ORACLE_DIR:-}" ] && [ -f "$RENG_ORACLE_DIR/prompts.txt" ]; then
-            while read -r model ref ids; do
-              [ -z "$model" ] && continue
-              echo "== $model"
-              ./target/release/reng-generate "$model" check.json 8 --ref "$RENG_ORACLE_DIR/$ref" $ids
-            done < "$RENG_ORACLE_DIR/prompts.txt"
+            IFS=: read -ra mods <<< "${RENG_CHECK_MODULES:-${RENG_MODULE_ID:?}}"
+            n=${#mods[@]}
+            for g in $(seq 0 $((n - 1))); do
+              (
+                i=0
+                while read -r model ref ids; do
+                  [ -z "$model" ] && continue
+                  if [ $((i % n)) -eq "$g" ]; then
+                    out=$(RENG_MODULE_ID=${mods[$g]} ./target/release/reng-generate "$model" "check-$g.json" 8 --ref "$RENG_ORACLE_DIR/$ref" $ids 2>&1) || { echo "$out"; echo "== $model FAILED on module ${mods[$g]}"; exit 1; }
+                    echo "== $model (module ${mods[$g]}): $(echo "$out" | grep -E 'vs reference' | head -1)"
+                  fi
+                  i=$((i + 1))
+                done < "$RENG_ORACLE_DIR/prompts.txt"
+              ) > "check-group-$g.log" 2>&1 &
+            done
+            fail=0
+            for job in $(jobs -p); do wait "$job" || fail=1; done
+            cat check-group-*.log
+            [ "$fail" -eq 0 ]
           fi
       - name: run
         run: |
