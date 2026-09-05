@@ -76,3 +76,8 @@ required-features = ["link-synapse"]
 name = "reng-layer-test"
 path = "src/bin/layer_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-heads-test"
+path = "src/bin/heads_test.rs"
+required-features = ["link-synapse"]

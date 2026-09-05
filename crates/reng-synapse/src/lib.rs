@@ -92,6 +92,12 @@ mod layer;
 pub use layer::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu};
 
 #[cfg(feature = "link-synapse")]
+mod heads;
+
+#[cfg(feature = "link-synapse")]
+pub use heads::{AxisParams, split_rotate_concat_bf16, split_rotate_concat_cpu};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as
