@@ -27,6 +27,8 @@ pub const SYN_GEOMETRY_SIZES: c_int = 1; // synGeometryMaxSizes
 pub const SYN_HOST_TO_DRAM: c_int = 0;
 pub const SYN_DRAM_TO_HOST: c_int = 1;
 pub const SYN_DRAM_TO_DRAM: c_int = 2;
+/// synStatus for a second synInitialize in one process.
+pub const SYN_OBJECT_ALREADY_INITIALIZED: synStatus = 5;
 pub const HABANA_DIM_MAX: usize = 25;
 
 #[repr(C)]

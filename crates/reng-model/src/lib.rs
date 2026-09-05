@@ -346,8 +346,9 @@ pub struct Generator<'a> {
 
 #[cfg(feature = "link-synapse")]
 impl<'a> Generator<'a> {
-    /// Compile for blocks of `rows` tokens over a cache of `capacity`
-    /// positions and upload the weights.
+    /// Compile for prompt blocks of `rows` tokens and decode blocks of
+    /// `decode_rows` tokens (0: one recipe for both) over a cache of
+    /// `capacity` positions, and upload the weights.
     ///
     /// # Errors
     ///
@@ -356,6 +357,7 @@ impl<'a> Generator<'a> {
         w: &'a LlamaWeights,
         cfg: &'a LlamaConfig,
         rows: usize,
+        decode_rows: usize,
         capacity: usize,
     ) -> Result<Self> {
         let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
@@ -366,6 +368,7 @@ impl<'a> Generator<'a> {
             cfg.intermediate_size,
             cfg.vocab_size,
             rows,
+            decode_rows,
             capacity,
             &sin,
             &cos,

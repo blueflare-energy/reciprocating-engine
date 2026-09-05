@@ -5,7 +5,7 @@
 //! benchmark-action/github-action-benchmark charts, so every merge to main
 //! appends a point to the tok/s and percent-of-ceiling series.
 //!
-//! `reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--capacity <n>] [--warmup <steps>]`
+//! `reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--warmup <steps>]`
 
 use reng_ceiling::{
     HardwareSpec, Precision, decode_ceiling, model_from_hf_config, prefill_ceiling,
@@ -20,12 +20,13 @@ struct Args {
     prompt: usize,
     n_new: usize,
     rows: usize,
+    decode_rows: usize,
     capacity: usize,
     warmup: usize,
 }
 
 fn parse_args() -> reng_core::Result<Args> {
-    let usage = "usage: reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--capacity <n>] [--warmup <steps>]";
+    let usage = "usage: reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--warmup <steps>]";
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
         return Err(reng_core::Error::Other(usage.into()));
@@ -36,6 +37,7 @@ fn parse_args() -> reng_core::Result<Args> {
         prompt: 128,
         n_new: 64,
         rows: 256,
+        decode_rows: 16,
         capacity: 1024,
         warmup: 4,
     };
@@ -48,6 +50,7 @@ fn parse_args() -> reng_core::Result<Args> {
             "--prompt" => a.prompt = val,
             "--new" => a.n_new = val,
             "--rows" => a.rows = val,
+            "--decode-rows" => a.decode_rows = val,
             "--capacity" => a.capacity = val,
             "--warmup" => a.warmup = val,
             other => return Err(reng_core::Error::Other(format!("unknown flag {other}"))),
@@ -84,11 +87,11 @@ fn main() -> reng_core::Result<()> {
     let w = load_weights(dir, &cfg)?;
 
     let t0 = Instant::now();
-    let mut g = Generator::new(&w, &cfg, a.rows, a.capacity)?;
+    let mut g = Generator::new(&w, &cfg, a.rows, a.decode_rows, a.capacity)?;
     let compile_s = t0.elapsed().as_secs_f64();
     println!(
-        "{model_name}: {} layers, hidden {}, vocab {}; compiled rows {} capacity {} in {compile_s:.2}s",
-        cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, a.rows, a.capacity
+        "{model_name}: {} layers, hidden {}, vocab {}; compiled rows {} / decode rows {} / capacity {} in {compile_s:.2}s",
+        cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, a.rows, a.decode_rows, a.capacity
     );
 
     // A synthetic prompt: the ids only need to be valid, throughput does not

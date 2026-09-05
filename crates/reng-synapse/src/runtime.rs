@@ -119,9 +119,17 @@ pub(crate) struct Runtime {
     info_index: HashMap<String, usize>,
     /// Device buffer per persistent tensor, by name.
     addrs: HashMap<String, u64>,
-    /// Pinned host staging buffer per uploaded input, by input index.
+    /// Shape per persistent tensor, by name (sharing requires equal shapes).
+    shapes: HashMap<String, Vec<u64>>,
+    /// Whether this runtime acquired the device (else it borrows a parent's).
+    owns_device: bool,
+    /// Pinned host staging buffer per uploaded input, by input index (null
+    /// for inputs bound to a parent's buffer).
     host_bufs: Vec<*mut c_void>,
+    /// Device buffer per persistent tensor, by input then scratch index.
     dev_bufs: Vec<u64>,
+    /// The device buffers this runtime allocated (freed on drop).
+    owned: Vec<u64>,
     d_out: u64,
     h_out: *mut c_void,
     /// Pinned buffer for [`Runtime::fence_uploads`], grown on demand.
@@ -134,8 +142,18 @@ pub(crate) struct Runtime {
 impl Runtime {
     /// Compile `gb`, acquire a device, allocate every persistent tensor, and
     /// upload the inputs' host data.
-    #[allow(clippy::too_many_lines)]
     pub fn new(gb: Gb, out: Out) -> Result<Self> {
+        Self::new_with(gb, out, None)
+    }
+
+    /// Like [`Runtime::new`], but sharing `parent`'s device and stream, and
+    /// binding every persistent tensor whose name `parent` also has to the
+    /// parent's buffer instead of allocating (and uploading) its own. A
+    /// second recipe over the same weights and KV cache costs only its own
+    /// per-step inputs and output. The child must be dropped before the
+    /// parent.
+    #[allow(clippy::too_many_lines)]
+    pub fn new_with(gb: Gb, out: Out, parent: Option<&Runtime>) -> Result<Self> {
         gb.serialize_if_requested()?;
         let mut recipe: synRecipeHandle = core::ptr::null_mut();
         syn!(synGraphCompile(
@@ -158,57 +176,95 @@ impl Runtime {
             name_ptrs.len() as u32
         ));
 
-        let mut dev: synDeviceId = 0;
-        syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
-        let mut stream: synStreamHandle = core::ptr::null_mut();
-        syn!(synStreamCreateGeneric(&mut stream, dev, 0));
+        let (dev, stream) = match parent {
+            Some(p) => (p.dev, p.stream),
+            None => {
+                let mut dev: synDeviceId = 0;
+                syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+                let mut stream: synStreamHandle = core::ptr::null_mut();
+                syn!(synStreamCreateGeneric(&mut stream, dev, 0));
+                (dev, stream)
+            }
+        };
+        // A tensor is shared with the parent when it has the same name AND
+        // the same shape (the per-step inputs of a narrower recipe have the
+        // same names as the parent's but different shapes).
+        let shared = |name: &CString, sizes: &[u64]| -> Option<u64> {
+            let key = name.to_str().unwrap();
+            parent.and_then(|p| match (p.addrs.get(key), p.shapes.get(key)) {
+                (Some(&d), Some(sh)) if sh == sizes => Some(d),
+                _ => None,
+            })
+        };
 
         let n_in = gb.names.len();
         let n_scratch = gb.scratch_names.len();
         let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + n_scratch);
+        let mut owned: Vec<u64> = Vec::with_capacity(n_in + n_scratch);
         let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in);
         let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + n_scratch + 1);
         let mut addrs = HashMap::with_capacity(n_in + n_scratch + 1);
         let mut info_index = HashMap::with_capacity(n_in + n_scratch + 1);
+        let mut shapes = HashMap::with_capacity(n_in + n_scratch + 1);
         for (idx, data) in gb.data.iter().enumerate() {
             let bytes = (data.len() * 2) as u64;
-            let mut d = 0u64;
-            syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
             let mut hb: *mut c_void = core::ptr::null_mut();
-            syn!(synHostMalloc(dev, bytes, 0, &mut hb));
-            // SAFETY: hb holds data.len() bf16 elements.
-            unsafe {
-                let pb = hb.cast::<u16>();
-                for (j, &val) in data.iter().enumerate() {
-                    *pb.add(j) = f32_to_bf16(val);
+            let d = if let Some(d) = shared(&gb.names[idx], &gb.sizes[idx]) {
+                d
+            } else {
+                let mut d = 0u64;
+                syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
+                owned.push(d);
+                syn!(synHostMalloc(dev, bytes, 0, &mut hb));
+                // SAFETY: hb holds data.len() bf16 elements.
+                unsafe {
+                    let pb = hb.cast::<u16>();
+                    for (j, &val) in data.iter().enumerate() {
+                        *pb.add(j) = f32_to_bf16(val);
+                    }
                 }
-            }
-            syn!(synMemCopyAsync(
-                stream,
-                hb as u64,
-                bytes,
-                d,
-                SYN_HOST_TO_DRAM
-            ));
+                syn!(synMemCopyAsync(
+                    stream,
+                    hb as u64,
+                    bytes,
+                    d,
+                    SYN_HOST_TO_DRAM
+                ));
+                d
+            };
             info_index.insert(gb.names[idx].to_str().unwrap().to_owned(), infos.len());
             infos.push(launch_info(&gb.names[idx], d, ids[idx], &gb.sizes[idx]));
             addrs.insert(gb.names[idx].to_str().unwrap().to_owned(), d);
+            shapes.insert(
+                gb.names[idx].to_str().unwrap().to_owned(),
+                gb.sizes[idx].clone(),
+            );
             dev_bufs.push(d);
             host_bufs.push(hb);
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
             let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
-            let mut d = 0u64;
-            syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
-            // Device-resident state starts as zeros (finite, so a masked-out
-            // stale cache row can never poison a softmax).
-            syn!(synMemsetD32Async(d, 0, (bytes / 4) as usize, stream));
+            let d = if let Some(d) = shared(&gb.scratch_names[k], sizes) {
+                d
+            } else {
+                let mut d = 0u64;
+                syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
+                owned.push(d);
+                // Device-resident state starts as zeros (finite, so a
+                // masked-out stale cache row can never poison a softmax).
+                syn!(synMemsetD32Async(d, 0, (bytes / 4) as usize, stream));
+                d
+            };
             info_index.insert(
                 gb.scratch_names[k].to_str().unwrap().to_owned(),
                 infos.len(),
             );
             infos.push(launch_info(&gb.scratch_names[k], d, ids[n_in + k], sizes));
             addrs.insert(gb.scratch_names[k].to_str().unwrap().to_owned(), d);
+            shapes.insert(
+                gb.scratch_names[k].to_str().unwrap().to_owned(),
+                sizes.clone(),
+            );
             dev_bufs.push(d);
         }
         let out_bytes = (out.elems() * 2) as u64;
@@ -242,12 +298,15 @@ impl Runtime {
             gb,
             dev,
             stream,
+            owns_device: parent.is_none(),
             recipe,
             infos,
             info_index,
             addrs,
+            shapes,
             host_bufs,
             dev_bufs,
+            owned,
             d_out,
             h_out,
             h_fence: core::ptr::null_mut(),
@@ -271,6 +330,7 @@ impl Runtime {
     pub fn upload(&mut self, idx: usize, data: &[f32]) -> Result<()> {
         assert_eq!(data.len(), self.gb.data[idx].len());
         let hb = self.host_bufs[idx];
+        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
         // SAFETY: hb holds data.len() bf16 elements.
         unsafe {
             let pb = hb.cast::<u16>();
@@ -635,24 +695,28 @@ impl Drop for Runtime {
         unsafe {
             synStreamSynchronize(self.stream);
             for &hb in &self.host_bufs {
-                synHostFree(self.dev, hb, 0);
+                if !hb.is_null() {
+                    synHostFree(self.dev, hb, 0);
+                }
             }
             synHostFree(self.dev, self.h_out, 0);
             if !self.h_fence.is_null() {
                 synHostFree(self.dev, self.h_fence, 0);
             }
-            for &d in &self.dev_bufs {
+            for &d in &self.owned {
                 synDeviceFree(self.dev, d, 0);
             }
             synDeviceFree(self.dev, self.d_out, 0);
             if self.dws != 0 {
                 synDeviceFree(self.dev, self.dws, 0);
             }
-            synStreamDestroy(self.stream);
             synRecipeDestroy(self.recipe);
             synGraphDestroy(self.gb.graph);
-            synDeviceRelease(self.dev);
-            synDestroy();
+            if self.owns_device {
+                synStreamDestroy(self.stream);
+                synDeviceRelease(self.dev);
+                synDestroy();
+            }
         }
     }
 }

@@ -14,7 +14,7 @@
 //! within bf16 rounding of each other and the mismatch is reported as a
 //! near-tie instead.
 //!
-//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]`
+//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]`
 
 use reng_model::{Generator, LlamaConfig, argmax_rows, load_weights, prefill_logits};
 use std::path::Path;
@@ -22,6 +22,7 @@ use std::time::Instant;
 
 const DEFAULT_MARGIN: f32 = 0.5;
 const DEFAULT_ROWS: usize = 256;
+const DEFAULT_DECODE_ROWS: usize = 16;
 const DEFAULT_CAPACITY: usize = 1024;
 
 #[derive(serde::Deserialize)]
@@ -45,13 +46,14 @@ struct Args {
     ref_path: Option<String>,
     margin: f32,
     rows: usize,
+    decode_rows: usize,
     capacity: usize,
     recompute: bool,
     ids: Vec<u32>,
 }
 
 fn parse_args() -> reng_core::Result<Args> {
-    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]";
+    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]";
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 4 {
         return Err(reng_core::Error::Other(usage.into()));
@@ -62,6 +64,7 @@ fn parse_args() -> reng_core::Result<Args> {
     let mut ref_path = None;
     let mut margin = DEFAULT_MARGIN;
     let mut rows = DEFAULT_ROWS;
+    let mut decode_rows = DEFAULT_DECODE_ROWS;
     let mut capacity = DEFAULT_CAPACITY;
     let mut recompute = false;
     let mut i = 3;
@@ -86,6 +89,7 @@ fn parse_args() -> reng_core::Result<Args> {
                     .map_err(|e| reng_core::Error::Other(format!("margin: {e}")))?;
             }
             "--rows" => rows = num("rows")?,
+            "--decode-rows" => decode_rows = num("decode-rows")?,
             "--capacity" => capacity = num("capacity")?,
             other => {
                 return Err(reng_core::Error::Other(format!("unknown flag {other}")));
@@ -108,6 +112,7 @@ fn parse_args() -> reng_core::Result<Args> {
         ref_path,
         margin,
         rows,
+        decode_rows,
         capacity,
         recompute,
         ids,
@@ -146,10 +151,11 @@ fn main() -> reng_core::Result<()> {
             a.capacity
         );
         let t0 = Instant::now();
-        let g = Generator::new(&w, &cfg, a.rows, a.capacity)?;
+        let g = Generator::new(&w, &cfg, a.rows, a.decode_rows, a.capacity)?;
         println!(
-            "compiled cached model (rows {}, capacity {}): {:.2}s",
+            "compiled cached model (rows {}, decode rows {}, capacity {}): {:.2}s",
             a.rows,
+            a.decode_rows,
             a.capacity,
             t0.elapsed().as_secs_f32()
         );

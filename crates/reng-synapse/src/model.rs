@@ -11,7 +11,7 @@
 //! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention.
 //!
 //! With a KV cache (see `cached.rs`) each layer reads per-head cache tensors
-//! `[head_dim, capacity + rows]` and writes updated ones: the block's keys
+//! `[head_dim, capacity]` and writes updated ones: the block's keys
 //! (after RoPE) and values are placed at their positions by a gemm with a
 //! 0/1 placement matrix and added to the cache read. Attention runs over
 //! the whole updated cache with a mask that admits positions up to each
@@ -121,7 +121,11 @@ pub(crate) struct Gb {
 
 impl Gb {
     pub fn new() -> Result<Self> {
-        syn!(synInitialize());
+        // A second graph in the same process finds the library initialised.
+        let st = unsafe { synInitialize() };
+        if st != SYN_SUCCESS && st != SYN_OBJECT_ALREADY_INITIALIZED {
+            return Err(Error::Other(format!("synInitialize -> synStatus {st}")));
+        }
         let mut graph: synGraphHandle = core::ptr::null_mut();
         syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
         Ok(Self {
@@ -226,17 +230,17 @@ pub(crate) struct Shared {
     /// Additive mask laid out like the score matrix, `[keys, queries]`.
     pub mask: Option<synTensor>,
     /// KV-cache capacity in positions. When set, every layer gets per-head
-    /// cache input and output tensors (see [`cache_names`]) of
-    /// `capacity + tokens` positions, which is also the key axis of the scores.
+    /// cache input and output tensors (see [`cache_names`]) of `capacity`
+    /// positions, which is also the key axis of the scores.
     pub cache: Option<usize>,
-    /// The placement matrix input (`[tokens, capacity + tokens]` device
-    /// sizes: row r of the block goes to the position whose entry is 1).
+    /// The placement matrix input (`[tokens, capacity]` device sizes: row r
+    /// of the block goes to the position whose entry is 1).
     pub place: Option<synTensor>,
 }
 
 /// Persistent tensor names of layer `li`'s cache state for KV head `g`:
 /// `(k_cache_in, v_cache_in, k_cache_out, v_cache_out)`, each
-/// `[head_dim, capacity + tokens]` (keys after RoPE).
+/// `[head_dim, capacity]` (keys after RoPE).
 #[must_use]
 pub fn cache_names(li: usize, g: usize) -> (String, String, String, String) {
     (
@@ -304,10 +308,8 @@ pub(crate) fn build_layer(
         None => gb.mid(&p("out"), &[h, t], bf)?,
     };
 
-    // Key axis of the score matrices: the block alone, or the whole cache
-    // (`capacity + rows` positions: a block that starts near the end of the
-    // usable capacity spills its padding rows into the slack).
-    let keys = sh.cache.map_or(t, |c| c as u64 + t);
+    // Key axis of the score matrices: the block alone, or the whole cache.
+    let keys = sh.cache.map_or(t, |c| c as u64);
     let rms = RmsNormParams {
         epsilon: w.eps,
         fused_gamma_beta: false,

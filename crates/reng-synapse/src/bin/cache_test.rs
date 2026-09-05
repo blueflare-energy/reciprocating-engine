@@ -2,7 +2,7 @@
 //! compiled recipe (a full block, a partial block, then single rows) must
 //! produce the same logits as the CPU reference over the whole sequence.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size] [decode_rows]`.
 
 use reng_synapse::{CachedModel, LayerWeights, ModelWeights, model_forward_cpu};
 use std::time::Instant;
@@ -65,6 +65,8 @@ fn main() -> reng_core::Result<()> {
     // `tail_size` rows (default 1: single-token decode steps).
     let tail_rows = arg(9, 3usize);
     let tail_size = arg(10, 1usize);
+    // A separate decode recipe for blocks of up to this many rows (0: none).
+    let decode_rows = arg(11, 0usize);
     let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
         tokens <= capacity,
@@ -137,11 +139,21 @@ fn main() -> reng_core::Result<()> {
         lm_head: &lm_head,
     };
     println!(
-        "cached model: layers={n_layers}, rows={rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}"
+        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}"
     );
 
     let t0 = Instant::now();
-    let mut cm = CachedModel::new(&m, hidden, inter, vocab, rows, capacity, &sin_cap, &cos_cap)?;
+    let mut cm = CachedModel::new(
+        &m,
+        hidden,
+        inter,
+        vocab,
+        rows,
+        decode_rows,
+        capacity,
+        &sin_cap,
+        &cos_cap,
+    )?;
     println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
 
     let mut blocks: Vec<usize> = vec![rows, 8];

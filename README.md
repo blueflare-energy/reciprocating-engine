@@ -58,9 +58,11 @@ INDEX  PCI              STEPPING
 ...
 ```
 
-The cached decode step is about 11 ms for SmolLM2-135M at batch 1, most of
-it launch overhead and the readback protocol rather than compute; the
-performance work against the roofline starts from here.
+Generation compiles two recipes over the same weights and cache: a wide one
+for prompt blocks and a narrow one for decode steps. SmolLM2-135M at batch 1
+decodes at about 400 tok/s (2.5 ms per step, 4% of the HBM roofline); the
+step is dominated by per-node overhead across the 30-layer recipe, which is
+where the performance work against the ceiling starts.
 
 ## Layout
 
