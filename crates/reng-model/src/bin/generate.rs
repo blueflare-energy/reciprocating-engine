@@ -9,10 +9,9 @@
 //! written to `out.json`. With `--ref <ref.json>` (from `generate.py`) the
 //! loop is teacher-forced: step `i` scores `prompt ++ ref[..i]` and the
 //! engine's top-1 is compared with `ref[i]`. A mismatch counts as a failure
-//! only when the reference's own f32 top-1/top-2 margin at that step is at
-//! least `--margin` (default 0.5 logits); below that the two candidates are
-//! within bf16 rounding of each other and the mismatch is reported as a
-//! near-tie instead.
+//! unless the engine's token is within `--margin` logits (default 0.5) of
+//! the reference's best candidate in the reference's own f32 logits; such a
+//! near-tie is within bf16 rounding and is reported as one instead.
 //!
 //! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]`
 
@@ -30,6 +29,25 @@ struct RefStep {
     top1: u32,
     top2: u32,
     margin: f32,
+    /// Top candidates and their f32 logits, best first (newer references).
+    #[serde(default)]
+    top_ids: Vec<u32>,
+    #[serde(default)]
+    top_logits: Vec<f32>,
+}
+
+impl RefStep {
+    /// Whether `id` is within `margin` logits of the reference's best.
+    fn near_tie(&self, id: u32, margin: f32) -> bool {
+        if self.top_ids.is_empty() {
+            return self.margin < margin && (id == self.top1 || id == self.top2);
+        }
+        let best = self.top_logits[0];
+        self.top_ids
+            .iter()
+            .zip(&self.top_logits)
+            .any(|(&t, &l)| t == id && best - l < margin)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -190,8 +208,7 @@ fn main() -> reng_core::Result<()> {
                 let verdict = if last == want {
                     "match"
                 } else if let Some(s) = r.steps.get(step) {
-                    let tie = s.margin < a.margin && (last == s.top1 || last == s.top2);
-                    if tie {
+                    if s.near_tie(last, a.margin) {
                         near_ties += 1;
                         "near-tie"
                     } else {

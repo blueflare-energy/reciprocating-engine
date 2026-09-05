@@ -19,10 +19,14 @@
 //! so there are two: a wide one for prompts and a narrow one for decode
 //! steps, sharing the weights and the cache buffers (`Runtime::new_with`).
 
+use crate::f32_to_bf16;
 use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer, cache_names};
 use crate::runtime::Runtime;
 use reng_core::Result;
 use std::time::Instant;
+
+/// bf16 1.0.
+const BF16_ONE: u16 = 0x3F80;
 
 /// Per-step input indices of one compiled recipe.
 struct Inputs {
@@ -209,7 +213,7 @@ impl CachedModel {
                 self.rt.zero(a, bytes)?;
             }
         }
-        self.rt.settle()?;
+        self.rt.fence()?;
         self.pos = 0;
         Ok(())
     }
@@ -227,6 +231,21 @@ impl CachedModel {
     /// Panics if `n` is 0 or exceeds `rows`, if `x` is not a whole number of
     /// rows, or if the block would overflow the cache.
     pub fn step(&mut self, x: &[f32]) -> Result<Vec<f32>> {
+        self.step_rows(x, false)
+    }
+
+    /// Like [`CachedModel::step`] but returns only the last row's logits
+    /// (`[1, vocab]`), which is all generation needs; reading one row instead
+    /// of a whole block is what keeps long prefills cheap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails or the output never completes.
+    pub fn step_last(&mut self, x: &[f32]) -> Result<Vec<f32>> {
+        self.step_rows(x, true)
+    }
+
+    fn step_rows(&mut self, x: &[f32], last_only: bool) -> Result<Vec<f32>> {
         let (h, hd, c) = (self.hidden, self.head_dim, self.capacity);
         assert_eq!(x.len() % h, 0);
         let n = x.len() / h;
@@ -262,10 +281,12 @@ impl CachedModel {
         // Mask laid out like the scores, [key (FCD), query]: query row q sits
         // at cache position pos + q and may see every position up to its own
         // (padding rows past the cache end see everything; they are discarded).
+        // Built directly in bf16: these are the largest per-step uploads.
         let keys = c;
-        let mut mb = vec![MASK_NEG; p * keys];
+        let neg = f32_to_bf16(MASK_NEG);
+        let mut mb = vec![neg; p * keys];
         for q in 0..p {
-            mb[q * keys..q * keys + (pos + q + 1).min(keys)].fill(0.0);
+            mb[q * keys..q * keys + (pos + q + 1).min(keys)].fill(0);
         }
         // Placement, host row-major [position, row] (device sizes [row,
         // position]): real block row r lands at position pos + r (< capacity
@@ -274,9 +295,9 @@ impl CachedModel {
         // attention is a uniform average of the cached values), and anything
         // placed at a future position would be summed into the real token
         // written there later.
-        let mut pb = vec![0.0f32; keys * p];
+        let mut pb = vec![0u16; keys * p];
         for r in 0..n {
-            pb[(pos + r) * p + r] = 1.0;
+            pb[(pos + r) * p + r] = BF16_ONE;
         }
         let trace = std::env::var("RENG_STEP_TRACE").is_ok();
         let t0 = Instant::now();
@@ -292,11 +313,15 @@ impl CachedModel {
         rt.upload(ix.x, &xb)?;
         rt.upload(ix.sin, &sb)?;
         rt.upload(ix.cos, &cb)?;
-        rt.upload(ix.mask, &mb)?;
-        rt.upload(ix.place, &pb)?;
-        rt.fence_uploads(ix.place)?;
+        rt.upload_bf16(ix.mask, &mb)?;
+        rt.upload_bf16(ix.place, &pb)?;
+        rt.fence()?;
         let t_upload = t0.elapsed();
-        let logits = rt.launch_and_read(n)?;
+        let logits = if last_only {
+            rt.launch_and_read_range(n - 1, 1)?
+        } else {
+            rt.launch_and_read(n)?
+        };
         if trace {
             eprintln!(
                 "step trace: uploads {:.2} ms, launch+readback {:.2} ms",
@@ -306,7 +331,7 @@ impl CachedModel {
         }
         self.parity = wr;
         self.pos += n;
-        debug_assert_eq!(logits.len(), n * self.vocab);
+        debug_assert_eq!(logits.len(), if last_only { 1 } else { n } * self.vocab);
         Ok(logits)
     }
 }

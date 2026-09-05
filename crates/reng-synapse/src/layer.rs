@@ -22,6 +22,11 @@ pub struct LayerWeights<'a> {
     pub wk: &'a [f32],
     pub wv: &'a [f32],
     pub wo: &'a [f32],
+    /// Attention biases (Qwen2-style), `hidden` for `bq` and `n_kv_heads *
+    /// head_dim` for `bk`/`bv`; empty when the model has none.
+    pub bq: &'a [f32],
+    pub bk: &'a [f32],
+    pub bv: &'a [f32],
     /// MLP: `wg`, `wu` are `[hidden, inter]`; `wd` is `[inter, hidden]`.
     pub wg: &'a [f32],
     pub wu: &'a [f32],

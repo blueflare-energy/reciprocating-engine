@@ -53,6 +53,7 @@ const SENTINEL_D32: u32 = 0x7FC1_7FC1;
 /// device-to-host copy; "none left" means the copy has landed. Distinct from
 /// the device sentinel so the two conditions stay separable.
 const HOST_SENTINEL_BF16: u16 = 0x7FC2;
+const HOST_SENTINEL_D32: u32 = 0x7FC2_7FC2;
 /// Upper bound on waiting for a recipe's output to complete.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -133,9 +134,12 @@ pub(crate) struct Runtime {
     owned: Vec<u64>,
     d_out: u64,
     h_out: *mut c_void,
-    /// Pinned buffer for [`Runtime::fence_uploads`], grown on demand.
-    h_fence: *mut c_void,
-    fence_bytes: u64,
+    /// The small fence buffer of [`Runtime::fence`] (device, host in, host
+    /// out) and the last pattern written to it.
+    fence_dev: u64,
+    fence_in: *mut c_void,
+    fence_out: *mut c_void,
+    fence_seq: u32,
     out: Out,
     dws: u64,
 }
@@ -210,7 +214,8 @@ impl Runtime {
         let mut info_index = HashMap::with_capacity(n_in + n_scratch + 1);
         let mut shapes = HashMap::with_capacity(n_in + n_scratch + 1);
         for (idx, data) in gb.data.iter().enumerate() {
-            let bytes = (data.len() * 2) as u64;
+            let raw = gb.raw[idx].as_deref();
+            let bytes = raw.map_or((data.len() * 2) as u64, |r| r.len() as u64);
             let mut hb: *mut c_void = core::ptr::null_mut();
             let d = if let Some(d) = shared(&gb.names[idx], &gb.sizes[idx]) {
                 d
@@ -219,11 +224,16 @@ impl Runtime {
                 syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
                 owned.push(d);
                 syn!(synHostMalloc(dev, bytes, 0, &mut hb));
-                // SAFETY: hb holds data.len() bf16 elements.
+                // SAFETY: hb holds `bytes` bytes: the raw bytes, or
+                // data.len() bf16 elements.
                 unsafe {
-                    let pb = hb.cast::<u16>();
-                    for (j, &val) in data.iter().enumerate() {
-                        *pb.add(j) = f32_to_bf16(val);
+                    if let Some(r) = raw {
+                        core::ptr::copy_nonoverlapping(r.as_ptr(), hb.cast::<u8>(), r.len());
+                    } else {
+                        let pb = hb.cast::<u16>();
+                        for (j, &val) in data.iter().enumerate() {
+                            *pb.add(j) = f32_to_bf16(val);
+                        }
                     }
                 }
                 syn!(synMemCopyAsync(
@@ -312,8 +322,10 @@ impl Runtime {
             owned,
             d_out,
             h_out,
-            h_fence: core::ptr::null_mut(),
-            fence_bytes: 0,
+            fence_dev: 0,
+            fence_in: core::ptr::null_mut(),
+            fence_out: core::ptr::null_mut(),
+            fence_seq: 0,
             out,
             dws,
         })
@@ -351,88 +363,115 @@ impl Runtime {
         Ok(())
     }
 
-    /// Wait until input `idx` (the last one uploaded) is visible on the
-    /// device: copy it back with the host sentinel and spin until the copy
-    /// has landed and equals the staged data. Host-to-device copies on the
-    /// stream are executed in order, so once the last one is visible all of
-    /// them are. Needed because the stream sync returns before DMA copies
-    /// have landed on this stack, and a launch issued right after them would
-    /// otherwise compute on the previous step's inputs.
+    /// Replace input `idx`'s contents with bf16 data already in device format
+    /// (for the large 0/1 and mask patterns that need no conversion).
+    pub fn upload_bf16(&mut self, idx: usize, data: &[u16]) -> Result<()> {
+        assert_eq!(data.len(), self.gb.data[idx].len());
+        let hb = self.host_bufs[idx];
+        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
+        // SAFETY: hb holds data.len() bf16 elements.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), hb.cast::<u16>(), data.len());
+        }
+        syn!(synMemCopyAsync(
+            self.stream,
+            hb as u64,
+            (data.len() * 2) as u64,
+            self.dev_bufs[idx],
+            SYN_HOST_TO_DRAM
+        ));
+        Ok(())
+    }
+
+    /// Wait until every upload enqueued so far is visible on the device: a
+    /// small fence buffer gets a fresh pattern uploaded after them, and is
+    /// read back until that pattern shows. Host-to-device copies on the
+    /// stream execute in order, so once the fence is visible all of them are.
+    /// Needed because the stream sync returns before DMA copies have landed
+    /// on this stack, and a launch issued right after them would otherwise
+    /// compute on the previous step's inputs.
     ///
     /// # Errors
     ///
-    /// Returns an error if the data never appears.
-    pub fn fence_uploads(&mut self, idx: usize) -> Result<()> {
-        syn!(synStreamSynchronize(self.stream));
-        let n = self.gb.data[idx].len();
-        let bytes = (n * 2) as u64;
-        if self.h_fence.is_null() || self.fence_bytes < bytes {
-            if !self.h_fence.is_null() {
-                unsafe { synHostFree(self.dev, self.h_fence, 0) };
-            }
-            let mut vb: *mut c_void = core::ptr::null_mut();
-            syn!(synHostMalloc(self.dev, bytes, 0, &mut vb));
-            self.h_fence = vb;
-            self.fence_bytes = bytes;
+    /// Returns an error if the pattern never appears.
+    pub fn fence(&mut self) -> Result<()> {
+        const WORDS: usize = 1024;
+        if self.fence_dev == 0 {
+            let bytes = (WORDS * 4) as u64;
+            syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut self.fence_dev));
+            syn!(synHostMalloc(self.dev, bytes, 0, &mut self.fence_in));
+            syn!(synHostMalloc(self.dev, bytes, 0, &mut self.fence_out));
+            self.owned.push(self.fence_dev);
         }
-        let vb = self.h_fence;
+        self.fence_seq = self.fence_seq.wrapping_add(1);
+        let pattern = self.fence_seq | 0x5A00_0000;
+        // SAFETY: both fence buffers hold WORDS u32 values.
+        unsafe {
+            for j in 0..WORDS {
+                *self.fence_in.cast::<u32>().add(j) = pattern;
+            }
+        }
+        syn!(synMemCopyAsync(
+            self.stream,
+            self.fence_in as u64,
+            (WORDS * 4) as u64,
+            self.fence_dev,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synStreamSynchronize(self.stream));
         let started = Instant::now();
-        let mut copies = 0u32;
         loop {
-            // SAFETY: vb holds at least n bf16 elements.
+            // SAFETY: as above.
             unsafe {
-                for j in 0..n {
-                    *vb.cast::<u16>().add(j) = HOST_SENTINEL_BF16;
+                for j in 0..WORDS {
+                    *self.fence_out.cast::<u32>().add(j) = HOST_SENTINEL_D32;
                 }
             }
             syn!(synMemCopyAsync(
                 self.stream,
-                self.dev_bufs[idx],
-                bytes,
-                vb as u64,
+                self.fence_dev,
+                (WORDS * 4) as u64,
+                self.fence_out as u64,
                 SYN_DRAM_TO_HOST
             ));
             syn!(synStreamSynchronize(self.stream));
-            copies += 1;
-            // Wait for this copy to land, then compare.
-            loop {
-                // SAFETY: as above.
-                let pending = unsafe {
-                    let p = vb.cast::<u16>();
-                    (0..n).any(|j| core::ptr::read_volatile(p.add(j)) == HOST_SENTINEL_BF16)
+            let mut pending = true;
+            let mut matched = false;
+            while pending {
+                // SAFETY: as above; the DMA writes each word exactly once.
+                let (p, m) = unsafe {
+                    let q = self.fence_out.cast::<u32>();
+                    let mut p = false;
+                    let mut m = true;
+                    for j in 0..WORDS {
+                        let v = core::ptr::read_volatile(q.add(j));
+                        if v == HOST_SENTINEL_D32 {
+                            p = true;
+                        } else if v != pattern {
+                            m = false;
+                        }
+                    }
+                    (p, m)
                 };
-                if !pending {
-                    break;
-                }
-                if started.elapsed() > READBACK_TIMEOUT {
+                pending = p;
+                matched = m;
+                if pending && started.elapsed() > READBACK_TIMEOUT {
                     return Err(Error::Other(format!(
-                        "fence: copy of input {idx} did not land within {READBACK_TIMEOUT:?}"
+                        "fence: copy did not land within {READBACK_TIMEOUT:?}"
                     )));
                 }
                 std::hint::spin_loop();
             }
-            // SAFETY: both buffers hold n bf16 elements.
-            let differs = unsafe {
-                let (p, q) = (vb.cast::<u16>(), self.host_bufs[idx].cast::<u16>());
-                (0..n).filter(|&j| *p.add(j) != *q.add(j)).count()
-            };
-            if differs == 0 {
-                break;
+            if matched {
+                return Ok(());
             }
             if started.elapsed() > READBACK_TIMEOUT {
                 return Err(Error::Other(format!(
-                    "fence: upload of input {idx} never became visible ({differs} elements differ)"
+                    "fence: uploads never became visible within {READBACK_TIMEOUT:?}"
                 )));
             }
             std::thread::sleep(Duration::from_micros(50));
         }
-        if copies > 1 && env_on("RENG_READBACK_TRACE") {
-            eprintln!(
-                "fence: input {idx} visible after {copies} copies ({:?})",
-                started.elapsed()
-            );
-        }
-        Ok(())
     }
 
     /// Index of the input named `name`.
@@ -449,7 +488,7 @@ impl Runtime {
     }
 
     /// Zero `bytes` of device memory at `addr` (a DMA write; call
-    /// [`Runtime::settle`] before the next launch reads it).
+    /// [`Runtime::fence`] before the next launch reads it).
     pub fn zero(&self, addr: u64, bytes: u64) -> Result<()> {
         syn!(synMemsetD32Async(
             addr,
@@ -457,14 +496,6 @@ impl Runtime {
             (bytes / 4) as usize,
             self.stream
         ));
-        Ok(())
-    }
-
-    /// Wait for the stream and then a few milliseconds more, for the rare
-    /// paths where a DMA write must be visible to the next launch.
-    pub fn settle(&self) -> Result<()> {
-        syn!(synStreamSynchronize(self.stream));
-        std::thread::sleep(Duration::from_millis(20));
         Ok(())
     }
 
@@ -481,17 +512,25 @@ impl Runtime {
 
     /// Launch the recipe and read back the first `rows` outermost rows of the
     /// output as f32 (see the module docs for the two-sentinel protocol).
-    #[allow(clippy::too_many_lines)]
     pub fn launch_and_read(&mut self, rows: usize) -> Result<Vec<f32>> {
-        let n_out = rows * self.out.row_elems();
-        assert!(n_out <= self.out.elems());
+        self.launch_and_read_range(0, rows)
+    }
+
+    /// Launch the recipe and read back `rows` outermost rows of the output
+    /// starting at row `first`, as f32.
+    #[allow(clippy::too_many_lines)]
+    pub fn launch_and_read_range(&mut self, first: usize, rows: usize) -> Result<Vec<f32>> {
+        let row_elems = self.out.row_elems();
+        let n_out = rows * row_elems;
+        assert!((first + rows) * row_elems <= self.out.elems());
         let out_bytes = (n_out * 2) as u64;
-        let (stream, dev, d_out, h_out) = (self.stream, self.dev, self.d_out, self.h_out);
+        let (stream, dev, h_out) = (self.stream, self.dev, self.h_out);
+        let d_out = self.d_out + (first * row_elems * 2) as u64;
         let trace = env_on("RENG_STEP_TRACE");
         let t0 = Instant::now();
         // Pre-fill the device output with the recipe-completion sentinel.
         syn!(synMemsetD32Async(
-            d_out,
+            self.d_out,
             SENTINEL_D32,
             self.out.elems() / 2,
             stream
@@ -703,8 +742,9 @@ impl Drop for Runtime {
                 }
             }
             synHostFree(self.dev, self.h_out, 0);
-            if !self.h_fence.is_null() {
-                synHostFree(self.dev, self.h_fence, 0);
+            if !self.fence_in.is_null() {
+                synHostFree(self.dev, self.fence_in, 0);
+                synHostFree(self.dev, self.fence_out, 0);
             }
             for &d in &self.owned {
                 synDeviceFree(self.dev, d, 0);

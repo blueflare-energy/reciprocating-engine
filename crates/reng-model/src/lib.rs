@@ -7,6 +7,7 @@
 //! computes `y = x @ W^T`; the engine wants `[in, out]`, so projections are
 //! transposed once at load time. The embedding table stays `[vocab, hidden]`
 //! for the host-side gather; a tied LM head is its transpose, `[hidden, vocab]`.
+//! Qwen2-style attention biases are loaded when present (Llama has none).
 
 use reng_core::{Error, Result};
 use reng_synapse::bf16_to_f32;
@@ -66,6 +67,10 @@ pub struct LayerTensors {
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
     pub wo: Vec<f32>,
+    /// Attention biases; empty when the checkpoint has none.
+    pub bq: Vec<f32>,
+    pub bk: Vec<f32>,
+    pub bv: Vec<f32>,
     pub wg: Vec<f32>,
     pub wu: Vec<f32>,
     pub wd: Vec<f32>,
@@ -145,6 +150,21 @@ fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
+/// A 1-D tensor that a checkpoint may omit (attention biases): empty when
+/// absent, checked for length when present.
+fn optional_vec(st: &SafeTensors<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
+    if st.tensor(name).is_err() {
+        return Ok(Vec::new());
+    }
+    let (v, shape) = tensor_f32(st, name)?;
+    if shape != [len] {
+        return Err(Error::Other(format!(
+            "tensor {name}: shape {shape:?}, expected [{len}]"
+        )));
+    }
+    Ok(v)
+}
+
 /// A `[out, in]` HF linear weight as the engine's `[in, out]`.
 fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Result<Vec<f32>> {
     let (v, shape) = tensor_f32(st, name)?;
@@ -186,6 +206,9 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             wk: linear(&st, &p("self_attn.k_proj.weight"), kvd, h)?,
             wv: linear(&st, &p("self_attn.v_proj.weight"), kvd, h)?,
             wo: linear(&st, &p("self_attn.o_proj.weight"), h, h)?,
+            bq: optional_vec(&st, &p("self_attn.q_proj.bias"), h)?,
+            bk: optional_vec(&st, &p("self_attn.k_proj.bias"), kvd)?,
+            bv: optional_vec(&st, &p("self_attn.v_proj.bias"), kvd)?,
             wg: linear(&st, &p("mlp.gate_proj.weight"), i, h)?,
             wu: linear(&st, &p("mlp.up_proj.weight"), i, h)?,
             wd: linear(&st, &p("mlp.down_proj.weight"), h, i)?,
@@ -290,6 +313,9 @@ fn layer_views<'a>(
             wk: &l.wk,
             wv: &l.wv,
             wo: &l.wo,
+            bq: &l.bq,
+            bk: &l.bk,
+            bv: &l.bv,
             wg: &l.wg,
             wu: &l.wu,
             wd: &l.wd,
@@ -403,12 +429,10 @@ impl<'a> Generator<'a> {
     /// Panics if `ids` is empty or would overflow the cache.
     pub fn feed(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         assert!(!ids.is_empty());
-        let v = self.cfg.vocab_size;
         let mut last = Vec::new();
         for block in ids.chunks(self.model.rows()) {
             let x = embed_tokens(self.w, self.cfg, block);
-            let logits = self.model.step(&x)?;
-            last = logits[(block.len() - 1) * v..].to_vec();
+            last = self.model.step_last(&x)?;
         }
         Ok(last)
     }

@@ -2,9 +2,9 @@
 
 usage: generate.py <model_dir> <out.json> <n_new> <token_id> [token_id ...]
 Writes the prompt, the greedily generated ids, the decoded text, and for each
-generated step the f32 logit margin between the top-1 and top-2 candidates
-(teacher-forced over the reference sequence), so a bf16 engine can tell a
-near-tie from a real divergence.
+generated step the f32 top-8 candidates with their logits (teacher-forced
+over the reference sequence), so a bf16 engine can tell a near-tie from a
+real divergence.
 """
 import json, sys, torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -22,9 +22,10 @@ new = full[len(ids):]
 steps = []
 for i, t in enumerate(new):
     row = lg[len(ids) - 1 + i]
-    v, ix = torch.topk(row, 2)
+    v, ix = torch.topk(row, 8)
     steps.append({"top1": ix[0].item(), "top2": ix[1].item(),
-                  "margin": (v[0] - v[1]).item()})
+                  "margin": (v[0] - v[1]).item(),
+                  "top_ids": ix.tolist(), "top_logits": v.tolist()})
     assert ix[0].item() == t, (i, ix[0].item(), t)
 res = {"prompt": ids, "generated": new, "steps": steps,
        "text": tok.decode(full), "prompt_text": tok.decode(ids),

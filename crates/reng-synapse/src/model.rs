@@ -108,6 +108,8 @@ pub(crate) struct Gb {
     pub names: Vec<CString>,
     pub sizes: Vec<Vec<u64>>,
     pub data: Vec<Vec<f32>>,
+    /// Raw device bytes for non-bf16 inputs (else `data` is converted).
+    pub raw: Vec<Option<Vec<u8>>>,
     pub scratch_names: Vec<CString>,
     pub scratch_sizes: Vec<Vec<u64>>,
     /// Whether each scratch tensor is f32 (else bf16); sizes count elements.
@@ -130,6 +132,7 @@ impl Gb {
             names: Vec::new(),
             sizes: Vec::new(),
             data: Vec::new(),
+            raw: Vec::new(),
             scratch_names: Vec::new(),
             scratch_sizes: Vec::new(),
             scratch_f32: Vec::new(),
@@ -144,6 +147,24 @@ impl Gb {
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
         self.data.push(data.to_vec());
+        self.raw.push(None);
+        Ok(t)
+    }
+
+    /// A persistent input tensor of another dtype whose bytes are uploaded
+    /// as given (index tensors for scatter/gather probes).
+    pub fn input_raw(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        dtype: core::ffi::c_int,
+        bytes: &[u8],
+    ) -> Result<synTensor> {
+        let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
+        self.names.push(cname);
+        self.sizes.push(sizes.to_vec());
+        self.data.push(Vec::new());
+        self.raw.push(Some(bytes.to_vec()));
         Ok(t)
     }
 
@@ -435,6 +456,43 @@ pub(crate) fn build_layer(
         pg.0,
         pg.1,
     )?;
+    // Attention biases (when present) broadcast over the token dim.
+    let (t_q, t_k, t_v) = if w.bq.is_empty() {
+        (t_q, t_k, t_v)
+    } else {
+        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * w.scale).collect();
+        let t_bq = gb.input(&p("bq"), &[hd, 1, hpg, groups], &bq_scaled)?;
+        let t_bk = gb.input(&p("bk"), &[hd, 1, 1, groups], w.bk)?;
+        let t_bv = gb.input(&p("bv"), &[hd, 1, 1, groups], w.bv)?;
+        let qb = gb.mid(&p("qb"), &[hd, t, hpg, groups], bf)?;
+        let kb = gb.mid(&p("kb"), &[hd, t, 1, groups], bf)?;
+        let vb = gb.mid(&p("vb"), &[hd, t, 1, groups], bf)?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("q_bias"),
+            &[t_q, t_bq],
+            &[qb],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("k_bias"),
+            &[t_k, t_bk],
+            &[kb],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("v_bias"),
+            &[t_v, t_bv],
+            &[vb],
+            none.0,
+            none.1,
+        )?;
+        (qb, kb, vb)
+    };
     gb.node(
         "rope_st2_fwd_bf16",
         &p("rope_q"),
@@ -634,9 +692,9 @@ pub(crate) struct SharedBatched {
 /// Append one decoder layer for `B` sequences of one token each, reading `x`
 /// (`[hidden, B]`) and returning the layer output in the same shape. The
 /// attention path is the 4-D batched one of [`build_layer`] with the
-/// sequence batch as a fifth, outermost dimension: the projections read the
-/// input as `[hidden, 1, 1, 1, B]` against weights `[hd, hidden, .., 1]`
-/// (broadcast over sequences), every sequence has its own RoPE row, cache
+/// sequence batch as a fifth, outermost dimension: the projections are 2-D
+/// gemms with `M = B` whose `[hidden, B]` outputs are free reshapes of the
+/// head layout, every sequence has its own RoPE row, cache
 /// slot, placement column and mask, and with one query row per sequence the
 /// context `[hd, 1, hpg, groups, B]` already is `[hidden, B]` in memory.
 /// Weights carry the same names and element counts as in [`build_layer`],
@@ -666,36 +724,18 @@ pub(crate) fn build_layer_batched(
     );
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
-    let blocks = |m: &[f32], cols: usize, per_group: usize| -> Vec<f32> {
-        let mut v = Vec::with_capacity(hidden * cols);
-        for g in 0..nkv {
-            for j in 0..per_group {
-                let head = g * per_group + j;
-                for r in 0..hidden {
-                    v.extend_from_slice(&m[r * cols + head * hd_us..r * cols + (head + 1) * hd_us]);
-                }
-            }
-        }
-        v
-    };
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    let t_wq = gb.input(
-        &p("wq"),
-        &[hd, h, hpg, groups, 1],
-        &blocks(&wq_scaled, hidden, hpg_us),
-    )?;
-    let t_wk = gb.input(
-        &p("wk"),
-        &[hd, h, 1, groups, 1],
-        &blocks(w.wk, nkv * hd_us, 1),
-    )?;
-    let t_wv = gb.input(
-        &p("wv"),
-        &[hd, h, 1, groups, 1],
-        &blocks(w.wv, nkv * hd_us, 1),
-    )?;
+    // With one row per sequence the projections are plain gemms with
+    // M = B over the natural `[in, out]` weights: `[hidden, B]` is already
+    // `[hd, 1, hpg, groups, B]` in memory (head-major features, sequence
+    // outermost), so the head layout is a free reshape. These weights are
+    // laid out differently from the wide recipe's per-head blocks, so they
+    // get their own names and buffers.
+    let t_wq = gb.input(&p("wq2"), &[h, h], &wq_scaled)?;
+    let t_wk = gb.input(&p("wk2"), &[hd * groups, h], w.wk)?;
+    let t_wv = gb.input(&p("wv2"), &[hd * groups, h], w.wv)?;
     let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
     let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
     let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
@@ -703,7 +743,9 @@ pub(crate) fn build_layer_batched(
 
     let t_n1 = gb.mid(&p("n1"), &[h, b], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32)?;
-    let t_n1_5 = gb.mid(&p("n1_5"), &[h, 1, 1, 1, b], bf)?;
+    let t_q2 = gb.mid(&p("q2"), &[h, b], bf)?;
+    let t_k2 = gb.mid(&p("k2"), &[hd * groups, b], bf)?;
+    let t_v2 = gb.mid(&p("v2"), &[hd * groups, b], bf)?;
     let t_q = gb.mid(&p("q"), &[hd, 1, hpg, groups, b], bf)?;
     let t_qr = gb.mid(&p("qr"), &[hd, 1, hpg, groups, b], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, 1, 1, groups, b], bf)?;
@@ -779,31 +821,49 @@ pub(crate) fn build_layer_batched(
         prm.0,
         prm.1,
     )?;
-    gb.node("reshape", &p("n1_5d"), &[t_n1], &[t_n1_5], none.0, none.1)?;
-    gb.node(
-        "batch_gemm",
-        &p("q_proj"),
-        &[t_n1_5, t_wq],
-        &[t_q],
-        pg.0,
-        pg.1,
-    )?;
-    gb.node(
-        "batch_gemm",
-        &p("k_proj"),
-        &[t_n1_5, t_wk],
-        &[t_k],
-        pg.0,
-        pg.1,
-    )?;
-    gb.node(
-        "batch_gemm",
-        &p("v_proj"),
-        &[t_n1_5, t_wv],
-        &[t_v],
-        pg.0,
-        pg.1,
-    )?;
+    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q2], pg.0, pg.1)?;
+    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k2], pg.0, pg.1)?;
+    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v2], pg.0, pg.1)?;
+    gb.node("reshape", &p("q_5d"), &[t_q2], &[t_q], none.0, none.1)?;
+    gb.node("reshape", &p("k_5d"), &[t_k2], &[t_k], none.0, none.1)?;
+    gb.node("reshape", &p("v_5d"), &[t_v2], &[t_v], none.0, none.1)?;
+    // Attention biases (when present) broadcast over the sequence batch.
+    let (t_q, t_k, t_v) = if w.bq.is_empty() {
+        (t_q, t_k, t_v)
+    } else {
+        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * w.scale).collect();
+        let t_bq = gb.input(&p("bq"), &[hd, 1, hpg, groups, 1], &bq_scaled)?;
+        let t_bk = gb.input(&p("bk"), &[hd, 1, 1, groups, 1], w.bk)?;
+        let t_bv = gb.input(&p("bv"), &[hd, 1, 1, groups, 1], w.bv)?;
+        let qb = gb.mid(&p("qb"), &[hd, 1, hpg, groups, b], bf)?;
+        let kb = gb.mid(&p("kb"), &[hd, 1, 1, groups, b], bf)?;
+        let vb = gb.mid(&p("vb"), &[hd, 1, 1, groups, b], bf)?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("q_bias"),
+            &[t_q, t_bq],
+            &[qb],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("k_bias"),
+            &[t_k, t_bk],
+            &[kb],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("v_bias"),
+            &[t_v, t_bv],
+            &[vb],
+            none.0,
+            none.1,
+        )?;
+        (qb, kb, vb)
+    };
     gb.node(
         "rope_st2_fwd_bf16",
         &p("rope_q"),
@@ -1207,9 +1267,18 @@ pub fn layer_cpu(
 
     let n1 = rmsnorm(x, w.g1);
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
-    let q = matmul(&n1, &wq_scaled, hidden, hidden);
-    let k = matmul(&n1, w.wk, hidden, kvd);
-    let v = matmul(&n1, w.wv, hidden, kvd);
+    let bias = |mut m: Vec<f32>, b: &[f32], scale: f32| -> Vec<f32> {
+        if !b.is_empty() {
+            let cols = b.len();
+            for (i, v) in m.iter_mut().enumerate() {
+                *v += b[i % cols] * scale;
+            }
+        }
+        m
+    };
+    let q = bias(matmul(&n1, &wq_scaled, hidden, hidden), w.bq, w.scale);
+    let k = bias(matmul(&n1, w.wk, hidden, kvd), w.bk, 1.0);
+    let v = bias(matmul(&n1, w.wv, hidden, kvd), w.bv, 1.0);
     let mut qr = vec![0.0f32; tokens * hidden];
     let mut kr = vec![0.0f32; tokens * kvd];
     for head in 0..nh {

@@ -28,6 +28,7 @@ reng-generate <model_dir> engine.json 8 --ref gen.json 504 3575 282 4649 314
 
 `reng-generate --ref` is teacher-forced: it scores the reference prefix at
 every step, so one near-tie does not desynchronise the rest of the check. A
-mismatch fails only when the reference margin is at least `--margin`
-(default 0.5 logits). Below that the f32 candidates are within bf16 rounding
-of each other and the mismatch is reported as a near-tie.
+mismatch fails unless the engine's token is within `--margin` logits
+(default 0.5) of the reference's best candidate in the reference's f32
+logits; such candidates are within bf16 rounding of each other and the
+mismatch is reported as a near-tie.

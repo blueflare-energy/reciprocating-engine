@@ -9,12 +9,16 @@
 //! prefill of sequence `b` chooses its first write buffer so that its last
 //! launch lands in the buffer the next batched step reads.
 
+use crate::f32_to_bf16;
 use crate::model::{
     Gb, MASK_NEG, ModelWeights, Shared, SharedBatched, build_head, build_layer,
     build_layer_batched, cache_names,
 };
 use crate::runtime::{Out, Runtime};
 use reng_core::Result;
+
+/// bf16 1.0.
+const BF16_ONE: u16 = 0x3F80;
 
 struct Inputs {
     x: usize,
@@ -36,7 +40,6 @@ pub struct BatchedModel {
     rows: usize,
     capacity: usize,
     hidden: usize,
-    vocab: usize,
     head_dim: usize,
     n_kv: usize,
     /// Position of each sequence.
@@ -142,7 +145,6 @@ impl BatchedModel {
             rows,
             capacity,
             hidden,
-            vocab,
             head_dim: hd,
             n_kv: l0.n_kv_heads,
             pos: vec![0; batch],
@@ -221,7 +223,7 @@ impl BatchedModel {
                 self.rt.zero(a + off, bytes)?;
             }
         }
-        self.rt.settle()?;
+        self.rt.fence()?;
         self.pos[b] = 0;
         Ok(())
     }
@@ -254,6 +256,7 @@ impl BatchedModel {
             1 - self.parity
         };
         let off = b as u64 * self.slot_bytes();
+        let neg = f32_to_bf16(MASK_NEG);
         let mut last = Vec::new();
         for chunk in x.chunks(p * h) {
             let n = chunk.len() / h;
@@ -269,13 +272,13 @@ impl BatchedModel {
                     cb[r * hd..(r + 1) * hd].copy_from_slice(&self.cos[src..src + hd]);
                 }
             }
-            let mut mb = vec![MASK_NEG; p * c];
+            let mut mb = vec![neg; p * c];
             for q in 0..p {
-                mb[q * c..q * c + (pos + q + 1).min(c)].fill(0.0);
+                mb[q * c..q * c + (pos + q + 1).min(c)].fill(0);
             }
-            let mut pb = vec![0.0f32; c * p];
+            let mut pb = vec![0u16; c * p];
             for r in 0..n {
-                pb[(pos + r) * p + r] = 1.0;
+                pb[(pos + r) * p + r] = BF16_ONE;
             }
             let rd = 1 - wr;
             for (li, (k, v)) in self.slots.iter().enumerate() {
@@ -288,11 +291,10 @@ impl BatchedModel {
             self.pf.upload(self.pf_ix.x, &xb)?;
             self.pf.upload(self.pf_ix.sin, &sb)?;
             self.pf.upload(self.pf_ix.cos, &cb)?;
-            self.pf.upload(self.pf_ix.mask, &mb)?;
-            self.pf.upload(self.pf_ix.place, &pb)?;
-            self.pf.fence_uploads(self.pf_ix.place)?;
-            let logits = self.pf.launch_and_read(n)?;
-            last = logits[(n - 1) * self.vocab..].to_vec();
+            self.pf.upload_bf16(self.pf_ix.mask, &mb)?;
+            self.pf.upload_bf16(self.pf_ix.place, &pb)?;
+            self.pf.fence()?;
+            last = self.pf.launch_and_read_range(n - 1, 1)?;
             self.pos[b] += n;
             wr = 1 - wr;
         }
@@ -315,16 +317,17 @@ impl BatchedModel {
         for b in 0..nb {
             assert!(self.pos[b] < c, "cache overflow for sequence {b}");
         }
+        let neg = f32_to_bf16(MASK_NEG);
         let mut sb = vec![0.0f32; nb * hd];
         let mut cb = vec![0.0f32; nb * hd];
-        let mut mb = vec![MASK_NEG; nb * c];
-        let mut pb = vec![0.0f32; nb * c];
+        let mut mb = vec![neg; nb * c];
+        let mut pb = vec![0u16; nb * c];
         for b in 0..nb {
             let pos = self.pos[b];
             sb[b * hd..(b + 1) * hd].copy_from_slice(&self.sin[pos * hd..(pos + 1) * hd]);
             cb[b * hd..(b + 1) * hd].copy_from_slice(&self.cos[pos * hd..(pos + 1) * hd]);
-            mb[b * c..b * c + pos + 1].fill(0.0);
-            pb[b * c + pos] = 1.0;
+            mb[b * c..b * c + pos + 1].fill(0);
+            pb[b * c + pos] = BF16_ONE;
         }
         let (rd, wr) = (self.parity, 1 - self.parity);
         for (li, (k, v)) in self.slots.iter().enumerate() {
@@ -337,9 +340,9 @@ impl BatchedModel {
         self.rt.upload(self.ix.x, x)?;
         self.rt.upload(self.ix.sin, &sb)?;
         self.rt.upload(self.ix.cos, &cb)?;
-        self.rt.upload(self.ix.mask, &mb)?;
-        self.rt.upload(self.ix.place, &pb)?;
-        self.rt.fence_uploads(self.ix.place)?;
+        self.rt.upload_bf16(self.ix.mask, &mb)?;
+        self.rt.upload_bf16(self.ix.place, &pb)?;
+        self.rt.fence()?;
         let logits = self.rt.launch_and_read(nb)?;
         self.parity = wr;
         for pos in &mut self.pos {

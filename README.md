@@ -59,10 +59,22 @@ INDEX  PCI              STEPPING
 ```
 
 Generation compiles two recipes over the same weights and cache: a wide one
-for prompt blocks and a one-row one for decode steps. SmolLM2-135M at batch 1
-decodes at about 730 tok/s (1.3 ms per step, 8% of the HBM roofline); the
-step is dominated by per-node dispatch across the 30-layer recipe, which is
-where the performance work against the ceiling continues.
+for prompt blocks and a one-row one for decode steps; `--batch` decodes
+several sequences in lockstep over a multi-slot cache. Measured on one card
+(bf16, 128-token prompt, `tools/oracle` references match), percentages
+against the `reng-ceiling` roofline:
+
+| Model | Decode b1 tok/s | Decode b8 tok/s | Decode b64 tok/s | Prefill tok/s |
+|---|---|---|---|---|
+| SmolLM2-135M | 679 (7.5%) | 3098 (4.7%) | 5864 (1.8%) | 33.7k (2.9%) |
+| SmolLM2-360M | 532 (15.8%) | 2034 (8.0%) | | |
+| Qwen2.5-0.5B | 545 (22.0%) | | | 25.5k (8.1%) |
+| SmolLM2-1.7B | 293 (41.3%) | 969 (18.1%) | 3339 (11.2%) | 15.5k (17.0%) |
+
+Batched figures use a cache sized to the context (256 positions). The
+single-sequence step is bound by per-node dispatch across the recipe; the
+batched step by rewriting the whole KV cache every step, which an in-place
+scatter will remove. Both are where the performance work continues.
 
 ## Layout
 

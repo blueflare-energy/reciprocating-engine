@@ -93,11 +93,13 @@ fn main() -> reng_core::Result<()> {
                     name: "A",
                     sizes: &a_sizes,
                     data: &a,
+                    raw: None,
                 },
                 NodeInput {
                     name: "B",
                     sizes: &b_sizes,
                     data: b,
+                    raw: None,
                 },
             ],
             &[nn, mm, batch as u64],

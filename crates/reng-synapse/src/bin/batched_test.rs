@@ -88,11 +88,13 @@ fn case_gqa() -> reng_core::Result<f32> {
                 name: "A",
                 sizes: &[k as u64, m as u64, hpg as u64, groups as u64],
                 data: &a,
+                raw: None,
             },
             NodeInput {
                 name: "B",
                 sizes: &[k as u64, n as u64, 1, groups as u64],
                 data: &b,
+                raw: None,
             },
         ],
         &[n as u64, m as u64, hpg as u64, groups as u64],
@@ -133,11 +135,13 @@ fn case_a_broadcast() -> reng_core::Result<f32> {
                 name: "A",
                 sizes: &[k as u64, m as u64, 1],
                 data: &a,
+                raw: None,
             },
             NodeInput {
                 name: "B",
                 sizes: &[n as u64, k as u64, heads as u64],
                 data: &b,
+                raw: None,
             },
         ],
         &[n as u64, m as u64, heads as u64],
@@ -173,11 +177,13 @@ fn case_broadcast_add() -> reng_core::Result<f32> {
                 name: "X",
                 sizes: &[n as u64, m as u64, g as u64, h as u64],
                 data: &x,
+                raw: None,
             },
             NodeInput {
                 name: "M",
                 sizes: &[n as u64, m as u64, 1, 1],
                 data: &mask,
+                raw: None,
             },
         ],
         &[n as u64, m as u64, g as u64, h as u64],
@@ -243,16 +249,19 @@ fn case_rope3d() -> reng_core::Result<f32> {
                 name: "X",
                 sizes: &[hd as u64, rows as u64, heads as u64],
                 data: &x,
+                raw: None,
             },
             NodeInput {
                 name: "SIN",
                 sizes: &[hd as u64, rows as u64],
                 data: &sin,
+                raw: None,
             },
             NodeInput {
                 name: "COS",
                 sizes: &[hd as u64, rows as u64],
                 data: &cos,
+                raw: None,
             },
         ],
         &[hd as u64, rows as u64, heads as u64],
@@ -361,11 +370,13 @@ fn case_softmax_mask() -> reng_core::Result<f32> {
                 name: "X",
                 sizes: &[n as u64, m as u64],
                 data: &x,
+                raw: None,
             },
             NodeInput {
                 name: "M",
                 sizes: &[n as u64, m as u64],
                 data: &mask,
+                raw: None,
             },
         ],
         &[n as u64, m as u64],
@@ -402,11 +413,13 @@ fn case_batched_decode_gemm() -> reng_core::Result<f32> {
                 name: "A",
                 sizes: &[k as u64, 1, 1, 1, bsz as u64],
                 data: &a,
+                raw: None,
             },
             NodeInput {
                 name: "W",
                 sizes: &[n as u64, k as u64, hpg as u64, groups as u64, 1],
                 data: &w,
+                raw: None,
             },
         ],
         &[n as u64, 1, hpg as u64, groups as u64, bsz as u64],
@@ -454,16 +467,19 @@ fn case_rope_per_sequence() -> reng_core::Result<f32> {
                 name: "X",
                 sizes: &[hd as u64, 1, heads as u64, 1, bsz as u64],
                 data: &x,
+                raw: None,
             },
             NodeInput {
                 name: "SIN",
                 sizes: &[hd as u64, 1, 1, 1, bsz as u64],
                 data: &sin,
+                raw: None,
             },
             NodeInput {
                 name: "COS",
                 sizes: &[hd as u64, 1, 1, 1, bsz as u64],
                 data: &cos,
+                raw: None,
             },
         ],
         &[hd as u64, 1, heads as u64, 1, bsz as u64],
@@ -487,6 +503,81 @@ fn case_rope_per_sequence() -> reng_core::Result<f32> {
     Ok(rel(&hpu, &c))
 }
 
+/// Case 10: ONNX-style ScatterND writing whole `hd` rows into a
+/// `[hd, keys, 1, groups]` cache at `(g, 0, pos_g)`. Tries the candidate
+/// guids in turn and reports the first that compiles and matches.
+fn case_scatter_nd() -> reng_core::Result<f32> {
+    let (hd, keys, groups) = (64usize, 128usize, 3usize);
+    let data = ramp(hd * keys * groups, 13);
+    let n = groups;
+    let updates = ramp(hd * n, 14);
+    let positions = [5usize, 77, 127];
+    // ONNX indices [n, 3] = (g, 0, pos); device sizes [3, n], int32.
+    let mut idx: Vec<u8> = Vec::with_capacity(n * 3 * 4);
+    for (g, &pos) in positions.iter().enumerate() {
+        for v in [g as i32, 0i32, pos as i32] {
+            idx.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let mut c: Vec<f32> = data.iter().map(|v| bf16(*v)).collect();
+    for (g, &pos) in positions.iter().enumerate() {
+        for d in 0..hd {
+            c[d + hd * (pos + keys * g)] = bf16(updates[d + hd * g]);
+        }
+    }
+    let mut last_err = String::new();
+    for guid in [
+        "scatter_nd_onnx_fwd_bf16",
+        "scatter_nd_splice_fwd_bf16",
+        "scatter_nd_element_fwd_bf16",
+        "scatter_nd_fwd_bf16",
+    ] {
+        let res = run_node(
+            guid,
+            &[
+                NodeInput {
+                    name: "DATA",
+                    sizes: &[hd as u64, keys as u64, 1, groups as u64],
+                    data: &data,
+                    raw: None,
+                },
+                NodeInput {
+                    name: "IDX",
+                    sizes: &[3, n as u64],
+                    data: &[],
+                    raw: Some((reng_synapse::SYN_TYPE_INT32, &idx)),
+                },
+                NodeInput {
+                    name: "UPD",
+                    sizes: &[hd as u64, n as u64],
+                    data: &updates,
+                    raw: None,
+                },
+            ],
+            &[hd as u64, keys as u64, 1, groups as u64],
+            core::ptr::null(),
+            0,
+        );
+        match res {
+            Ok(hpu) => {
+                let r = rel(&hpu, &c);
+                println!("  {guid}: rel_L2={r:.4}");
+                if r < 0.02 {
+                    return Ok(r);
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                println!("  {guid}: rejected ({})", &msg[..msg.len().min(60)]);
+                last_err = msg;
+            }
+        }
+    }
+    Err(reng_core::Error::Other(format!(
+        "no ScatterND guid worked: {last_err}"
+    )))
+}
+
 fn main() -> reng_core::Result<()> {
     let names = [
         "batch_gemm GQA inner-batch broadcast (transpose_b)",
@@ -499,6 +590,7 @@ fn main() -> reng_core::Result<()> {
         "softmax_fwd_bf16 with a mask input",
         "batch_gemm 5-D, weights broadcast over the sequence batch",
         "rope_st2_fwd_bf16 with a per-sequence 5-D table",
+        "ScatterND of hd rows into a [hd,keys,1,groups] cache",
     ];
     let selected: Vec<usize> = match std::env::args()
         .nth(1)
@@ -519,7 +611,8 @@ fn main() -> reng_core::Result<()> {
             6 => case_slice(),
             7 => case_softmax_mask(),
             8 => case_batched_decode_gemm(),
-            _ => case_rope_per_sequence(),
+            9 => case_rope_per_sequence(),
+            _ => case_scatter_nd(),
         };
         match res {
             Ok(r) if r < 0.02 => println!("case {ci}: {}: rel_L2={r:.4} ok", names[ci]),
