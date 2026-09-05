@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `reng-synapse`: a Llama-style decoder (RMSNorm, RoPE, grouped-query
+  attention, SwiGLU) as one fused SynapseAI recipe; attention batched over
+  heads in 4-D tensors; a KV cache updated inside the recipe (placement
+  gemm plus add, ping-pong buffers) with a narrow decode recipe sharing the
+  prefill recipe's weights and cache; a two-sentinel readback protocol that
+  is exact on a stack whose stream sync returns before DMA copies land;
+  `run_node` probes and contract tests for `batch_gemm`, broadcast add,
+  4-D softmax, batched RoPE and `transpose`.
+- `reng-model`: HuggingFace `config.json` + `model.safetensors` loading,
+  prefill (`reng-prefill`), KV-cached greedy generation (`reng-generate`,
+  teacher-forced against an HF reference with a bf16 near-tie tolerance),
+  and `reng-bench` (prefill and decode tok/s next to the roofline ceiling).
+- `tools/oracle/`: HF transformers CPU reference scripts.
+- `bench` workflow: runs `reng-bench` on a self-hosted Gaudi2 runner after
+  every merge to main and publishes the history to GitHub Pages.
+
 - Workspace scaffold with five crates: `reng-core`, `reng-hal`, `reng-ceiling`,
   `reng-cli`, `reng-synapse`.
 - `reng-core`: dtype, tensor shape, and device-identifier types.
