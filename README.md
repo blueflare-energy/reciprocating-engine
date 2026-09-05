@@ -93,6 +93,7 @@ against the `reng-ceiling` roofline:
 | Qwen3-8B | 125 (77.1%) | 980 (76.5%) |  |  |
 | DeepSeek-R1-Distill-Llama-8B | 130 (79.8%) | 1030 (79.7%) | 6894 (71.3%) |  |
 | phi-4 | 72 (83.5%) | 578 (84.1%) |  |  |
+| Qwen2.5-32B | 33 (87.1%) | 262 (86.1%) |  |  |
 
 Decode percentages are against the HBM roofline, prefill against the MME
 roofline. Every model is verified against a Hugging Face f32 reference

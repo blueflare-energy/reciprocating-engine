@@ -90,6 +90,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and asked for at the end, the windowed prefill reproduces the
   reference's forgetting (top-1 match, cosine 0.9991) while
   `RENG_NO_WINDOW=1` does not (top-1 differs, cosine 0.9656).
+- Qwen2.5-32B verified without engine changes (64 layers, hidden 5120,
+  40 heads over 8 KV heads, head_dim 128, intermediate 27648, vocab
+  152064, untied head, rope_theta 1e6, `use_sliding_window: false`):
+  7/8 exact plus a reference near-tie over the 5-token prompt, 8/8
+  exact over a 315-token prompt, and at 315 tokens 301/315 argmax
+  agreement with last-logits cosine 0.9984; b1 33 tok/s (87.1% of the
+  HBM ceiling), b8 262 (86.1%), 30 ms per decode step. The 65.5 GB
+  checkpoint puts 64.7 GB on the card (the embedding table stays on the
+  host), memory-mapped in 2-3 s, first token 15-20 s after start with a
+  cached recipe. `RENG_RECIPE_TRACE` now reports the device bytes each
+  runtime allocates (inputs, scratch, output, workspace).
 - `reng-sdpa-test` and `reng-msoftmax-test` probe the fused attention
   (`sdpa_recomp_fwd_bf16`) and masked-softmax kernels against host
   references; `tools/profile/` holds the trace timeline and decode-step
