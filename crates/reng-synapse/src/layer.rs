@@ -3,19 +3,21 @@
 //! ```text
 //! n1  = rmsnorm(x, g1)
 //! q,k,v = n1 @ Wq (pre-scaled), n1 @ Wk, n1 @ Wv
-//! qr, kr = rope(q), rope(k)
-//! attn = softmax(qr @ kr^T) @ v          (single head, head_dim = hidden)
+//! per head i (split along the feature axis):
+//!   qr_i, kr_i = rope(q_i), rope(k_i)
+//!   attn_i = softmax(qr_i @ kr_i^T) @ v_i
+//! attn = concat_i(attn_i)
 //! h    = x + attn @ Wo
 //! n2   = rmsnorm(h, g2)
 //! out  = h + down( silu(n2 @ Wg) * (n2 @ Wu) )
 //! ```
 //!
-//! Nineteen nodes, one graph, one launch. Activations never leave HBM; only the
+//! One graph, one launch. Activations never leave HBM; only the
 //! `[tokens, hidden]` output is read back. This is the on-device-dataflow
-//! architecture end to end, composed purely from kernels already verified in
-//! isolation. Single-head (no head split) so the layer dataflow is proven before
-//! multi-head reshaping is added. Attention is non-causal here; a causal mask
-//! is one additive node away.
+//! architecture end to end, composed purely from kernels verified in
+//! isolation. Heads are split with the compiler's `split` node and merged with
+//! `concat` (axis 0 = the feature FCD), so every matmul stays a verified 2D
+//! gemm. Attention is non-causal here; a causal mask is one additive node away.
 
 use crate::ffi::*;
 use crate::{bf16_to_f32, f32_to_bf16};
@@ -37,6 +39,8 @@ macro_rules! syn {
 
 /// Weights and inputs of one decoder layer, all row-major f32.
 pub struct LayerWeights<'a> {
+    /// Number of attention heads; `hidden % n_heads == 0`.
+    pub n_heads: usize,
     /// RMSNorm gains, each length `hidden`.
     pub g1: &'a [f32],
     pub g2: &'a [f32],
@@ -49,10 +53,10 @@ pub struct LayerWeights<'a> {
     pub wg: &'a [f32],
     pub wu: &'a [f32],
     pub wd: &'a [f32],
-    /// RoPE caches `[tokens, hidden]` (head_dim = hidden, contiguous).
+    /// RoPE caches `[tokens, head_dim]` (head_dim contiguous), shared by heads.
     pub sin: &'a [f32],
     pub cos: &'a [f32],
-    /// Attention scale, folded into `wq`.
+    /// Attention scale (normally `1/sqrt(head_dim)`), folded into `wq`.
     pub scale: f32,
     pub eps: f32,
 }
@@ -129,9 +133,14 @@ struct RopeParams {
     mode: i32,
 }
 
+#[repr(C)]
+struct AxisParams {
+    axis: u32,
+}
+
 /// Run one fused decoder layer on `x` (`[tokens, hidden]`, row-major) and
-/// return `out` (`[tokens, hidden]`) as f32. Every dimension should be at least
-/// 128 (see [`crate::Device`]).
+/// return `out` (`[tokens, hidden]`) as f32. Every dimension, including
+/// `head_dim = hidden / n_heads`, should be at least 128 (see [`crate::Device`]).
 ///
 /// # Errors
 ///
@@ -139,7 +148,8 @@ struct RopeParams {
 ///
 /// # Panics
 ///
-/// Panics if any buffer length disagrees with `tokens`, `hidden`, `inter`.
+/// Panics if any buffer length disagrees with `tokens`, `hidden`, `inter`, or
+/// if `hidden` is not a multiple of `n_heads`.
 #[allow(clippy::too_many_lines)]
 pub fn decoder_layer_bf16(
     x: &[f32],
@@ -148,7 +158,10 @@ pub fn decoder_layer_bf16(
     hidden: usize,
     inter: usize,
 ) -> Result<Vec<f32>> {
-    let (t, h, i) = (tokens as u64, hidden as u64, inter as u64);
+    let nh = w.n_heads;
+    assert!(nh >= 1 && hidden % nh == 0);
+    let head_dim = hidden / nh;
+    let (t, h, i, hd) = (tokens as u64, hidden as u64, inter as u64, head_dim as u64);
     assert_eq!(x.len(), tokens * hidden);
     for m in [w.wq, w.wk, w.wv, w.wo] {
         assert_eq!(m.len(), hidden * hidden);
@@ -159,8 +172,8 @@ pub fn decoder_layer_bf16(
     for v in [w.g1, w.g2] {
         assert_eq!(v.len(), hidden);
     }
-    assert_eq!(w.sin.len(), tokens * hidden);
-    assert_eq!(w.cos.len(), tokens * hidden);
+    assert_eq!(w.sin.len(), tokens * head_dim);
+    assert_eq!(w.cos.len(), tokens * head_dim);
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
 
     syn!(synInitialize());
@@ -178,8 +191,8 @@ pub fn decoder_layer_bf16(
         ("WK", vec![h, h], w.wk),
         ("WV", vec![h, h], w.wv),
         ("WO", vec![h, h], w.wo),
-        ("SIN", vec![h, t], w.sin),
-        ("COS", vec![h, t], w.cos),
+        ("SIN", vec![hd, t], w.sin),
+        ("COS", vec![hd, t], w.cos),
         ("WG", vec![i, h], w.wg),
         ("WU", vec![i, h], w.wu),
         ("WD", vec![h, i], w.wd),
@@ -215,10 +228,6 @@ pub fn decoder_layer_bf16(
     let t_q = mid("q", &[h, t])?;
     let t_k = mid("k", &[h, t])?;
     let t_v = mid("v", &[h, t])?;
-    let t_qr = mid("qr", &[h, t])?;
-    let t_kr = mid("kr", &[h, t])?;
-    let t_scores = mid("scores", &[t, t])?;
-    let t_probs = mid("probs", &[t, t])?;
     let t_attn = mid("attn", &[h, t])?;
     let t_o = mid("o", &[h, t])?;
     let t_h = mid("h", &[h, t])?;
@@ -232,6 +241,20 @@ pub fn decoder_layer_bf16(
     // RMSNorm's second output (inverse RMS) must be f32.
     let t_inv1 = tensor(graph, "inv1", &[1, t], SYN_TYPE_F32, false)?.0;
     let t_inv2 = tensor(graph, "inv2", &[1, t], SYN_TYPE_F32, false)?.0;
+    // Per-head slices and attention intermediates.
+    let heads = |prefix: &str, sizes: &[u64]| -> Result<Vec<synTensor>> {
+        (0..nh)
+            .map(|j| mid(&format!("{prefix}{j}"), sizes))
+            .collect()
+    };
+    let q_h = heads("q", &[hd, t])?;
+    let k_h = heads("k", &[hd, t])?;
+    let v_h = heads("v", &[hd, t])?;
+    let qr_h = heads("qr", &[hd, t])?;
+    let kr_h = heads("kr", &[hd, t])?;
+    let sc_h = heads("scores", &[t, t])?;
+    let pr_h = heads("probs", &[t, t])?;
+    let at_h = heads("attn", &[hd, t])?;
 
     let rms = RmsNormParams {
         epsilon: w.eps,
@@ -240,6 +263,7 @@ pub fn decoder_layer_bf16(
         bwd_mode: 0,
     };
     let rope = RopeParams { offset: 0, mode: 0 };
+    let axis0 = AxisParams { axis: 0 };
     let gemm = synGEMMParams {
         transpose_a: false,
         transpose_b: false,
@@ -249,15 +273,17 @@ pub fn decoder_layer_bf16(
         transpose_b: true,
     };
     let sm = synSoftmaxParams { dim: 0 };
-    let p = |r: &RmsNormParams| {
-        (
-            (r as *const RmsNormParams).cast::<c_void>(),
-            core::mem::size_of::<RmsNormParams>() as u32,
-        )
-    };
+    let prm = (
+        (&raw const rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    );
     let pr = (
         (&raw const rope).cast::<c_void>(),
         core::mem::size_of::<RopeParams>() as u32,
+    );
+    let pax = (
+        (&raw const axis0).cast::<c_void>(),
+        core::mem::size_of::<AxisParams>() as u32,
     );
     let pg = (
         (&raw const gemm).cast::<c_void>(),
@@ -274,58 +300,99 @@ pub fn decoder_layer_bf16(
     let none = (core::ptr::null::<c_void>(), 0u32);
 
     // Attention block.
-    let (pp, pl) = p(&rms);
     node(
         graph,
         "rms_norm_fwd_bf16",
         "norm1",
         &[t_x, t_g1],
         &[t_n1, t_inv1],
-        pp,
-        pl,
+        prm.0,
+        prm.1,
     )?;
     node(graph, "gemm", "q_proj", &[t_n1, t_wq], &[t_q], pg.0, pg.1)?;
     node(graph, "gemm", "k_proj", &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
     node(graph, "gemm", "v_proj", &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
-    node(
-        graph,
-        "rope_st2_fwd_bf16",
-        "rope_q",
-        &[t_q, t_sin, t_cos],
-        &[t_qr],
-        pr.0,
-        pr.1,
-    )?;
-    node(
-        graph,
-        "rope_st2_fwd_bf16",
-        "rope_k",
-        &[t_k, t_sin, t_cos],
-        &[t_kr],
-        pr.0,
-        pr.1,
-    )?;
-    // scores[query, key] = qr @ kr^T: K in its natural [seq, head_dim] layout.
+    if nh > 1 {
+        node(graph, "split", "split_q", &[t_q], &q_h, pax.0, pax.1)?;
+        node(graph, "split", "split_k", &[t_k], &k_h, pax.0, pax.1)?;
+        node(graph, "split", "split_v", &[t_v], &v_h, pax.0, pax.1)?;
+    }
+    let (qs, ks, vs): (Vec<synTensor>, Vec<synTensor>, Vec<synTensor>) = if nh > 1 {
+        (q_h, k_h, v_h)
+    } else {
+        (vec![t_q], vec![t_k], vec![t_v])
+    };
+    for j in 0..nh {
+        node(
+            graph,
+            "rope_st2_fwd_bf16",
+            &format!("rope_q{j}"),
+            &[qs[j], t_sin, t_cos],
+            &[qr_h[j]],
+            pr.0,
+            pr.1,
+        )?;
+        node(
+            graph,
+            "rope_st2_fwd_bf16",
+            &format!("rope_k{j}"),
+            &[ks[j], t_sin, t_cos],
+            &[kr_h[j]],
+            pr.0,
+            pr.1,
+        )?;
+        // scores[query, key] = qr @ kr^T: K in its natural [seq, head_dim] layout.
+        node(
+            graph,
+            "gemm",
+            &format!("qk{j}"),
+            &[qr_h[j], kr_h[j]],
+            &[sc_h[j]],
+            pgt.0,
+            pgt.1,
+        )?;
+        node(
+            graph,
+            "softmax_fwd_bf16",
+            &format!("softmax{j}"),
+            &[sc_h[j]],
+            &[pr_h[j]],
+            ps.0,
+            ps.1,
+        )?;
+        node(
+            graph,
+            "gemm",
+            &format!("av{j}"),
+            &[pr_h[j], vs[j]],
+            &[at_h[j]],
+            pg.0,
+            pg.1,
+        )?;
+    }
+    let attn_full = if nh > 1 {
+        node(
+            graph,
+            "concat",
+            "merge_heads",
+            &at_h,
+            &[t_attn],
+            pax.0,
+            pax.1,
+        )?;
+        t_attn
+    } else {
+        at_h[0]
+    };
     node(
         graph,
         "gemm",
-        "qk",
-        &[t_qr, t_kr],
-        &[t_scores],
-        pgt.0,
-        pgt.1,
+        "o_proj",
+        &[attn_full, t_wo],
+        &[t_o],
+        pg.0,
+        pg.1,
     )?;
-    node(
-        graph,
-        "softmax_fwd_bf16",
-        "softmax",
-        &[t_scores],
-        &[t_probs],
-        ps.0,
-        ps.1,
-    )?;
-    node(graph, "gemm", "av", &[t_probs, t_v], &[t_attn], pg.0, pg.1)?;
-    node(graph, "gemm", "o_proj", &[t_attn, t_wo], &[t_o], pg.0, pg.1)?;
     node(
         graph,
         "add_fwd_bf16",
@@ -342,8 +409,8 @@ pub fn decoder_layer_bf16(
         "norm2",
         &[t_h, t_g2],
         &[t_n2, t_inv2],
-        pp,
-        pl,
+        prm.0,
+        prm.1,
     )?;
     node(
         graph,
@@ -542,6 +609,8 @@ pub fn decoder_layer_cpu(
     hidden: usize,
     inter: usize,
 ) -> Vec<f32> {
+    let nh = w.n_heads;
+    let hd = hidden / nh;
     let rmsnorm = |src: &[f32], g: &[f32]| -> Vec<f32> {
         let mut o = vec![0.0f32; tokens * hidden];
         for tk in 0..tokens {
@@ -567,47 +636,57 @@ pub fn decoder_layer_cpu(
         }
         o
     };
-    let rope = |src: &[f32]| -> Vec<f32> {
-        let half = hidden / 2;
-        let mut o = vec![0.0f32; tokens * hidden];
+    // Rotate-half RoPE applied to head `head` of a [tokens, hidden] tensor,
+    // written into the same head slot of the output.
+    let rope_head = |src: &[f32], head: usize, out: &mut [f32]| {
+        let half = hd / 2;
         for tk in 0..tokens {
-            let b = tk * hidden;
-            for d in 0..hidden {
+            let b = tk * hidden + head * hd;
+            let c = tk * hd;
+            for d in 0..hd {
                 let rot = if d < half {
                     -src[b + d + half]
                 } else {
                     src[b + d - half]
                 };
-                o[b + d] = src[b + d] * w.cos[b + d] + rot * w.sin[b + d];
+                out[b + d] = src[b + d] * w.cos[c + d] + rot * w.sin[c + d];
             }
         }
-        o
     };
 
     let n1 = rmsnorm(x, w.g1);
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
-    let q = rope(&matmul(&n1, &wq_scaled, hidden, hidden));
-    let k = rope(&matmul(&n1, w.wk, hidden, hidden));
+    let q = matmul(&n1, &wq_scaled, hidden, hidden);
+    let k = matmul(&n1, w.wk, hidden, hidden);
     let v = matmul(&n1, w.wv, hidden, hidden);
-    // attention, non-causal
+    let mut qr = vec![0.0f32; tokens * hidden];
+    let mut kr = vec![0.0f32; tokens * hidden];
+    for head in 0..nh {
+        rope_head(&q, head, &mut qr);
+        rope_head(&k, head, &mut kr);
+    }
+    // attention per head, non-causal
     let mut attn = vec![0.0f32; tokens * hidden];
     let mut scores = vec![0.0f32; tokens];
-    for qi in 0..tokens {
-        for (ki, s) in scores.iter_mut().enumerate() {
-            *s = (0..hidden)
-                .map(|d| q[qi * hidden + d] * k[ki * hidden + d])
-                .sum();
-        }
-        let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for s in &mut scores {
-            *s = (*s - m).exp();
-            sum += *s;
-        }
-        for (ki, s) in scores.iter().enumerate() {
-            let pr = s / sum;
-            for d in 0..hidden {
-                attn[qi * hidden + d] += pr * v[ki * hidden + d];
+    for head in 0..nh {
+        let off = head * hd;
+        for qi in 0..tokens {
+            for (ki, s) in scores.iter_mut().enumerate() {
+                *s = (0..hd)
+                    .map(|d| qr[qi * hidden + off + d] * kr[ki * hidden + off + d])
+                    .sum();
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - m).exp();
+                sum += *s;
+            }
+            for (ki, s) in scores.iter().enumerate() {
+                let pr = s / sum;
+                for d in 0..hd {
+                    attn[qi * hidden + off + d] += pr * v[ki * hidden + off + d];
+                }
             }
         }
     }

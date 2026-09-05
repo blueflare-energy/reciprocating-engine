@@ -1,8 +1,8 @@
-//! Verify one fused transformer decoder layer (single head) against a CPU
-//! reference: RMSNorm -> QKV -> RoPE -> attention -> O-proj -> residual ->
-//! RMSNorm -> SwiGLU MLP -> residual, all in one recipe.
+//! Verify one fused multi-head transformer decoder layer against a CPU
+//! reference: RMSNorm -> QKV -> per-head RoPE + attention (split/concat) ->
+//! O-proj -> residual -> RMSNorm -> SwiGLU MLP -> residual, all in one recipe.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-layer-test -- [tokens] [hidden] [inter]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-layer-test -- [tokens] [hidden] [inter] [n_heads]`.
 
 use reng_synapse::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu};
 
@@ -20,8 +20,14 @@ fn main() -> reng_core::Result<()> {
             .and_then(|a| a.parse().ok())
             .unwrap_or(d)
     };
-    let (tokens, hidden, inter) = (arg(1, 256usize), arg(2, 256usize), arg(3, 512usize));
-    let half = hidden / 2;
+    let (tokens, hidden, inter, n_heads) = (
+        arg(1, 256usize),
+        arg(2, 256usize),
+        arg(3, 512usize),
+        arg(4, 2usize),
+    );
+    let hd = hidden / n_heads;
+    let half = hd / 2;
     let fan = 1.0 / (hidden as f32).sqrt();
     let fan_i = 1.0 / (inter as f32).sqrt();
 
@@ -35,16 +41,18 @@ fn main() -> reng_core::Result<()> {
     let wg = seq(hidden * inter, 17, 6, 31, fan);
     let wu = seq(hidden * inter, 19, 7, 37, fan);
     let wd = seq(inter * hidden, 23, 8, 41, fan_i);
-    let mut sin = vec![0.0f32; tokens * hidden];
-    let mut cos = vec![0.0f32; tokens * hidden];
+    // RoPE caches are per position and per head_dim, shared across heads.
+    let mut sin = vec![0.0f32; tokens * hd];
+    let mut cos = vec![0.0f32; tokens * hd];
     for p in 0..tokens {
-        for d in 0..hidden {
-            let theta = p as f32 * 10000f32.powf(-2.0 * ((d % half) as f32) / hidden as f32);
-            sin[p * hidden + d] = theta.sin();
-            cos[p * hidden + d] = theta.cos();
+        for d in 0..hd {
+            let theta = p as f32 * 10000f32.powf(-2.0 * ((d % half) as f32) / hd as f32);
+            sin[p * hd + d] = theta.sin();
+            cos[p * hd + d] = theta.cos();
         }
     }
     let w = LayerWeights {
+        n_heads,
         g1: &g1,
         g2: &g2,
         wq: &wq,
@@ -56,11 +64,13 @@ fn main() -> reng_core::Result<()> {
         wd: &wd,
         sin: &sin,
         cos: &cos,
-        scale: fan,
+        scale: 1.0 / (hd as f32).sqrt(),
         eps: 1e-6,
     };
 
-    println!("fused decoder layer (single head): tokens={tokens}, hidden={hidden}, inter={inter}");
+    println!(
+        "fused decoder layer: tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads} (head_dim {hd})"
+    );
     let hpu = decoder_layer_bf16(&x, &w, tokens, hidden, inter)?;
     let cpu = decoder_layer_cpu(&x, &w, tokens, hidden, inter);
 
