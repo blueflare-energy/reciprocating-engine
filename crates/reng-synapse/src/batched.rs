@@ -243,6 +243,7 @@ impl<'a> BatchedModel<'a> {
             mask: Some(t_mask),
             cache: Some(cap),
             kidx: Some(t_kidx),
+            inplace: false,
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {
@@ -418,17 +419,30 @@ impl<'a> BatchedModel<'a> {
         let c = self.cap;
         let off = b as u64 * self.slot_bytes(c);
         let neg = f32_to_bf16(MASK_NEG);
-        // The wide recipe's cache tensors (input and aliased output) both
-        // bind to this sequence's slot.
-        for (li, (k, v)) in self.slots.iter().enumerate() {
-            let (kci, vci, kco, vco) = cache_names(li);
-            self.pf.rebind(&kci, k + off);
-            self.pf.rebind(&kco, k + off);
-            self.pf.rebind(&vci, v + off);
-            self.pf.rebind(&vco, v + off);
-        }
+        // The wide recipe's ScatterND is not in place: each block reads one
+        // buffer and writes another. The blocks alternate between this
+        // sequence's slot and the recipe's own buffers, starting so that the
+        // last block lands in the slot; the first block's input is stale
+        // (its positions are masked).
+        let n_blocks = n_total.div_ceil(p);
         let mut last = Vec::new();
-        for chunk in x.chunks(p * h) {
+        for (i, chunk) in x.chunks(p * h).enumerate() {
+            let to_slot = (n_blocks - 1 - i) % 2 == 0;
+            for (li, (k, v)) in self.slots.iter().enumerate() {
+                let (kci, vci, kco, vco) = cache_names(li);
+                let (k_own, v_own) = (self.pf.addr(&kco), self.pf.addr(&vco));
+                if to_slot {
+                    self.pf.rebind(&kci, k_own);
+                    self.pf.rebind(&vci, v_own);
+                    self.pf.rebind(&kco, k + off);
+                    self.pf.rebind(&vco, v + off);
+                } else {
+                    self.pf.rebind(&kci, k + off);
+                    self.pf.rebind(&vci, v + off);
+                    self.pf.rebind(&kco, k_own);
+                    self.pf.rebind(&vco, v_own);
+                }
+            }
             let n = chunk.len() / h;
             let pos = self.pos[b];
             let mut xb = vec![0.0f32; p * h];

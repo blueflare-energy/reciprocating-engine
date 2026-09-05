@@ -106,3 +106,13 @@ required-features = ["link-synapse"]
 name = "reng-batch-test"
 path = "src/bin/batch_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-attn-bench"
+path = "src/bin/attn_bench.rs"
+required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-scatter-bench"
+path = "src/bin/scatter_bench.rs"
+required-features = ["link-synapse"]

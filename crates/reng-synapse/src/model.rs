@@ -305,6 +305,11 @@ pub(crate) struct Shared {
     /// update `r + tokens * g` (row r of KV head g) goes to ONNX index
     /// `(g, 0, position)` of the `[hd, keys, 1, groups]` cache.
     pub kidx: Option<synTensor>,
+    /// Whether the cache update writes in place (output aliasing input).
+    /// In-place ScatterND runs its rows serially, so a block of many rows
+    /// (prefill) is written into a separate output buffer that the caller
+    /// copies back; a one-row decode step stays in place.
+    pub inplace: bool,
 }
 
 /// Persistent tensor names of layer `li`'s cache state:
@@ -395,13 +400,31 @@ pub(crate) fn build_layer(
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    let t_wq = gb.input(
-        &p("wq"),
-        &[hd, h, hpg, groups],
-        &blocks(&wq_scaled, hidden, hpg_us),
-    )?;
-    let t_wk = gb.input(&p("wk"), &[hd, h, 1, groups], &blocks(w.wk, nkv * hd_us, 1))?;
-    let t_wv = gb.input(&p("wv"), &[hd, h, 1, groups], &blocks(w.wv, nkv * hd_us, 1))?;
+    // The projections are plain gemms over the natural `[in, out]` weights
+    // (N = all heads at once; the same buffers the batched decode recipe
+    // binds by name) followed by a transpose into the head layout: a
+    // batch_gemm over per-head blocks runs each head as an N = hd gemm,
+    // which the MME executes at a fraction of its rate. Small models (few
+    // heads, narrow hidden) lose more to the transposes than they gain, so
+    // they keep the per-head form; `RENG_HEAD_BLOCKS` forces it.
+    let head_blocks = env_on("RENG_HEAD_BLOCKS") || hidden < 1024;
+    let (t_wq, t_wk, t_wv) = if head_blocks {
+        (
+            gb.input(
+                &p("wq"),
+                &[hd, h, hpg, groups],
+                &blocks(&wq_scaled, hidden, hpg_us),
+            )?,
+            gb.input(&p("wk"), &[hd, h, 1, groups], &blocks(w.wk, nkv * hd_us, 1))?,
+            gb.input(&p("wv"), &[hd, h, 1, groups], &blocks(w.wv, nkv * hd_us, 1))?,
+        )
+    } else {
+        (
+            gb.input(&p("wq2"), &[h, h], &wq_scaled)?,
+            gb.input(&p("wk2"), &[hd * groups, h], w.wk)?,
+            gb.input(&p("wv2"), &[hd * groups, h], w.wv)?,
+        )
+    };
     let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
     let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
     let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
@@ -495,31 +518,86 @@ pub(crate) fn build_layer(
         prm.0,
         prm.1,
     )?;
-    gb.node("reshape", &p("n1_4d"), &[t_n1], &[t_n1_4], none.0, none.1)?;
-    gb.node(
-        "batch_gemm",
-        &p("q_proj"),
-        &[t_n1_4, t_wq],
-        &[t_q],
-        pg.0,
-        pg.1,
-    )?;
-    gb.node(
-        "batch_gemm",
-        &p("k_proj"),
-        &[t_n1_4, t_wk],
-        &[t_k],
-        pg.0,
-        pg.1,
-    )?;
-    gb.node(
-        "batch_gemm",
-        &p("v_proj"),
-        &[t_n1_4, t_wv],
-        &[t_v],
-        pg.0,
-        pg.1,
-    )?;
+    if head_blocks {
+        gb.node("reshape", &p("n1_4d"), &[t_n1], &[t_n1_4], none.0, none.1)?;
+        gb.node(
+            "batch_gemm",
+            &p("q_proj"),
+            &[t_n1_4, t_wq],
+            &[t_q],
+            pg.0,
+            pg.1,
+        )?;
+        gb.node(
+            "batch_gemm",
+            &p("k_proj"),
+            &[t_n1_4, t_wk],
+            &[t_k],
+            pg.0,
+            pg.1,
+        )?;
+        gb.node(
+            "batch_gemm",
+            &p("v_proj"),
+            &[t_n1_4, t_wv],
+            &[t_v],
+            pg.0,
+            pg.1,
+        )?;
+    } else {
+        // `[features, t]` is `[hd, heads, t]`; the head layout wants the
+        // token dim inside the heads, so each projection ends in a
+        // transpose of its two outer dims (the inverse of `heads_last`).
+        let tr_in = TransposeParams {
+            permutation: [0, 2, 1, 0, 0],
+            tensor_dim: 3,
+        };
+        let ptr_in = (
+            (&raw const tr_in).cast::<c_void>(),
+            core::mem::size_of::<TransposeParams>() as u32,
+        );
+        for (name, wt, n_out, heads, out) in [
+            ("q", t_wq, h, hpg * groups, t_q),
+            ("k", t_wk, hd * groups, groups, t_k),
+            ("v", t_wv, hd * groups, groups, t_v),
+        ] {
+            let flat = gb.mid(&p(&format!("{name}2")), &[n_out, t], bf)?;
+            let by_head = gb.mid(&p(&format!("{name}_heads")), &[hd, heads, t], bf)?;
+            let tokens_in = gb.mid(&p(&format!("{name}_tokens")), &[hd, t, heads], bf)?;
+            gb.node(
+                "gemm",
+                &p(&format!("{name}_proj")),
+                &[t_n1, wt],
+                &[flat],
+                pg.0,
+                pg.1,
+            )?;
+            gb.node(
+                "reshape",
+                &p(&format!("{name}_3d")),
+                &[flat],
+                &[by_head],
+                none.0,
+                none.1,
+            )?;
+            gb.node(
+                "transpose",
+                &p(&format!("{name}_tokens_in")),
+                &[by_head],
+                &[tokens_in],
+                ptr_in.0,
+                ptr_in.1,
+            )?;
+            gb.node(
+                "reshape",
+                &p(&format!("{name}_4d")),
+                &[tokens_in],
+                &[out],
+                none.0,
+                none.1,
+            )?;
+        }
+    }
     // Attention biases (when present) broadcast over the token dim.
     let (t_q, t_k, t_v) = if w.bq.is_empty() {
         (t_q, t_k, t_v)
@@ -583,8 +661,17 @@ pub(crate) fn build_layer(
         let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
         let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups])?;
         let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups])?;
-        let kco = gb.scratch_alias(&n_kco, &[hd, keys, 1, groups], &n_kci)?;
-        let vco = gb.scratch_alias(&n_vco, &[hd, keys, 1, groups], &n_vci)?;
+        let (kco, vco) = if sh.inplace {
+            (
+                gb.scratch_alias(&n_kco, &[hd, keys, 1, groups], &n_kci)?,
+                gb.scratch_alias(&n_vco, &[hd, keys, 1, groups], &n_vci)?,
+            )
+        } else {
+            (
+                gb.scratch(&n_kco, &[hd, keys, 1, groups])?,
+                gb.scratch(&n_vco, &[hd, keys, 1, groups])?,
+            )
+        };
         let kru = gb.mid(&p("kru"), &[hd, t * groups], bf)?;
         let vu = gb.mid(&p("vu"), &[hd, t * groups], bf)?;
         gb.node("reshape", &p("kr_updates"), &[t_kr], &[kru], none.0, none.1)?;
@@ -1216,6 +1303,7 @@ fn build_stack(
         mask: t_mask,
         cache: None,
         kidx: None,
+        inplace: true,
     };
     let persist = env_on("RENG_PERSIST_LAYERS");
     let mut cur = t_x;

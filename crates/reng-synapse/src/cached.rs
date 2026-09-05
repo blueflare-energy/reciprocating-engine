@@ -17,7 +17,7 @@
 //! steps, sharing the weights and the cache buffers (`Runtime::new_with`).
 
 use crate::f32_to_bf16;
-use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer};
+use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer, cache_names};
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::Runtime;
 use reng_core::Result;
@@ -57,6 +57,12 @@ pub struct CachedModel {
     /// RoPE tables `[capacity, head_dim]`.
     sin: Vec<f32>,
     cos: Vec<f32>,
+    n_layers: usize,
+    /// Which of the two cache buffers per layer holds the cache: the wide
+    /// recipe reads one and writes the other (its ScatterND is not in
+    /// place), so its launches alternate them; the decode recipe (in place)
+    /// is bound to the current one before each launch.
+    flipped: bool,
 }
 
 impl CachedModel {
@@ -94,11 +100,11 @@ impl CachedModel {
         assert_eq!(cos.len(), capacity * hd);
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
-        let (gb, out) = Self::build(m, hidden, inter, vocab, rows, capacity)?;
+        let (gb, out) = Self::build(m, hidden, inter, vocab, rows, capacity, false)?;
         let rt = Runtime::new(gb, out)?;
         let ix = Self::inputs(&rt);
         let dec = if decode_rows > 0 && decode_rows != rows {
-            let (gb, out) = Self::build(m, hidden, inter, vocab, decode_rows, capacity)?;
+            let (gb, out) = Self::build(m, hidden, inter, vocab, decode_rows, capacity, true)?;
             let d = Runtime::new_with(gb, out, Some(&rt))?;
             let ix = Self::inputs(&d);
             Some((d, ix, decode_rows))
@@ -117,10 +123,14 @@ impl CachedModel {
             pos: 0,
             sin: sin.to_vec(),
             cos: cos.to_vec(),
+            n_layers: m.layers.len(),
+            flipped: false,
         })
     }
 
-    /// The graph for blocks of `rows` positions over a cache of `capacity`.
+    /// The graph for blocks of `rows` positions over a cache of `capacity`;
+    /// `inplace` selects the cache update form (see [`Shared::inplace`]).
+    #[allow(clippy::too_many_arguments)]
     fn build(
         m: &ModelWeights<'_>,
         hidden: usize,
@@ -128,6 +138,7 @@ impl CachedModel {
         vocab: usize,
         rows: usize,
         capacity: usize,
+        inplace: bool,
     ) -> Result<(Gb, crate::runtime::Out)> {
         let hd = hidden / m.layers[0].n_heads;
         let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64 + 1);
@@ -150,6 +161,7 @@ impl CachedModel {
             mask: Some(t_mask),
             cache: Some(capacity),
             kidx: Some(t_kidx),
+            inplace,
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {
@@ -254,10 +266,42 @@ impl CachedModel {
         );
         let pos = self.pos;
         // Small blocks go through the decode recipe when there is one.
+        let flipped = self.flipped;
+        let n_layers = self.n_layers;
+        let wide = !matches!(&self.dec, Some((_, _, dr)) if n <= *dr);
+        // Cache buffer addresses per layer (the wide runtime owns both).
+        let bufs: Vec<[u64; 4]> = (0..n_layers)
+            .map(|li| {
+                let (kci, vci, kco, vco) = cache_names(li);
+                [
+                    self.rt.addr(&kci),
+                    self.rt.addr(&vci),
+                    self.rt.addr(&kco),
+                    self.rt.addr(&vco),
+                ]
+            })
+            .collect();
         let (rt, ix, p) = match &mut self.dec {
             Some((d, ix, dr)) if n <= *dr => (d, &*ix, *dr),
             _ => (&mut self.rt, &self.ix, self.rows),
         };
+        for (li, b) in bufs.iter().enumerate() {
+            let (kci, vci, kco, vco) = cache_names(li);
+            let (k_cur, v_cur, k_other, v_other) = if flipped {
+                (b[2], b[3], b[0], b[1])
+            } else {
+                (b[0], b[1], b[2], b[3])
+            };
+            rt.rebind(&kci, k_cur);
+            rt.rebind(&vci, v_cur);
+            if wide {
+                rt.rebind(&kco, k_other);
+                rt.rebind(&vco, v_other);
+            } else {
+                rt.rebind(&kco, k_cur);
+                rt.rebind(&vco, v_cur);
+            }
+        }
 
         let mut xb = vec![0.0f32; p * h];
         xb[..n * h].copy_from_slice(x);
@@ -314,6 +358,9 @@ impl CachedModel {
             Read::LastLogits => rt.read_bf16_range("LOGITS", n - 1, 1)?,
             Read::AllLogits => rt.read_bf16_range("LOGITS", 0, n)?,
         };
+        if wide {
+            self.flipped = !flipped;
+        }
         if trace {
             eprintln!(
                 "step trace: uploads {:.2} ms, launch+readback {:.2} ms",
