@@ -1246,6 +1246,17 @@ fn compile_cached(gb: &Gb) -> Result<synRecipeHandle> {
 
 impl Drop for Runtime<'_> {
     fn drop(&mut self) {
+        // `RENG_RECIPE_TRACE` also reports where the teardown time goes.
+        let trace = env_on("RENG_RECIPE_TRACE");
+        let t0 = Instant::now();
+        let mut marks: Vec<(&str, f64)> = Vec::new();
+        let mut mark = |what: &'static str, since: &mut Instant| {
+            if trace {
+                marks.push((what, since.elapsed().as_secs_f64()));
+                *since = Instant::now();
+            }
+        };
+        let mut since = t0;
         unsafe {
             synStreamSynchronize(self.stream);
             for &hb in &self.host_bufs {
@@ -1258,6 +1269,7 @@ impl Drop for Runtime<'_> {
             if !self.h_aux.is_null() {
                 synHostFree(self.dev, self.h_aux, 0);
             }
+            mark("host frees", &mut since);
             for &d in &self.owned {
                 synDeviceFree(self.dev, d, 0);
             }
@@ -1265,13 +1277,25 @@ impl Drop for Runtime<'_> {
             if self.dws != 0 {
                 synDeviceFree(self.dev, self.dws, 0);
             }
+            mark("device frees", &mut since);
             synRecipeDestroy(self.recipe);
             synGraphDestroy(self.gb.graph);
+            mark("recipe + graph destroy", &mut since);
             if self.owns_device {
                 synStreamDestroy(self.stream);
                 synDeviceRelease(self.dev);
+                mark("stream destroy + device release", &mut since);
                 synDestroy();
+                mark("synDestroy", &mut since);
             }
+        }
+        if trace {
+            let parts: Vec<String> = marks.iter().map(|(w, t)| format!("{w} {t:.2} s")).collect();
+            eprintln!(
+                "runtime teardown: {} (total {:.2} s)",
+                parts.join(", "),
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
 }
