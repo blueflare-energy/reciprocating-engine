@@ -22,7 +22,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `reng-bench` (prefill and decode tok/s next to the roofline ceiling).
 - `tools/oracle/`: HF transformers CPU reference scripts.
 - `bench` workflow: runs `reng-bench` on a self-hosted Gaudi2 runner after
-  every merge to main and publishes the history to GitHub Pages.
+  every merge to main and publishes the history to GitHub Pages, plus the
+  decode-versus-batch and prefill-versus-context sweeps (`tools/sweep.py`).
+- Batched decode (`BatchedModel`, `reng-bench --batch`): B sequences advance
+  one token per launch over a B-slot KV cache; the cache is updated in place
+  by a ScatterND node and the greedy token is an argmax on the device.
+- Qwen2-style attention biases; sharded safetensors checkpoints; verified
+  models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B.
 
 - Workspace scaffold with five crates: `reng-core`, `reng-hal`, `reng-ceiling`,
   `reng-cli`, `reng-synapse`.
