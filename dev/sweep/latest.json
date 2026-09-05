@@ -1,0 +1,110 @@
+{
+  "options": {
+    "batches": "1,8,64",
+    "prompt": "128",
+    "new": "32",
+    "capacity": "1024"
+  },
+  "results": {
+    "SmolLM2-135M": {
+      "1": {
+        "ok": true,
+        "tok_s": 786.8,
+        "step_ms": 1.27,
+        "pct": 8.74
+      },
+      "8": {
+        "ok": true,
+        "tok_s": 5863.2,
+        "step_ms": 1.36,
+        "pct": 8.84
+      },
+      "64": {
+        "ok": true,
+        "tok_s": 29412.7,
+        "step_ms": 2.18,
+        "pct": 9.03
+      }
+    },
+    "SmolLM2-360M": {
+      "1": {
+        "ok": true,
+        "tok_s": 607.6,
+        "step_ms": 1.65,
+        "pct": 18.09
+      },
+      "8": {
+        "ok": true,
+        "tok_s": 4627.4,
+        "step_ms": 1.73,
+        "pct": 18.2
+      },
+      "64": {
+        "ok": true,
+        "tok_s": 20686.6,
+        "step_ms": 3.09,
+        "pct": 14.53
+      }
+    },
+    "Qwen2.5-0.5B": {
+      "1": {
+        "ok": true,
+        "tok_s": 754.8,
+        "step_ms": 1.32,
+        "pct": 30.49
+      },
+      "8": {
+        "ok": true,
+        "tok_s": 5270.6,
+        "step_ms": 1.52,
+        "pct": 26.95
+      },
+      "64": {
+        "ok": true,
+        "tok_s": 29507.0,
+        "step_ms": 2.17,
+        "pct": 20.72
+      }
+    },
+    "SmolLM2-1.7B": {
+      "1": {
+        "ok": true,
+        "tok_s": 369.6,
+        "step_ms": 2.7,
+        "pct": 52.06
+      },
+      "8": {
+        "ok": true,
+        "tok_s": 2449.1,
+        "step_ms": 3.27,
+        "pct": 45.6
+      },
+      "64": {
+        "ok": true,
+        "tok_s": 6506.3,
+        "step_ms": 9.84,
+        "pct": 21.72
+      }
+    },
+    "Qwen2.5-1.5B": {
+      "1": {
+        "ok": true,
+        "tok_s": 404.7,
+        "step_ms": 2.47,
+        "pct": 51.06
+      },
+      "8": {
+        "ok": true,
+        "tok_s": 2893.9,
+        "step_ms": 2.76,
+        "pct": 46.07
+      },
+      "64": {
+        "ok": true,
+        "tok_s": 16535.3,
+        "step_ms": 3.87,
+        "pct": 35.34
+      }
+    }
+  }
+}
