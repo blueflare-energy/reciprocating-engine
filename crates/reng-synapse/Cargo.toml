@@ -121,3 +121,8 @@ required-features = ["link-synapse"]
 name = "reng-guid-probe"
 path = "src/bin/guid_probe.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-argmax-test"
+path = "src/bin/argmax_test.rs"
+required-features = ["link-synapse"]

@@ -31,6 +31,16 @@ pub fn bf16_to_f32(x: u16) -> f32 {
     f32::from_bits(u32::from(x) << 16)
 }
 
+/// `w * scale` in bf16: one rounding of the f32 product per element, as
+/// the device would see a scalar folded into a weight. Exact for
+/// power-of-two scales.
+#[must_use]
+pub fn scale_bf16(w: &[u16], scale: f32) -> Vec<u16> {
+    w.iter()
+        .map(|&b| f32_to_bf16(bf16_to_f32(b) * scale))
+        .collect()
+}
+
 /// CPU reference matmul: `C[m,n] = A[m,k] @ B[k,n]`, row-major `f32`.
 #[must_use]
 pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -109,8 +119,8 @@ mod model;
 
 #[cfg(feature = "link-synapse")]
 pub use model::{
-    ModelWeights, layer_cpu, model_forward_bf16, model_forward_cpu, model_probe_bf16,
-    model_probe_cpu,
+    ModelWeights, layer_cpu, model_forward_bf16, model_forward_bf16_window, model_forward_cpu,
+    model_probe_bf16, model_probe_cpu,
 };
 
 #[cfg(feature = "link-synapse")]
@@ -496,6 +506,29 @@ mod tests {
         for &x in &[0.0f32, 1.0, -1.0, 3.5, 0.125, 100.0, -2.75] {
             let r = bf16_to_f32(f32_to_bf16(x));
             assert!((r - x).abs() <= x.abs() * 0.01 + 1e-3, "{x} -> {r}");
+        }
+    }
+
+    #[test]
+    fn scale_bf16_power_of_two_is_exact() {
+        let w = to_bf16(&[1.0, -3.0, 0.4375, 1000.0, -0.001]);
+        let back: Vec<f32> = scale_bf16(&w, 0.125)
+            .iter()
+            .map(|&b| bf16_to_f32(b))
+            .collect();
+        let want: Vec<f32> = w.iter().map(|&b| bf16_to_f32(b) * 0.125).collect();
+        assert_eq!(back, want);
+        // A non-power-of-two scale rounds once, to within half a bf16 ulp.
+        let back: Vec<f32> = scale_bf16(&w, 0.22)
+            .iter()
+            .map(|&b| bf16_to_f32(b))
+            .collect();
+        for (&b, &x) in back.iter().zip(&w) {
+            let exact = bf16_to_f32(x) * 0.22;
+            assert!(
+                (b - exact).abs() <= exact.abs() * (1.0 / 256.0),
+                "{b} vs {exact}"
+            );
         }
     }
 

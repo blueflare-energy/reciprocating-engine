@@ -30,7 +30,7 @@
 use crate::LayerWeights;
 use crate::ffi::*;
 use crate::runtime::{Out, OutKind, Runtime};
-use crate::{bf16_to_f32, f32_to_bf16};
+use crate::{bf16_to_f32, scale_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::ffi::CString;
@@ -67,14 +67,6 @@ struct RopeParams {
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
 /// to exactly zero in bf16 softmax while staying representable.
 pub(crate) const MASK_NEG: f32 = -30000.0;
-
-/// `w * scale` in bf16: one rounding of the f32 product, as the device
-/// would see it.
-fn scale_bf16(w: &[u16], scale: f32) -> Vec<u16> {
-    w.iter()
-        .map(|&b| f32_to_bf16(bf16_to_f32(b) * scale))
-        .collect()
-}
 
 /// `wq` with the attention scale folded in: a scaled bf16 copy, or the
 /// checkpoint slice itself when the model has a q norm, which would divide
@@ -1466,10 +1458,23 @@ pub(crate) fn build_head<'a>(
     let red = ReductionParams {
         reduction_dimension: 0,
     };
+    // `argmax_fwd_bf16` is wrong for a single-row input (the decode shape)
+    // whenever the row's maximum is small or negative: it returns 0 or an
+    // index past the end (Phi-3 at 200 to 300 tokens; reng-argmax-test).
+    // The f32 kernel is right in every case, so cast first.
+    let t_lf32 = gb.mid("logits_f32", &[v, t], SYN_TYPE_F32)?;
     gb.node(
-        "argmax_fwd_bf16",
-        "argmax",
+        "cast_bf16_to_f32",
+        "logits_cast",
         &[t_logits],
+        &[t_lf32],
+        core::ptr::null(),
+        0,
+    )?;
+    gb.node(
+        "argmax_fwd_f32",
+        "argmax",
+        &[t_lf32],
         &[t_ids],
         (&raw const red).cast::<c_void>(),
         core::mem::size_of::<ReductionParams>() as u32,
@@ -1505,6 +1510,7 @@ fn build_stack<'a>(
     hidden: usize,
     inter: usize,
     causal: bool,
+    window: Option<usize>,
     upto: usize,
     probe_out: Option<synTensor>,
 ) -> Result<(Gb<'a>, synTensor)> {
@@ -1520,7 +1526,11 @@ fn build_stack<'a>(
     let mask_host: Vec<f32> = (0..tokens * tokens)
         .map(|idx| {
             let (q, k) = (idx / tokens, idx % tokens);
-            if k <= q { 0.0 } else { MASK_NEG }
+            if k <= q && window.is_none_or(|w| q - k < w) {
+                0.0
+            } else {
+                MASK_NEG
+            }
         })
         .collect();
     let t_mask = if causal {
@@ -1551,6 +1561,23 @@ fn build_stack<'a>(
     Ok((gb, cur))
 }
 
+/// [`model_forward_bf16_window`] without a sliding window.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+pub fn model_forward_bf16(
+    x: &[f32],
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    vocab: usize,
+    causal: bool,
+) -> Result<Vec<f32>> {
+    model_forward_bf16_window(x, m, tokens, hidden, inter, vocab, causal, None)
+}
+
 /// Run the full forward pass on `x` (`[tokens, hidden]` embeddings, row-major)
 /// and return logits `[tokens, vocab]` as f32. With `causal`, key positions
 /// after the query are masked out in every layer. `hidden`, `inter`, and
@@ -1563,7 +1590,8 @@ fn build_stack<'a>(
 /// # Panics
 ///
 /// Panics if `layers` is empty or any buffer length disagrees with the sizes.
-pub fn model_forward_bf16(
+#[allow(clippy::too_many_arguments)]
+pub fn model_forward_bf16_window(
     x: &[f32],
     m: &ModelWeights<'_>,
     tokens: usize,
@@ -1571,13 +1599,14 @@ pub fn model_forward_bf16(
     inter: usize,
     vocab: usize,
     causal: bool,
+    window: Option<usize>,
 ) -> Result<Vec<f32>> {
     assert!(!m.layers.is_empty());
     assert_eq!(x.len(), tokens * hidden);
     assert_eq!(m.final_gamma.len(), hidden);
     assert_eq!(m.lm_head.len(), hidden * vocab);
     let last = m.layers.len() - 1;
-    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, last, None)?;
+    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, window, last, None)?;
     let out = build_head(&mut gb, cur, m, tokens, hidden, vocab, false)?;
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
@@ -1606,7 +1635,7 @@ pub fn model_probe_bf16(
     let (t, h) = (tokens as u64, hidden as u64);
     // Build the stack, then expose the last layer's output through a TPC
     // identity into a dedicated persistent tensor that is read back.
-    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, upto, None)?;
+    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, None, upto, None)?;
     let (t_probe, n_probe) = gb.output("PROBE", &[h, t], SYN_TYPE_BF16)?;
     let t_zero = gb.input("ZERO", &[h, t], &vec![0.0; hidden * tokens])?;
     gb.node(

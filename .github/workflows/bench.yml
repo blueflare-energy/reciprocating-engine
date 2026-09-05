@@ -89,9 +89,12 @@ jobs:
         # Chart 2 (decode per model and batch) and Chart 1 (prefill per model
         # and prompt length), published next to the history under
         # dev/sweep/ on gh-pages.
+        # RENG_SWEEP_DIRS (a subset of RENG_MODEL_DIRS) keeps the batch-64
+        # and long-context sweeps to the models charted on Pages; the run
+        # step above still benches every model.
         run: |
           set -euo pipefail
-          IFS=: read -ra dirs <<< "$RENG_MODEL_DIRS"
+          IFS=: read -ra dirs <<< "${RENG_SWEEP_DIRS:-$RENG_MODEL_DIRS}"
           python3 tools/sweep.py ./target/release/reng-bench sweep --batches 1,8,64 --new 32 "${dirs[@]}"
           python3 tools/sweep.py ./target/release/reng-bench prefill --mode prefill --contexts 128,512,1024,2048 "${dirs[@]}"
           git fetch --depth=1 origin gh-pages

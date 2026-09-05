@@ -74,6 +74,8 @@ pub struct BatchedModel<'a> {
     /// Per layer: the K buffer and the V buffer (5-D, all slots) of the
     /// current bucket.
     slots: Vec<(u64, u64)>,
+    /// Sliding window (see [`BatchedModel::set_window`]).
+    window: Option<usize>,
 }
 
 /// The bucket for `need` positions: the smallest of `min_cap`, doubling,
@@ -155,6 +157,7 @@ impl<'a> BatchedModel<'a> {
             sin: sin.to_vec(),
             cos: cos.to_vec(),
             slots,
+            window: None,
         })
     }
 
@@ -319,6 +322,12 @@ impl<'a> BatchedModel<'a> {
         (self.head_dim * (cap + 1) * self.n_kv * 2) as u64
     }
 
+    /// Restrict attention to a sliding window of `window` positions (Phi-3,
+    /// Mistral); `None` is full causal attention.
+    pub fn set_window(&mut self, window: Option<usize>) {
+        self.window = window;
+    }
+
     /// Start sequence `b` afresh. Its cache slot needs no clearing (the mask
     /// never admits positions at or beyond its position), so this is free.
     pub fn reset(&mut self, b: usize) {
@@ -459,7 +468,9 @@ impl<'a> BatchedModel<'a> {
             let keys = c + 1;
             let mut mb = vec![neg; p * keys];
             for q in 0..p {
-                mb[q * keys..q * keys + (pos + q + 1).min(c)].fill(0);
+                let end = (pos + q + 1).min(c);
+                let start = self.window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
+                mb[q * keys + start..q * keys + end].fill(0);
             }
             let mut ib: Vec<u8> = Vec::with_capacity(12 * p * self.n_kv);
             for g in 0..self.n_kv {
@@ -530,7 +541,8 @@ impl<'a> BatchedModel<'a> {
             let pos = self.pos[b];
             sb[b * hd..(b + 1) * hd].copy_from_slice(&self.sin[pos * hd..(pos + 1) * hd]);
             cb[b * hd..(b + 1) * hd].copy_from_slice(&self.cos[pos * hd..(pos + 1) * hd]);
-            mb[b * keys..b * keys + pos + 1].fill(0);
+            let start = self.window.map_or(0, |w| (pos + 1).saturating_sub(w));
+            mb[b * keys + start..b * keys + pos + 1].fill(0);
             for g in 0..self.n_kv {
                 for v in [b as i32, g as i32, 0i32, pos as i32] {
                     ib.extend_from_slice(&v.to_le_bytes());

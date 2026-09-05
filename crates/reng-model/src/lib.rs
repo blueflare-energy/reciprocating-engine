@@ -8,10 +8,14 @@
 //! transposed once at load time. The embedding table stays `[vocab, hidden]`
 //! for the host-side gather; a tied LM head is its transpose, `[hidden, vocab]`.
 //! Qwen2-style attention biases and Qwen3-style per-head q/k norm gains are
-//! loaded when present (Llama has neither).
+//! loaded when present (Llama has neither). Granite's four scalar
+//! multipliers need no graph change: the embedding multiplier is applied
+//! by the host gather, the attention multiplier is the per-layer attention
+//! scale, and the residual multiplier and `1/logits_scaling` are folded
+//! into `o_proj`/`down_proj` and the LM head at load.
 
 use reng_core::{Error, Result};
-use reng_synapse::{bf16_to_f32, f32_to_bf16};
+use reng_synapse::{bf16_to_f32, f32_to_bf16, scale_bf16};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use std::path::Path;
@@ -48,6 +52,36 @@ pub struct LlamaConfig {
     /// a NoPE layer; absent means every layer uses RoPE.
     #[serde(default)]
     pub no_rope_layers: Option<Vec<u8>>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+    /// Sliding window in positions (Phi-3, Mistral; Qwen2 only with
+    /// `use_sliding_window`).
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub use_sliding_window: Option<bool>,
+    /// Granite: the embedding rows are multiplied by this before the first
+    /// layer (`GraniteModel.forward`); absent means unscaled.
+    #[serde(default)]
+    pub embedding_multiplier: Option<f32>,
+    /// Granite: the attention scale, in place of `1/sqrt(head_dim)`
+    /// (`GraniteAttention.scaling`).
+    #[serde(default)]
+    pub attention_multiplier: Option<f32>,
+    /// Granite: every residual branch (attention and MLP) is multiplied by
+    /// this before the add (`GraniteDecoderLayer.forward`); folded into
+    /// `o_proj` and `down_proj` by [`load_weights`].
+    #[serde(default)]
+    pub residual_multiplier: Option<f32>,
+    /// Granite: the logits are divided by this
+    /// (`GraniteForCausalLM.forward`); folded into the LM head by
+    /// [`load_weights`], which leaves tied embeddings unscaled.
+    #[serde(default)]
+    pub logits_scaling: Option<f32>,
+    /// Whether the MLP projections carry biases; the engine has none, so
+    /// [`load_weights`] refuses such a checkpoint.
+    #[serde(default)]
+    pub mlp_bias: bool,
 }
 
 /// The `rope_scaling` object of a HF config. Llama 3.1 style scaling
@@ -68,6 +102,22 @@ pub struct RopeScaling {
 }
 
 impl LlamaConfig {
+    /// The sliding window attention uses, if the architecture applies one
+    /// (a query sees the last `window` positions, its own included).
+    /// Diagnostic `RENG_NO_WINDOW` disables it.
+    #[must_use]
+    pub fn window(&self) -> Option<usize> {
+        if std::env::var("RENG_NO_WINDOW").is_ok() {
+            return None;
+        }
+        let w = self.sliding_window.filter(|&w| w > 0);
+        match self.model_type.as_deref() {
+            Some("phi3" | "mistral") => w,
+            Some("qwen2" | "qwen3") if self.use_sliding_window == Some(true) => w,
+            _ => None,
+        }
+    }
+
     /// Read `config.json` from a model directory.
     ///
     /// # Errors
@@ -106,13 +156,22 @@ impl LlamaConfig {
     pub fn q_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim()
     }
+
+    /// The softmax scale on `q . k`: `attention_multiplier` when the config
+    /// has one (Granite), else `1/sqrt(head_dim)`.
+    #[must_use]
+    pub fn attention_scale(&self) -> f32 {
+        self.attention_multiplier
+            .unwrap_or_else(|| 1.0 / (self.head_dim() as f32).sqrt())
+    }
 }
 
 /// One layer's weights in engine layout (`[in, out]` projections), owned.
 pub struct LayerTensors {
     pub g1: Vec<f32>,
     pub g2: Vec<f32>,
-    /// Projections as stored, bf16 `[out, in]`.
+    /// Projections as stored, bf16 `[out, in]`; `wo` (and `wd`) carry the
+    /// config's `residual_multiplier` when it has one.
     pub wq: Vec<u16>,
     pub wk: Vec<u16>,
     pub wv: Vec<u16>,
@@ -134,12 +193,13 @@ pub struct LayerTensors {
 /// checkpoint's `[out, in]` layout (the device format, uploaded as is),
 /// the norm gains and biases f32.
 pub struct LlamaWeights {
-    /// `[vocab, hidden]`, bf16, row per token id.
+    /// `[vocab, hidden]`, bf16, row per token id (never scaled).
     pub embed: Vec<u16>,
     pub layers: Vec<LayerTensors>,
     pub final_gamma: Vec<f32>,
-    /// `[vocab, hidden]`, bf16 (the tied embeddings themselves when the
-    /// checkpoint has no head).
+    /// `[vocab, hidden]`, bf16 (a copy of the tied embeddings when the
+    /// checkpoint has no head), divided by the config's `logits_scaling`
+    /// when it has one.
     pub lm_head: Vec<u16>,
 }
 
@@ -319,13 +379,20 @@ impl Shards {
 }
 
 /// Load the checkpoint (`model.safetensors`, or its shards) from a model
-/// directory into engine layout.
+/// directory into engine layout. Granite's `residual_multiplier` is folded
+/// into `o_proj` and `down_proj` and `1/logits_scaling` into the LM head
+/// (scaled bf16 copies: one extra rounding per element, none for
+/// power-of-two scales).
 ///
 /// # Errors
 ///
 /// Returns an error if the files are missing, a tensor is absent or has an
-/// unexpected shape or dtype, or the LM head is untied and absent.
+/// unexpected shape or dtype, the LM head is untied and absent, or the
+/// config asks for MLP biases.
 pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
+    if cfg.mlp_bias {
+        return Err(Error::Other("mlp_bias is not supported".into()));
+    }
     let shards = Shards::open(dir)?;
     let parsed = shards.parse()?;
     let st = |name: &str| shards.shard(&parsed, name);
@@ -399,13 +466,21 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             let n = p(name);
             optional_vec(st(&n), &n, len)
         };
+        // Granite: `x + branch * residual_multiplier` for both branches;
+        // the scalar rides on the branches' output projections.
+        let residual = |w: Vec<u16>| -> Vec<u16> {
+            match cfg.residual_multiplier {
+                Some(r) => scale_bf16(&w, r),
+                None => w,
+            }
+        };
         layers.push(LayerTensors {
             g1: g("input_layernorm.weight")?,
             g2: g("post_attention_layernorm.weight")?,
             wq,
             wk,
             wv,
-            wo: lin("self_attn.o_proj.weight", h, qd)?,
+            wo: residual(lin("self_attn.o_proj.weight", h, qd)?),
             bq: opt("self_attn.q_proj.bias", qd)?,
             bk: opt("self_attn.k_proj.bias", kvd)?,
             bv: opt("self_attn.v_proj.bias", kvd)?,
@@ -413,7 +488,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             kn: opt("self_attn.k_norm.weight", hd)?,
             wg,
             wu,
-            wd: lin("mlp.down_proj.weight", h, i)?,
+            wd: residual(lin("mlp.down_proj.weight", h, i)?),
         });
     }
     let final_gamma = tensor_f32(st("model.norm.weight"), "model.norm.weight")?.0;
@@ -427,6 +502,12 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
         return Err(Error::Other(
             "lm_head.weight missing and embeddings are not tied".into(),
         ));
+    };
+    // Granite: `logits / logits_scaling`, folded into the head's own copy
+    // so the embedding table stays as stored.
+    let lm_head = match cfg.logits_scaling {
+        Some(s) => scale_bf16(&lm_head, 1.0 / s),
+        None => lm_head,
     };
     Ok(LlamaWeights {
         embed,
@@ -497,7 +578,8 @@ pub fn rope_caches_scaled(
     (sin, cos)
 }
 
-/// Host-side embedding gather: `[tokens, hidden]` for the given ids.
+/// Host-side embedding gather: `[tokens, hidden]` for the given ids, times
+/// the config's `embedding_multiplier` when it has one (Granite).
 ///
 /// # Panics
 ///
@@ -514,6 +596,11 @@ pub fn embed_tokens(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Vec<f32
                 .iter()
                 .map(|&b| bf16_to_f32(b)),
         );
+    }
+    if let Some(m) = cfg.embedding_multiplier {
+        for v in &mut x {
+            *v *= m;
+        }
     }
     x
 }
@@ -577,7 +664,7 @@ fn layer_views<'a>(
             wd: &l.wd,
             sin,
             cos,
-            scale: 1.0 / (hd as f32).sqrt(),
+            scale: cfg.attention_scale(),
             use_rope: cfg
                 .no_rope_layers
                 .as_ref()
@@ -614,7 +701,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     );
     let x = embed_tokens(w, cfg, &padded);
     let m = layer_views(w, cfg, &sin, &cos);
-    let mut logits = reng_synapse::model_forward_bf16(
+    let mut logits = reng_synapse::model_forward_bf16_window(
         &x,
         &m,
         tokens,
@@ -622,6 +709,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
         cfg.intermediate_size,
         cfg.vocab_size,
         true,
+        cfg.window(),
     )?;
     logits.truncate(real * cfg.vocab_size);
     Ok(logits)
@@ -671,6 +759,8 @@ impl<'a> Generator<'a> {
             &sin,
             &cos,
         )?;
+        let mut model = model;
+        model.set_window(cfg.window());
         Ok(Self { model, w, cfg })
     }
 
@@ -716,6 +806,10 @@ impl<'a> Generator<'a> {
     /// Panics if `ids` is empty or would overflow the cache.
     pub fn feed_id(&mut self, ids: &[u32]) -> Result<u32> {
         assert!(!ids.is_empty());
+        if std::env::var_os("RENG_HOST_ARGMAX").is_some_and(|v| v != "0") {
+            let logits = self.feed(ids)?;
+            return Ok(argmax_rows(&logits, self.cfg.vocab_size)[0] as u32);
+        }
         let mut last = 0;
         for block in ids.chunks(self.model.rows()) {
             let x = embed_tokens(self.w, self.cfg, block);
@@ -769,6 +863,8 @@ impl<'a> BatchedGenerator<'a> {
             &sin,
             &cos,
         )?;
+        let mut model = model;
+        model.set_window(cfg.window());
         Ok(Self { model, w, cfg })
     }
 
@@ -857,6 +953,30 @@ mod tests {
         let ang_a = sin_a[128 + 63].asin();
         let ang_b = sin_b[128 + 63].asin();
         assert!((ang_a / ang_b - 8.0).abs() < 1e-3, "{ang_a} {ang_b}");
+    }
+
+    #[test]
+    fn granite_multipliers_parse_and_default() {
+        let base = r#"{"hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 1,
+            "num_attention_heads": 4, "rms_norm_eps": 1e-5, "vocab_size": 16"#;
+        let llama: LlamaConfig = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert_eq!(llama.embedding_multiplier, None);
+        assert_eq!(llama.attention_multiplier, None);
+        assert_eq!(llama.residual_multiplier, None);
+        assert_eq!(llama.logits_scaling, None);
+        assert!(!llama.mlp_bias);
+        assert_eq!(llama.attention_scale(), 0.25);
+        let granite: LlamaConfig = serde_json::from_str(&format!(
+            r#"{base}, "embedding_multiplier": 12.0, "attention_multiplier": 0.015625,
+            "residual_multiplier": 0.22, "logits_scaling": 8.0, "mlp_bias": false,
+            "attention_bias": false, "rope_scaling": null}}"#
+        ))
+        .unwrap();
+        assert_eq!(granite.embedding_multiplier, Some(12.0));
+        assert_eq!(granite.attention_scale(), 0.015625);
+        assert_eq!(granite.residual_multiplier, Some(0.22));
+        assert_eq!(granite.logits_scaling, Some(8.0));
+        assert!(granite.rope_scaling.is_none());
     }
 
     #[test]

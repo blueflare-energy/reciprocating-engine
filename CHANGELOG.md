@@ -33,12 +33,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DeepSeek-R1-Distill-Llama-8B and Phi-3-mini-4k-instruct (its fused
   qkv_proj and gate_up_proj weights are split into row blocks by the
   loader).
+- Sliding-window attention (Phi-3, Mistral, Qwen2 with
+  `use_sliding_window`): the host-built masks admit only the last
+  `sliding_window` positions. Phi-3-mini at a 2100-token prompt agrees
+  with the reference (last-logits cosine 0.9999) where full attention
+  did not (0.41).
 - SmolLM3: NoPE layers (`no_rope_layers` in the config; those layers skip
   the rotary nodes); SmolLM3-3B verified.
 - Qwen3: per-head q/k RMSNorm (`q_norm`/`k_norm` gains, applied after the
   projection and before RoPE; the attention scale folds into the q gain)
   and an explicit `head_dim` whose `num_attention_heads * head_dim` may
   differ from `hidden_size`; verified Qwen3-0.6B and Qwen3-1.7B.
+- Granite 3.x dense (`model_type: granite`): the four config scalars
+  need no new graph node. `embedding_multiplier` scales the host
+  embedding gather, `attention_multiplier` replaces `1/sqrt(head_dim)`
+  as the attention scale (folded into `wq` as before),
+  `residual_multiplier` is folded into `o_proj` and `down_proj` and
+  `1/logits_scaling` into the LM head at load (scaled bf16 copies; the
+  tied embedding stays as stored). `scale_bf16` is now public in
+  `reng-synapse`. The loader refuses `mlp_bias: true`. Verified
+  granite-3.1-2b-instruct: 8/8 exact over a 345-token prompt, 7/8 plus
+  one reference near-tie over a 5-token prompt.
+- Verified on the roster: Llama-3.2-1B, Llama-3.2-3B, Llama-3.1-8B
+  (llama3 rope scaling), Qwen3-4B, Qwen3-8B, phi-4 (14.7B: 72 tok/s at
+  batch 1, 84% of the HBM ceiling).
+- `reng-argmax-test`: probes the argmax kernels with the row maximum
+  planted at chosen positions and values, single and multi row.
+- `RENG_HOST_ARGMAX=1` makes `reng-generate` read the logits and take
+  the argmax on the host; `RENG_ARGMAX_CHECK=1` reads both the device id
+  and the logits after every cached step and reports a disagreement.
 - `RENG_MODULE_ID` picks the card by its SynapseAI module id
   (`synDeviceAcquireByModuleId`); without it the runtime takes any free
   card. `HABANA_VISIBLE_DEVICES` never steered the acquire, so the bench
@@ -94,3 +117,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Gaudi2 MIN/MAX macros so the 1.19.0 driver builds on kernel 6.8+.
 - CI pipeline (build, format, clippy, tests, coverage) and self-hosted status
   badges.
+
+### Fixed
+
+- The device argmax of the LM head casts the logits to f32 first:
+  `argmax_fwd_bf16` is wrong for a single-row input (the decode shape)
+  whenever the row's maximum is small or negative, returning 0 or an
+  index past the vocabulary (Phi-3-mini returned 32384 of 32064 at
+  200-token prompts, whose maximum logits are negative); `argmax_fwd_f32`
+  is right in every probed case. Phi-3-mini now matches its reference
+  over a 300-token prompt.
+

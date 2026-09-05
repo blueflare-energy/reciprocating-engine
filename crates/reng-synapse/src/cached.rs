@@ -58,11 +58,17 @@ pub struct CachedModel<'a> {
     sin: Vec<f32>,
     cos: Vec<f32>,
     n_layers: usize,
+    /// Sliding window: a query attends only to the last `window` positions
+    /// (its own included) when set.
+    window: Option<usize>,
     /// Which of the two cache buffers per layer holds the cache: the wide
     /// recipe reads one and writes the other (its ScatterND is not in
     /// place), so its launches alternate them; the decode recipe (in place)
     /// is bound to the current one before each launch.
     flipped: bool,
+    /// `RENG_ARGMAX_CHECK`: after every id read, also read the logits row
+    /// and report when the device argmax disagrees with a host argmax.
+    check_argmax: bool,
 }
 
 impl<'a> CachedModel<'a> {
@@ -129,6 +135,8 @@ impl<'a> CachedModel<'a> {
             cos: cos.to_vec(),
             n_layers: m.layers.len(),
             flipped: false,
+            check_argmax: std::env::var_os("RENG_ARGMAX_CHECK").is_some(),
+            window: None,
         })
     }
 
@@ -209,6 +217,12 @@ impl<'a> CachedModel<'a> {
         self.capacity
     }
 
+    /// Restrict attention to a sliding window of `window` positions (Phi-3,
+    /// Mistral); `None` is full causal attention.
+    pub fn set_window(&mut self, window: Option<usize>) {
+        self.window = window;
+    }
+
     /// Forget the cached prefix. The cache contents need no clearing (the
     /// mask never admits positions at or beyond the current one), so this
     /// is free.
@@ -271,6 +285,7 @@ impl<'a> CachedModel<'a> {
         let pos = self.pos;
         // Small blocks go through the decode recipe when there is one.
         let flipped = self.flipped;
+        let check_argmax = self.check_argmax;
         let n_layers = self.n_layers;
         let wide = !matches!(&self.dec, Some((_, _, dr)) if n <= *dr);
         // Cache buffer addresses per layer (the wide runtime owns both).
@@ -328,7 +343,9 @@ impl<'a> CachedModel<'a> {
         let neg = f32_to_bf16(MASK_NEG);
         let mut mb = vec![neg; p * keys];
         for q in 0..p {
-            mb[q * keys..q * keys + (pos + q + 1).min(c)].fill(0);
+            let end = (pos + q + 1).min(c);
+            let start = self.window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
+            mb[q * keys + start..q * keys + end].fill(0);
         }
         // Scatter indices, ONNX triples (g, 0, position) for update r + p * g
         // (row r of KV head g): real rows go to pos + r (< capacity by the
@@ -357,6 +374,17 @@ impl<'a> CachedModel<'a> {
         // The recipe's read-back tensor is the argmax ids; the logits stay
         // on the device and are read only when asked for.
         let ids = rt.launch_and_read_i32(n - 1, 1)?;
+        if check_argmax && matches!(read, Read::LastId) {
+            let row = rt.read_bf16_range("LOGITS", n - 1, 1)?;
+            let host = (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b });
+            let dev = ids[0];
+            let at = |i: i32| row.get(usize::try_from(i).unwrap_or(usize::MAX)).copied();
+            eprintln!(
+                "argmax check: pos {pos} n {n} wide {wide} device {dev} (logit {:?}) host {host} (logit {})",
+                at(dev),
+                row[host]
+            );
+        }
         let logits = match read {
             Read::LastId => vec![ids[0] as f32],
             Read::LastLogits => rt.read_bf16_range("LOGITS", n - 1, 1)?,
