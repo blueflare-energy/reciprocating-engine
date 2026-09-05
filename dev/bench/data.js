@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788603284049,
+  "lastUpdate": 1788603467323,
   "repoUrl": "https://github.com/blueflare-energy/reciprocating-engine",
   "entries": {
     "Gaudi2 inference": [
@@ -182,6 +182,52 @@ window.BENCHMARK_DATA = {
           {
             "name": "SmolLM2-135M decode % of ceiling (b1)",
             "value": 6.75003727362712,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "noah@it.bluefla.re",
+            "name": "Noah"
+          },
+          "committer": {
+            "email": "noah@it.bluefla.re",
+            "name": "bfe-noah"
+          },
+          "distinct": true,
+          "id": "6192e24db1147bd365f9562c3382fe5137fc79d3",
+          "message": "reng-model: one-row decode blocks by default\n\nWith attention batched over heads the narrowest decode recipe is the fastest:\nSmolLM2-135M 734 tok/s at 1.30 ms per step with 1-row blocks, against 613\nat 16 rows and 510 at 64.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VUoyvmdyW73XuUwedpKuqZ",
+          "timestamp": "2026-09-05T04:17:09-06:00",
+          "tree_id": "62907b3372e65b46318a33282e8da6e4c7e4e264",
+          "url": "https://github.com/blueflare-energy/reciprocating-engine/commit/6192e24db1147bd365f9562c3382fe5137fc79d3"
+        },
+        "date": 1788603464367,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 9423.349189345343,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 0.8170574531728997,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b1)",
+            "value": 683.2120411339765,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 1.40 ms; ceiling 8986 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b1)",
+            "value": 7.603066471410127,
             "unit": "%",
             "extra": "HbmBandwidth bound"
           }
