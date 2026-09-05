@@ -3,8 +3,9 @@ name: bench
 # Throughput on real Gaudi2 hardware, recorded on every merge to main. Runs on
 # a self-hosted runner labelled `gaudi2`; the runner's environment provides
 # RENG_MODEL_DIRS (Hugging Face model directories, colon separated) and
-# RENG_MODULE_ID (the module id of the card to use, from `hl-smi`), so
-# nothing machine-specific lives in this file. Fork pull requests never reach this job: it only runs on pushes
+# RENG_MODULE_ID (the module id of the card to use, from `hl-smi`) and
+# optionally RENG_ORACLE_DIR (HF reference generations), so nothing
+# machine-specific lives in this file. Fork pull requests never reach this job: it only runs on pushes
 # to main and manual dispatch.
 
 on:
@@ -29,13 +30,34 @@ jobs:
   bench:
     name: gaudi2 throughput
     runs-on: [self-hosted, gaudi2]
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - name: build
-        run: cargo build --release --locked -p reng-model --features link-synapse --bin reng-bench
+        run: |
+          cargo build --release --locked -p reng-model --features link-synapse --bin reng-bench --bin reng-generate
+          cargo build --release --locked -p reng-synapse --features link-synapse --bin reng-cache-test --bin reng-batch-test
+      # Correctness on the card before any number is recorded: the
+      # synthetic cache and batch tests against their CPU references, and
+      # teacher-forced generation against the HF references the runner
+      # keeps in RENG_ORACLE_DIR (gen8_<model>.json next to the model's
+      # prompt ids in prompts.txt; skipped when the directory is unset).
+      - name: check
+        run: |
+          set -euo pipefail
+          ./target/release/reng-cache-test
+          ./target/release/reng-cache-test 64 256 512 4 512 2 2 512 3 16 1
+          ./target/release/reng-batch-test 256 576 1536 9 512 4 3 512 6 3
+          RENG_MIN_CAP=64 ./target/release/reng-batch-test 256 256 512 4 512 2 2 512 6 3
+          if [ -n "${RENG_ORACLE_DIR:-}" ] && [ -f "$RENG_ORACLE_DIR/prompts.txt" ]; then
+            while read -r model ref ids; do
+              [ -z "$model" ] && continue
+              echo "== $model"
+              ./target/release/reng-generate "$model" check.json 8 --ref "$RENG_ORACLE_DIR/$ref" $ids
+            done < "$RENG_ORACLE_DIR/prompts.txt"
+          fi
       - name: run
         run: |
           set -euo pipefail

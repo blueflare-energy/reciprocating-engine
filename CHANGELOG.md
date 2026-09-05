@@ -46,6 +46,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the natural weights (shared with the batched decode recipe) plus a
   transpose into the head layout instead of per-head batch_gemms, which
   the MME runs at N = head_dim.
+- The `bench` workflow runs the cache and batch tests and teacher-forced
+  generation against the runner's HF references before recording numbers.
 - `reng-attn-bench` and `reng-scatter-bench` time attention gemm
   orientations and cache-write kernels standalone.
 - Capacity buckets for batched decode: the recipes are compiled for the
