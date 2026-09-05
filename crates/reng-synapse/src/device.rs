@@ -248,6 +248,181 @@ impl Device {
         Ok(out)
     }
 
+    /// `C[m,n] = op(A) @ op(B)` on the MME using the `gemm` transpose flags.
+    /// `a` is stored row-major `[m,k]` when `!transpose_a`, else `[k,m]`; `b`
+    /// is stored `[k,n]` when `!transpose_b`, else `[n,k]`. Pins the flag
+    /// semantics so a fused graph can form `Q @ K^T` without a host transpose.
+    /// Returns row-major `[m,n]` f32.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a.len() != m*k` or `b.len() != k*n`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ex(
+        &self,
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Result<Vec<f32>> {
+        assert_eq!(a.len(), m * k);
+        assert_eq!(b.len(), k * n);
+        let (mm, kk, nn) = (m as u64, k as u64, n as u64);
+        // Device sizes are FCD-first, so a row-major [r,c] store is [c,r].
+        let a_sizes: [u64; 2] = if transpose_a { [mm, kk] } else { [kk, mm] };
+        let b_sizes: [u64; 2] = if transpose_b { [kk, nn] } else { [nn, kk] };
+        let mut graph: synGraphHandle = core::ptr::null_mut();
+        syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
+
+        let (n_a, n_b, n_c) = (
+            CString::new("A").unwrap(),
+            CString::new("B").unwrap(),
+            CString::new("C").unwrap(),
+        );
+        let t_a = self.tensor(graph, &n_a, a_sizes[0], a_sizes[1])?;
+        let t_b = self.tensor(graph, &n_b, b_sizes[0], b_sizes[1])?;
+        let t_c = self.tensor(graph, &n_c, nn, mm)?;
+
+        let params = synGEMMParams {
+            transpose_a,
+            transpose_b,
+        };
+        let guid = CString::new("gemm").unwrap();
+        let inputs = [t_a, t_b];
+        let outputs = [t_c];
+        syn!(synNodeCreate(
+            graph,
+            inputs.as_ptr(),
+            outputs.as_ptr(),
+            2,
+            1,
+            (&raw const params).cast::<c_void>(),
+            core::mem::size_of::<synGEMMParams>() as u32,
+            guid.as_ptr(),
+            CString::new("mmx").unwrap().as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+
+        let mut recipe: synRecipeHandle = core::ptr::null_mut();
+        syn!(synGraphCompile(
+            &mut recipe,
+            graph,
+            CString::new("gemmx").unwrap().as_ptr(),
+            core::ptr::null()
+        ));
+
+        let names = [n_a.as_ptr(), n_b.as_ptr(), n_c.as_ptr()];
+        let mut ids: [u64; 3] = [0; 3];
+        syn!(synTensorRetrieveIds(
+            recipe,
+            names.as_ptr(),
+            ids.as_mut_ptr(),
+            3
+        ));
+
+        let a_bytes = (m * k * 2) as u64;
+        let b_bytes = (k * n * 2) as u64;
+        let c_bytes = (m * n * 2) as u64;
+        let (mut da, mut db, mut dc) = (0u64, 0u64, 0u64);
+        syn!(synDeviceMalloc(self.id, a_bytes, 0, 0, &mut da));
+        syn!(synDeviceMalloc(self.id, b_bytes, 0, 0, &mut db));
+        syn!(synDeviceMalloc(self.id, c_bytes, 0, 0, &mut dc));
+        let mut ws = 0u64;
+        syn!(synWorkspaceGetSize(&mut ws, recipe));
+        let mut dws = 0u64;
+        if ws > 0 {
+            syn!(synDeviceMalloc(self.id, ws, 0, 0, &mut dws));
+        }
+
+        let (mut ha, mut hb, mut hc): (*mut c_void, *mut c_void, *mut c_void) = (
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        syn!(synHostMalloc(self.id, a_bytes, 0, &mut ha));
+        syn!(synHostMalloc(self.id, b_bytes, 0, &mut hb));
+        syn!(synHostMalloc(self.id, c_bytes, 0, &mut hc));
+
+        // SAFETY: ha holds m*k and hb holds k*n bf16 elements.
+        unsafe {
+            let pa = ha.cast::<u16>();
+            for (i, &x) in a.iter().enumerate() {
+                *pa.add(i) = f32_to_bf16(x);
+            }
+            let pb = hb.cast::<u16>();
+            for (i, &x) in b.iter().enumerate() {
+                *pb.add(i) = f32_to_bf16(x);
+            }
+        }
+
+        let mut stream: synStreamHandle = core::ptr::null_mut();
+        syn!(synStreamCreateGeneric(&mut stream, self.id, 0));
+        syn!(synMemCopyAsync(
+            stream,
+            ha as u64,
+            a_bytes,
+            da,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synMemCopyAsync(
+            stream,
+            hb as u64,
+            b_bytes,
+            db,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let infos = [
+            launch_info(&n_a, da, ids[0], a_sizes[0], a_sizes[1]),
+            launch_info(&n_b, db, ids[1], b_sizes[0], b_sizes[1]),
+            launch_info(&n_c, dc, ids[2], nn, mm),
+        ];
+        syn!(synLaunch(stream, infos.as_ptr(), 3, dws, recipe, 0));
+        syn!(synStreamSynchronize(stream));
+        syn!(synMemCopyAsync(
+            stream,
+            dc,
+            c_bytes,
+            hc as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let mut out = vec![0.0f32; m * n];
+        // SAFETY: hc holds m*n bf16 elements just copied back.
+        unsafe {
+            let pc = hc.cast::<u16>();
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = bf16_to_f32(*pc.add(i));
+            }
+        }
+
+        unsafe {
+            for h in [ha, hb, hc] {
+                synHostFree(self.id, h, 0);
+            }
+            for d in [da, db, dc] {
+                synDeviceFree(self.id, d, 0);
+            }
+            if dws != 0 {
+                synDeviceFree(self.id, dws, 0);
+            }
+            synStreamDestroy(stream);
+            synRecipeDestroy(recipe);
+            synGraphDestroy(graph);
+        }
+        Ok(out)
+    }
+
     /// Row-wise softmax of a `rows x cols` bf16 matrix (softmax over `cols`),
     /// via `softmax_fwd_bf16`. Returns f32.
     ///
