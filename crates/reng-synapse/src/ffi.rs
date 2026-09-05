@@ -19,6 +19,7 @@ pub type synTensor = *mut c_void;
 pub const SYN_SUCCESS: synStatus = 0;
 pub const SYN_DEVICE_GAUDI2: c_int = 4;
 pub const SYN_TYPE_BF16: c_int = 1 << 1;
+pub const SYN_TYPE_F32: c_int = 1 << 2; // syn_type_single
 pub const SYN_TENSOR_DATA: c_int = 0; // DATA_TENSOR
 pub const SYN_GEOMETRY_SIZES: c_int = 1; // synGeometryMaxSizes
 pub const SYN_HOST_TO_DRAM: c_int = 0;

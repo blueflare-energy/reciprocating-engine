@@ -68,7 +68,7 @@ pub use mm::{gemm_bf16, gemm_cpu};
 mod ops;
 
 #[cfg(feature = "link-synapse")]
-pub use ops::{softmax_bf16, softmax_cpu};
+pub use ops::{rms_norm_bf16, rms_norm_cpu, softmax_bf16, softmax_cpu};
 
 #[cfg(feature = "link-synapse")]
 mod attn;

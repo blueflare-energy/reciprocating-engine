@@ -51,6 +51,17 @@ impl Device {
         fcd: u64,
         outer: u64,
     ) -> Result<synTensor> {
+        self.tensor_nd(graph, name, &[fcd, outer], SYN_TYPE_BF16)
+    }
+
+    /// Create a persistent tensor with FCD-first `sizes` and the given dtype.
+    fn tensor_nd(
+        &self,
+        graph: synGraphHandle,
+        name: &CString,
+        sizes: &[u64],
+        dtype: core::ffi::c_int,
+    ) -> Result<synTensor> {
         let mut t: synTensor = core::ptr::null_mut();
         syn!(synTensorHandleCreate(
             &mut t,
@@ -64,12 +75,11 @@ impl Device {
         syn!(synTensorAssignToSection(t, sec, 0));
         let mut geo = synTensorGeometry {
             sizes: [0; HABANA_DIM_MAX],
-            dims: 2,
+            dims: sizes.len() as u32,
         };
-        geo.sizes[0] = fcd;
-        geo.sizes[1] = outer;
+        geo.sizes[..sizes.len()].copy_from_slice(sizes);
         syn!(synTensorSetGeometry(t, &geo, SYN_GEOMETRY_SIZES));
-        syn!(synTensorSetDeviceDataType(t, SYN_TYPE_BF16));
+        syn!(synTensorSetDeviceDataType(t, dtype));
         Ok(t)
     }
 
@@ -353,6 +363,193 @@ impl Device {
             synHostFree(self.id, host_out, 0);
             synDeviceFree(self.id, dev_in, 0);
             synDeviceFree(self.id, dev_out, 0);
+            if dws != 0 {
+                synDeviceFree(self.id, dws, 0);
+            }
+            synStreamDestroy(stream);
+            synRecipeDestroy(recipe);
+            synGraphDestroy(graph);
+        }
+        Ok(out)
+    }
+
+    /// RMSNorm over the feature axis: for each token,
+    /// `y = x / sqrt(mean_features(x^2) + eps) * gamma`. `x` has `features` as
+    /// the FCD (contiguous) dimension and `tokens` as the outer dimension, i.e.
+    /// row-major `[tokens, features]` (`x[t*features + f]`); `gamma` is length
+    /// `features`. Returns the same layout as f32. Uses the vendor
+    /// `rms_norm_fwd_bf16` kernel. `features` should be at least 128 (see the
+    /// [`Device`] docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x.len() != features*tokens` or `gamma.len() != features`.
+    pub fn rms_norm(
+        &self,
+        x: &[f32],
+        gamma: &[f32],
+        features: usize,
+        tokens: usize,
+        eps: f32,
+    ) -> Result<Vec<f32>> {
+        assert_eq!(x.len(), features * tokens);
+        assert_eq!(gamma.len(), features);
+        let (f, t) = (features as u64, tokens as u64);
+        let mut graph: synGraphHandle = core::ptr::null_mut();
+        syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
+
+        let (n_x, n_g, n_y, n_inv) = (
+            CString::new("X").unwrap(),
+            CString::new("G").unwrap(),
+            CString::new("Y").unwrap(),
+            CString::new("INVRMS").unwrap(),
+        );
+        // x, y: [features, tokens]. gamma: [features, 1]. inv_rms: [1, tokens].
+        let t_x = self.tensor_nd(graph, &n_x, &[f, t], SYN_TYPE_BF16)?;
+        // gamma is 1D [features].
+        let t_g = self.tensor_nd(graph, &n_g, &[f], SYN_TYPE_BF16)?;
+        let t_y = self.tensor_nd(graph, &n_y, &[f, t], SYN_TYPE_BF16)?;
+        // The kernel requires the inverse-RMS output in f32, shape [1, tokens].
+        let t_inv = self.tensor_nd(graph, &n_inv, &[1, t], SYN_TYPE_F32)?;
+
+        #[repr(C)]
+        struct RmsNormParams {
+            epsilon: f32,
+            fused_gamma_beta: bool,
+            use_stages: bool,
+            bwd_mode: i32,
+        }
+        let params = RmsNormParams {
+            epsilon: eps,
+            fused_gamma_beta: false,
+            use_stages: false,
+            bwd_mode: 0,
+        };
+        let inputs = [t_x, t_g];
+        let outputs = [t_y, t_inv];
+        let guid = CString::new("rms_norm_fwd_bf16").unwrap();
+        syn!(synNodeCreate(
+            graph,
+            inputs.as_ptr(),
+            outputs.as_ptr(),
+            2,
+            2,
+            (&raw const params).cast::<c_void>(),
+            core::mem::size_of::<RmsNormParams>() as u32,
+            guid.as_ptr(),
+            CString::new("rmsn").unwrap().as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+
+        let mut recipe: synRecipeHandle = core::ptr::null_mut();
+        syn!(synGraphCompile(
+            &mut recipe,
+            graph,
+            CString::new("rmsn").unwrap().as_ptr(),
+            core::ptr::null()
+        ));
+
+        let names = [n_x.as_ptr(), n_g.as_ptr(), n_y.as_ptr(), n_inv.as_ptr()];
+        let mut ids: [u64; 4] = [0; 4];
+        syn!(synTensorRetrieveIds(
+            recipe,
+            names.as_ptr(),
+            ids.as_mut_ptr(),
+            4
+        ));
+
+        let x_bytes = (features * tokens * 2) as u64;
+        let g_bytes = (features * 2) as u64;
+        let inv_bytes = (tokens * 4) as u64; // inv_rms is f32
+        let (mut dx, mut dg, mut dy, mut dinv) = (0u64, 0u64, 0u64, 0u64);
+        syn!(synDeviceMalloc(self.id, x_bytes, 0, 0, &mut dx));
+        syn!(synDeviceMalloc(self.id, g_bytes, 0, 0, &mut dg));
+        syn!(synDeviceMalloc(self.id, x_bytes, 0, 0, &mut dy));
+        syn!(synDeviceMalloc(self.id, inv_bytes, 0, 0, &mut dinv));
+        let mut ws = 0u64;
+        syn!(synWorkspaceGetSize(&mut ws, recipe));
+        let mut dws = 0u64;
+        if ws > 0 {
+            syn!(synDeviceMalloc(self.id, ws, 0, 0, &mut dws));
+        }
+
+        let (mut hx, mut hg, mut hy): (*mut c_void, *mut c_void, *mut c_void) = (
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        syn!(synHostMalloc(self.id, x_bytes, 0, &mut hx));
+        syn!(synHostMalloc(self.id, g_bytes, 0, &mut hg));
+        syn!(synHostMalloc(self.id, x_bytes, 0, &mut hy));
+
+        // SAFETY: hx holds features*tokens and hg holds features bf16 elements.
+        unsafe {
+            let px = hx.cast::<u16>();
+            for (i, &v) in x.iter().enumerate() {
+                *px.add(i) = f32_to_bf16(v);
+            }
+            let pg = hg.cast::<u16>();
+            for (i, &v) in gamma.iter().enumerate() {
+                *pg.add(i) = f32_to_bf16(v);
+            }
+        }
+
+        let mut stream: synStreamHandle = core::ptr::null_mut();
+        syn!(synStreamCreateGeneric(&mut stream, self.id, 0));
+        syn!(synMemCopyAsync(
+            stream,
+            hx as u64,
+            x_bytes,
+            dx,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synMemCopyAsync(
+            stream,
+            hg as u64,
+            g_bytes,
+            dg,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let infos = [
+            launch_info(&n_x, dx, ids[0], f, t),
+            launch_info(&n_g, dg, ids[1], f, 1),
+            launch_info(&n_y, dy, ids[2], f, t),
+            launch_info(&n_inv, dinv, ids[3], 1, t),
+        ];
+        syn!(synLaunch(stream, infos.as_ptr(), 4, dws, recipe, 0));
+        syn!(synStreamSynchronize(stream));
+        syn!(synMemCopyAsync(
+            stream,
+            dy,
+            x_bytes,
+            hy as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let mut out = vec![0.0f32; features * tokens];
+        // SAFETY: hy holds features*tokens bf16 elements just copied back.
+        unsafe {
+            let py = hy.cast::<u16>();
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = bf16_to_f32(*py.add(i));
+            }
+        }
+
+        unsafe {
+            for h in [hx, hg, hy] {
+                synHostFree(self.id, h, 0);
+            }
+            for d in [dx, dg, dy, dinv] {
+                synDeviceFree(self.id, d, 0);
+            }
             if dws != 0 {
                 synDeviceFree(self.id, dws, 0);
             }

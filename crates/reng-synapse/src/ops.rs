@@ -20,6 +20,56 @@ pub fn softmax_bf16(input: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>>
     Device::acquire()?.softmax(input, rows, cols)
 }
 
+/// RMSNorm over the feature axis via `rms_norm_fwd_bf16`. `x` is row-major
+/// `[features, tokens]`, `gamma` is length `features`. Acquires and releases a
+/// device for the single call.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+///
+/// # Panics
+///
+/// Panics if `x.len() != features*tokens` or `gamma.len() != features`.
+pub fn rms_norm_bf16(
+    x: &[f32],
+    gamma: &[f32],
+    features: usize,
+    tokens: usize,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    Device::acquire()?.rms_norm(x, gamma, features, tokens, eps)
+}
+
+/// CPU reference RMSNorm over the feature axis. `x` is laid out with `features`
+/// as the contiguous (FCD) dimension and `tokens` as the outer dimension, i.e.
+/// row-major `[tokens, features]` (`x[t*features + f]`); `gamma` is length
+/// `features`. Matches the on-device tensor layout used by [`crate::Device`].
+#[must_use]
+pub fn rms_norm_cpu(
+    x: &[f32],
+    gamma: &[f32],
+    features: usize,
+    tokens: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; features * tokens];
+    for t in 0..tokens {
+        let base = t * features;
+        let mut ms = 0.0f32;
+        for f in 0..features {
+            let v = x[base + f];
+            ms += v * v;
+        }
+        ms /= features as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for f in 0..features {
+            out[base + f] = x[base + f] * inv * gamma[f];
+        }
+    }
+    out
+}
+
 /// CPU reference row-wise softmax over `cols`, f32.
 #[must_use]
 pub fn softmax_cpu(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {
