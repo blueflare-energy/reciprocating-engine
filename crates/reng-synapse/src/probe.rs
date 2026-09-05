@@ -94,6 +94,104 @@ pub fn run_node_extra(
     Runtime::new(gb, out)?.launch_and_read(rows)
 }
 
+/// Like [`run_node_extra`] with a dtype per extra output (name, sizes,
+/// dtype): the first output (`out_sizes`, bf16) is read back, the extras
+/// are workspace tensors that are produced but not read.
+///
+/// # Errors
+///
+/// As [`run_node`].
+///
+/// # Panics
+///
+/// Panics if an input's data length disagrees with its sizes.
+pub fn run_node_extra_typed(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    out_sizes: &[u64],
+    extra: &[(&str, &[u64], core::ffi::c_int)],
+    params: *const c_void,
+    params_size: u32,
+) -> Result<Vec<f32>> {
+    let mut gb = Gb::new()?;
+    let mut tensors = Vec::with_capacity(ins.len());
+    for i in ins {
+        if let Some((dtype, bytes)) = i.raw {
+            tensors.push(gb.input_raw(i.name, i.sizes, dtype, bytes)?);
+        } else {
+            assert_eq!(i.sizes.iter().product::<u64>() as usize, i.data.len());
+            tensors.push(gb.input(i.name, i.sizes, i.data)?);
+        }
+    }
+    let (t_out, n_out) = gb.output("OUT", out_sizes, SYN_TYPE_BF16)?;
+    let mut outs = vec![t_out];
+    for (name, sizes, dtype) in extra {
+        outs.push(gb.mid(name, sizes, *dtype)?);
+    }
+    gb.node(guid, "probe", &tensors, &outs, params, params_size)?;
+    let out = Out {
+        name: n_out,
+        sizes: out_sizes.to_vec(),
+        kind: OutKind::Bf16,
+    };
+    let rows = *out_sizes.last().unwrap_or(&1) as usize;
+    Runtime::new(gb, out)?.launch_and_read(rows)
+}
+
+/// Like [`run_node_extra_typed`] but reads back the output at index `read`
+/// of `outs` (name, sizes, dtype; that one must be bf16) while the others
+/// are workspace tensors, for kernels whose interesting output is not the
+/// first.
+///
+/// # Errors
+///
+/// As [`run_node`].
+///
+/// # Panics
+///
+/// Panics if an input's data length disagrees with its sizes or `read` is
+/// out of range.
+pub fn run_node_pick(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    outs: &[(&str, &[u64], core::ffi::c_int)],
+    read: usize,
+    params: *const c_void,
+    params_size: u32,
+) -> Result<Vec<f32>> {
+    assert!(read < outs.len());
+    let mut gb = Gb::new()?;
+    let mut tensors = Vec::with_capacity(ins.len());
+    for i in ins {
+        if let Some((dtype, bytes)) = i.raw {
+            tensors.push(gb.input_raw(i.name, i.sizes, dtype, bytes)?);
+        } else {
+            assert_eq!(i.sizes.iter().product::<u64>() as usize, i.data.len());
+            tensors.push(gb.input(i.name, i.sizes, i.data)?);
+        }
+    }
+    let mut out_tensors = Vec::with_capacity(outs.len());
+    let mut picked = None;
+    for (k, (name, sizes, dtype)) in outs.iter().enumerate() {
+        if k == read {
+            let (t, n) = gb.output(name, sizes, *dtype)?;
+            picked = Some((n, sizes.to_vec()));
+            out_tensors.push(t);
+        } else {
+            out_tensors.push(gb.mid(name, sizes, *dtype)?);
+        }
+    }
+    gb.node(guid, "probe", &tensors, &out_tensors, params, params_size)?;
+    let (name, sizes) = picked.expect("read index checked above");
+    let rows = *sizes.last().unwrap_or(&1) as usize;
+    let out = Out {
+        name,
+        sizes,
+        kind: OutKind::Bf16,
+    };
+    Runtime::new(gb, out)?.launch_and_read(rows)
+}
+
 /// Like [`run_node`] but with an int32 output.
 ///
 /// # Errors
