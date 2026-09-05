@@ -57,6 +57,28 @@ jobs:
           json.dump(out, open("bench.json", "w"), indent=2)
           ' bench-*.json
           cat bench.json
+      - name: sweep
+        # Chart 2: decode throughput per model and batch, published next to
+        # the history as dev/sweep/latest.{md,json} on gh-pages.
+        run: |
+          set -euo pipefail
+          IFS=: read -ra dirs <<< "$RENG_MODEL_DIRS"
+          HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
+            python3 tools/sweep.py ./target/release/reng-bench sweep --batches 1,8,64 --new 32 "${dirs[@]}"
+          git fetch --depth=1 origin gh-pages
+          rm -rf /tmp/gh-pages && git worktree add /tmp/gh-pages origin/gh-pages
+          mkdir -p /tmp/gh-pages/dev/sweep
+          cp sweep.md /tmp/gh-pages/dev/sweep/latest.md
+          cp sweep.json /tmp/gh-pages/dev/sweep/latest.json
+          cd /tmp/gh-pages
+          git config user.name 'blueflare-ci'
+          git config user.email 'ci@blueflare.energy'
+          git add dev/sweep
+          if ! git diff --cached --quiet; then
+            git commit -q -m "bench: decode sweep for ${GITHUB_SHA::7}"
+            git push -q origin HEAD:gh-pages
+          fi
+          cd - >/dev/null && git worktree remove --force /tmp/gh-pages
       - name: record
         uses: benchmark-action/github-action-benchmark@v1
         with:
