@@ -67,6 +67,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agreement with last-logits cosine 1.0000; b1 512 tok/s, b8 4205.
   `reng-layer-test` uses the dense input generator of the other tests
   and `reng-norm-test` takes `[scale] [eps]`.
+- Gemma-3 text (`gemma3_text`) and Gemma-2 (`gemma2`), from a sub-agent
+  patch: `(1 + w)` norm gains folded at load, post-attention and
+  post-MLP norms on top of the input norms (four per layer), the
+  `sqrt(hidden)` embedding scale on the host in f32,
+  `query_pre_attn_scalar` folded into the q-norm gain, per-layer RoPE
+  tables (local theta on sliding layers, global on full layers) and
+  per-layer sliding masks on the prefill, cached and batched paths (the
+  model-wide window of the previous entry became a per-layer field),
+  `tie_word_embeddings` defaulting to true for Gemma, GELU-tanh composed
+  as `x * sigmoid(c1 x + c3 x^3)` (`gelu_fwd_bf16` only offers the erf
+  form; `reng-gelu-test`), and the Gemma-2 attention and final logit
+  softcaps. Verified Gemma-3-270m (8/8; 798-token prompt 789/798 with
+  cosine 0.9998, 643/798 without the window), Gemma-3-1B (7/8 plus a
+  near-tie; 795/798, cosine 1.0000) and Gemma-2-2B (7/8 plus a
+  near-tie); b1 939 / 474 / 282 tok/s.
 - Mistral-7B verified without engine changes: v0.3 (vocab 32768,
   rope_theta 1e6, no window) 7/8 exact plus a reference near-tie, 296/304
   argmax agreement with last-logits cosine 1.0000 at 304 tokens, b1 136
