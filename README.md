@@ -70,13 +70,19 @@ against the `reng-ceiling` roofline:
 | SmolLM2-360M | 599 (17.8%) | 5432 (21.4%) | 30206 (21.2%) | 71.9k (14.1%) |
 | Qwen2.5-0.5B | 750 (30.3%) | 5722 (29.3%) | 36982 (26.0%) | 103.9k (25.9%) |
 | Qwen2.5-1.5B | 398 (50.3%) | 3175 (50.5%) | 20205 (43.2%) | 60.2k (45.5%) |
+| Falcon3-1B-Base | 499 (57.3%) | 3867 (57.0%) | | |
 | TinyLlama-1.1B | 553 (46.8%) | 4584 (49.0%) | 27828 (40.4%) | 50.0k (26.1%) |
+| DeepSeek-R1-Distill-Qwen-1.5B | 396 (50.0%) | 3138 (50.0%) | | |
 | SmolLM2-1.7B | 385 (54.3%) | 3049 (56.8%) | 13971 (46.6%) | 34.2k (28.7%) |
 | Qwen2.5-3B | 245 (61.9%) | 1932 (61.2%) | 12903 (53.6%) | 31.6k (47.4%) |
 | Qwen2.5-7B | 133 (76.6%) | 1051 (76.2%) | 7372 (69.0%) | 18.5k (62.5%) |
+| DeepSeek-R1-Distill-Llama-8B | 129 (79.3%) | 1023 (79.2%) | | |
 
 Decode percentages are against the HBM roofline, prefill against the MME
-roofline. The `bench` workflow regenerates the decode-versus-batch table
+roofline. Every model is verified against a Hugging Face f32 reference
+before it is listed (8 greedy tokens, exact up to bf16 near-ties). The
+Llama-3.1 rope scaling of the 8B distill is not applied yet, so that row
+holds only for short contexts. The `bench` workflow regenerates the decode-versus-batch table
 (the plan's Chart 2) at
 [dev/sweep/latest.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/latest.md)
 and the prefill-versus-context table (Chart 1) at

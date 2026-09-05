@@ -29,7 +29,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by a ScatterND node and the greedy token is an argmax on the device.
 - Qwen2-style attention biases; sharded safetensors checkpoints; verified
   models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B/7B,
-  TinyLlama-1.1B.
+  TinyLlama-1.1B, Falcon3-1B-Base, DeepSeek-R1-Distill-Qwen-1.5B and
+  DeepSeek-R1-Distill-Llama-8B.
 - `RENG_MODULE_ID` picks the card by its SynapseAI module id
   (`synDeviceAcquireByModuleId`); without it the runtime takes any free
   card. `HABANA_VISIBLE_DEVICES` never steered the acquire, so the bench
