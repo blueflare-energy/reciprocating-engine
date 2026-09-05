@@ -116,6 +116,16 @@ mod cached;
 pub use cached::CachedModel;
 
 #[cfg(feature = "link-synapse")]
+mod probe;
+
+#[cfg(feature = "link-synapse")]
+pub use probe::{NodeInput, run_node};
+
+/// Vendor parameter structs, for [`run_node`] probes.
+#[cfg(feature = "link-synapse")]
+pub use ffi::{synGEMMParams, synSoftmaxParams};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as

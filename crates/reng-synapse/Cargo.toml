@@ -91,3 +91,13 @@ required-features = ["link-synapse"]
 name = "reng-cache-test"
 path = "src/bin/cache_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-bgemm-test"
+path = "src/bin/bgemm_test.rs"
+required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-batched-test"
+path = "src/bin/batched_test.rs"
+required-features = ["link-synapse"]
