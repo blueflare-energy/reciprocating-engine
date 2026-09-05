@@ -29,6 +29,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   by a ScatterND node and the greedy token is an argmax on the device.
 - Qwen2-style attention biases; sharded safetensors checkpoints; verified
   models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B/7B.
+- `RENG_MODULE_ID` picks the card by its SynapseAI module id
+  (`synDeviceAcquireByModuleId`); without it the runtime takes any free
+  card. `HABANA_VISIBLE_DEVICES` never steered the acquire, so the bench
+  workflow now relies on the runner exporting `RENG_MODULE_ID`.
+- `reng-mme-bench` takes the gemm shape (m k n iters transpose_b) and runs
+  on the graph runtime: the prefill gemm `[1024 x 2048] x [2048 x 8192]`
+  reaches 82% of the MME peak standalone, so the 44% seen inside the
+  prefill recipe is the recipe's doing.
 - Capacity buckets for batched decode: the recipes are compiled for the
   smallest bucket of cache positions holding the longest live sequence and
   regrown on demand (`RENG_MIN_CAP` sets the floor), since attention reads

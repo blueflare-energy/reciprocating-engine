@@ -245,8 +245,7 @@ impl Runtime {
         let (dev, stream) = match parent {
             Some(p) => (p.dev, p.stream),
             None => {
-                let mut dev: synDeviceId = 0;
-                syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+                let dev = crate::device::acquire_device()?;
                 let mut stream: synStreamHandle = core::ptr::null_mut();
                 syn!(synStreamCreateGeneric(&mut stream, dev, 0));
                 (dev, stream)
@@ -627,6 +626,25 @@ impl Runtime {
     pub fn rebind(&mut self, name: &str, addr: u64) {
         let idx = self.info_index[name];
         self.infos[idx].tensor_address = addr;
+    }
+
+    /// Enqueue one launch without reading anything back (launches on the
+    /// stream run in order; a later [`Runtime::launch_and_read`] completes
+    /// after all of them). For throughput measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the launch is rejected.
+    pub fn launch_only(&mut self) -> Result<()> {
+        syn!(synLaunch(
+            self.stream,
+            self.infos.as_ptr(),
+            self.infos.len() as u32,
+            self.dws,
+            self.recipe,
+            0
+        ));
+        Ok(())
     }
 
     /// Launch the recipe and read back the first `rows` outermost rows of the

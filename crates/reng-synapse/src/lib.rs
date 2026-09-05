@@ -125,7 +125,7 @@ pub use batched::BatchedModel;
 mod probe;
 
 #[cfg(feature = "link-synapse")]
-pub use probe::{NodeInput, SYN_TYPE_INT32, run_node, run_node_i32};
+pub use probe::{NodeInput, SYN_TYPE_INT32, bench_node, run_node, run_node_i32};
 
 /// Vendor parameter structs, for [`run_node`] probes.
 #[cfg(feature = "link-synapse")]
@@ -290,8 +290,7 @@ mod hpu {
                 3
             ));
 
-            let mut dev: synDeviceId = 0;
-            syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+            let dev = crate::device::acquire_device()?;
 
             let bytes_a = (m * k * 2) as u64;
             let bytes_b = (k * n * 2) as u64;

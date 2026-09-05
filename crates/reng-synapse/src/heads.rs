@@ -148,8 +148,7 @@ pub fn split_rotate_concat_bf16(
         2
     ));
 
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let dev = crate::device::acquire_device()?;
     let bytes = (tokens * hidden * 2) as u64;
     let (mut dx, mut dout) = (0u64, 0u64);
     syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut dx));

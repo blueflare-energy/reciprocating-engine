@@ -233,8 +233,7 @@ pub fn swiglu_mlp_bf16(
         5
     ));
 
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let dev = crate::device::acquire_device()?;
 
     let x_bytes = (tokens * hidden * 2) as u64;
     let w_bytes = (hidden * inter * 2) as u64;

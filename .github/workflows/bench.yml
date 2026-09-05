@@ -3,8 +3,8 @@ name: bench
 # Throughput on real Gaudi2 hardware, recorded on every merge to main. Runs on
 # a self-hosted runner labelled `gaudi2`; the runner's environment provides
 # RENG_MODEL_DIRS (Hugging Face model directories, colon separated) and
-# RENG_DEVICE (the accel index to use), so nothing machine-specific lives in
-# this file. Fork pull requests never reach this job: it only runs on pushes
+# RENG_MODULE_ID (the module id of the card to use, from `hl-smi`), so
+# nothing machine-specific lives in this file. Fork pull requests never reach this job: it only runs on pushes
 # to main and manual dispatch.
 
 on:
@@ -44,10 +44,8 @@ jobs:
           IFS=: read -ra dirs <<< "$RENG_MODEL_DIRS"
           for dir in "${dirs[@]}"; do
             name=$(basename "$dir")
-            HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
-              ./target/release/reng-bench "$dir" "bench-$name-b1.json" --prompt 128 --new 64
-            HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
-              ./target/release/reng-bench "$dir" "bench-$name-b8.json" --prompt 128 --new 32 --batch 8 --warmup 1
+            ./target/release/reng-bench "$dir" "bench-$name-b1.json" --prompt 128 --new 64
+            ./target/release/reng-bench "$dir" "bench-$name-b8.json" --prompt 128 --new 32 --batch 8 --warmup 1
           done
           python3 -c '
           import json, sys
@@ -64,10 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           IFS=: read -ra dirs <<< "$RENG_MODEL_DIRS"
-          HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
-            python3 tools/sweep.py ./target/release/reng-bench sweep --batches 1,8,64 --new 32 "${dirs[@]}"
-          HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
-            python3 tools/sweep.py ./target/release/reng-bench prefill --mode prefill --contexts 128,512,1024,2048 "${dirs[@]}"
+          python3 tools/sweep.py ./target/release/reng-bench sweep --batches 1,8,64 --new 32 "${dirs[@]}"
+          python3 tools/sweep.py ./target/release/reng-bench prefill --mode prefill --contexts 128,512,1024,2048 "${dirs[@]}"
           git fetch --depth=1 origin gh-pages
           rm -rf /tmp/gh-pages && git worktree add /tmp/gh-pages origin/gh-pages
           mkdir -p /tmp/gh-pages/dev/sweep

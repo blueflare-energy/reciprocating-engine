@@ -66,6 +66,7 @@ unsafe extern "C" {
         pDeviceId: *mut synDeviceId,
         deviceType: c_int,
     ) -> synStatus;
+    pub fn synDeviceAcquireByModuleId(pDeviceId: *mut synDeviceId, moduleId: u32) -> synStatus;
     pub fn synDeviceRelease(deviceId: synDeviceId) -> synStatus;
     pub fn synDeviceMalloc(
         deviceId: synDeviceId,

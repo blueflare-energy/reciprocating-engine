@@ -132,8 +132,7 @@ pub fn matmul_chain_bf16(a: &[f32], w: &[f32], d: usize, depth: usize) -> Result
         3
     ));
 
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let dev = crate::device::acquire_device()?;
 
     let bytes = (d * d * 2) as u64;
     let (mut dev_a, mut dev_w, mut dev_out) = (0u64, 0u64, 0u64);

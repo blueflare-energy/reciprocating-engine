@@ -3,6 +3,7 @@
 //! contract (tensor ranks, layouts, broadcasting, parameter structs) before
 //! it goes into a model graph; every `reng-*-test` for a new guid uses it.
 
+use crate::ffi::SYN_TYPE_BF16;
 use crate::model::{Gb, make_tensor};
 use crate::runtime::{Out, OutKind, Runtime};
 use core::ffi::c_void;
@@ -76,6 +77,43 @@ pub fn run_node_i32(
     )?;
     let rows = *out_sizes.last().unwrap_or(&1) as usize;
     rt.launch_and_read_i32(0, rows)
+}
+
+/// Time one node: compile it once, launch it `iters` times back to back,
+/// and return the seconds per launch together with the first output row
+/// (for a spot check). The final launch is read back, which also waits for
+/// the earlier ones.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+pub fn bench_node(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    out_sizes: &[u64],
+    params: *const c_void,
+    params_size: u32,
+    iters: usize,
+) -> Result<(f64, Vec<f32>)> {
+    let mut rt = build_probe(
+        guid,
+        ins,
+        out_sizes,
+        SYN_TYPE_BF16,
+        OutKind::Bf16,
+        params,
+        params_size,
+    )?;
+    for _ in 0..3 {
+        rt.launch_and_read(1)?;
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        rt.launch_only()?;
+    }
+    let row = rt.launch_and_read(1)?;
+    let secs = t0.elapsed().as_secs_f64() / (iters as f64 + 1.0);
+    Ok((secs, row))
 }
 
 #[allow(clippy::too_many_arguments)]

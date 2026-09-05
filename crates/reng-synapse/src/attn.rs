@@ -198,8 +198,7 @@ pub fn attention_bf16(
         4
     ));
 
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let dev = crate::device::acquire_device()?;
 
     let sd_bytes = (seq * dim * 2) as u64;
     let (mut dq, mut dkt, mut dv, mut dout) = (0u64, 0u64, 0u64, 0u64);

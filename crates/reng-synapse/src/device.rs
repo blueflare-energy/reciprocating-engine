@@ -21,6 +21,26 @@ macro_rules! syn {
     }};
 }
 
+/// Acquire a Gaudi2 card: the one whose module id `RENG_MODULE_ID` names,
+/// else any free one. (`HABANA_VISIBLE_DEVICES` and friends do not steer
+/// `synDeviceAcquireByDeviceType` on this stack, which takes the lowest
+/// free module id; `hl-smi --query-aip=index,module_id,bus_id` maps them.)
+///
+/// # Errors
+///
+/// Returns an error if the acquire fails.
+pub(crate) fn acquire_device() -> Result<synDeviceId> {
+    let mut dev: synDeviceId = 0;
+    match std::env::var("RENG_MODULE_ID")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(module) => syn!(synDeviceAcquireByModuleId(&mut dev, module)),
+        None => syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2)),
+    }
+    Ok(dev)
+}
+
 /// An acquired Gaudi2 device. Holds the SynapseAI process init for its
 /// lifetime; drop releases the device and tears down the process. Each op runs
 /// as its own recipe launch. Reliable dimensions are at least 128: a smaller
@@ -39,8 +59,7 @@ impl Device {
     /// Returns an error if init or acquire fails.
     pub fn acquire() -> Result<Self> {
         syn!(synInitialize());
-        let mut id: synDeviceId = 0;
-        syn!(synDeviceAcquireByDeviceType(&mut id, SYN_DEVICE_GAUDI2));
+        let id = acquire_device()?;
         Ok(Self { id })
     }
 
