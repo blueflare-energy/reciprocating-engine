@@ -56,3 +56,8 @@ required-features = ["link-synapse"]
 name = "reng-silu-test"
 path = "src/bin/silu_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-mlp-test"
+path = "src/bin/mlp_test.rs"
+required-features = ["link-synapse"]

@@ -77,6 +77,12 @@ mod attn;
 pub use attn::{attention_bf16, attention_cpu};
 
 #[cfg(feature = "link-synapse")]
+mod mlp;
+
+#[cfg(feature = "link-synapse")]
+pub use mlp::{swiglu_mlp_bf16, swiglu_mlp_cpu};
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as
