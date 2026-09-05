@@ -19,6 +19,12 @@
 //! with a mask that admits positions up to each query's own. No DMA node
 //! touches the cache.
 //!
+//! Attention is the four nodes qk `batch_gemm`, mask add, softmax and av
+//! `batch_gemm`, or one fused `sdpa_recomp_fwd_bf16` node over the same
+//! tensors: the default in the single-sequence decode recipe, everywhere
+//! with `RENG_SDPA=1` and nowhere with `RENG_SDPA=0` (read when the graph
+//! is built; see [`fused_sdpa`]).
+//!
 //! Launch and readback (including the completion protocol) live in
 //! `runtime.rs`. Diagnostic environment switches (all off by default):
 //! `RENG_DEVSYNC` (device-wide sync after launch), `RENG_SETTLE_MS` (sleep
@@ -84,6 +90,54 @@ impl RmsNormParams {
 struct RopeParams {
     offset: u32,
     mode: i32,
+}
+
+/// `ns_Sdpa::Params` of the fused attention guid `sdpa_recomp_fwd_bf16`:
+/// `float scale; bool is_causal; ns_DropoutKernel::ParamsOptionalMaskOut
+/// dropout { float ratio; unsigned seed; bool disableMaskOut }; bool
+/// is_inference`, 24 bytes with C padding (explicit and zeroed: the raw
+/// bytes go into the recipe cache key).
+#[repr(C)]
+struct SdpaParams {
+    scale: f32,
+    is_causal: u8,
+    _pad0: [u8; 3],
+    dropout_ratio: f32,
+    dropout_seed: u32,
+    disable_mask_out: u8,
+    _pad1: [u8; 3],
+    is_inference: u8,
+    _pad2: [u8; 3],
+}
+
+impl SdpaParams {
+    /// Inference without dropout and with an explicit mask (no causal
+    /// flag: with a KV cache the key axis is the whole cache).
+    const fn inference(scale: f32) -> Self {
+        Self {
+            scale,
+            is_causal: 0,
+            _pad0: [0; 3],
+            dropout_ratio: 0.0,
+            dropout_seed: 0,
+            disable_mask_out: 1,
+            _pad1: [0; 3],
+            is_inference: 1,
+            _pad2: [0; 3],
+        }
+    }
+}
+
+/// Whether a graph being built takes the fused attention node: what
+/// `RENG_SDPA` says ([`crate::sdpa_switch`]), or `default` when it is
+/// unset. The default is `true` for the single-sequence decode recipe
+/// only: measured on Qwen2.5-1.5B, SmolLM2-1.7B, Llama-3.2-3B and
+/// Qwen2.5-7B, the fused node never slows a batch-1 decode step and
+/// speeds Llama-3.2-3B's up by 2%, while prefill blocks and batched
+/// decode are a wash at best (Qwen2.5-1.5B, with two KV groups, loses 5%
+/// on 256-row prefill blocks and 2.5% at batch 8).
+pub(crate) fn fused_sdpa(default: bool) -> bool {
+    crate::sdpa_switch(std::env::var("RENG_SDPA").ok().as_deref()).unwrap_or(default)
 }
 
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
@@ -710,6 +764,13 @@ pub(crate) struct Shared {
     /// (prefill) is written into a separate output buffer that the caller
     /// copies back; a one-row decode step stays in place.
     pub inplace: bool,
+    /// Whether attention is one fused `sdpa_recomp_fwd_bf16` node per
+    /// layer instead of the qk gemm, mask add, softmax and av gemm
+    /// (`RENG_SDPA`, read once when the graph is built, or the recipe's
+    /// default; see [`fused_sdpa`]). The kernel reads the engine's own
+    /// tensors: it broadcasts the size-1 K/V heads dim over the query
+    /// heads of a group and takes the additive mask as it is.
+    pub sdpa: bool,
 }
 
 /// Persistent tensor names of layer `li`'s cache state:
@@ -872,8 +933,6 @@ pub(crate) fn build_layer<'a>(
     let t_q = gb.mid(&p("q"), &[hd, t, hpg, groups], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, t, 1, groups], bf)?;
     let t_v = gb.mid(&p("v"), &[hd, t, 1, groups], bf)?;
-    let t_sc = gb.mid(&p("scores"), &[keys, t, hpg, groups], bf)?;
-    let t_pr = gb.mid(&p("probs"), &[keys, t, hpg, groups], bf)?;
     let t_at = gb.mid(&p("at"), &[hd, t, hpg, groups], bf)?;
     let t_at3 = gb.mid(&p("at3"), &[hd, t, hpg * groups], bf)?;
     let t_att = gb.mid(&p("att"), &[hd, hpg * groups, t], bf)?;
@@ -1203,43 +1262,62 @@ pub(crate) fn build_layer<'a>(
     } else {
         (t_kr, t_v)
     };
-    // scores[key, query] per head = q @ k^T with K in its natural layout.
-    gb.node(
-        "batch_gemm",
-        &p("qk"),
-        &[t_qr, k_full],
-        &[t_sc],
-        pgt.0,
-        pgt.1,
-    )?;
-    // Gemma-2: softcap the scores (which carry `1 / cap`) before the mask.
-    let t_sc = match w.attn_softcap {
-        Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, t, hpg, groups], cap)?,
-        None => t_sc,
-    };
-    let sm_in = if let Some(mask) = mask {
-        let masked = gb.mid(&p("masked"), &[keys, t, hpg, groups], bf)?;
+    if sh.sdpa && w.attn_softcap.is_none() {
+        // Fused attention: one node over the same tensors (the scale is
+        // already on q). A softcapped layer (Gemma-2) keeps the four
+        // nodes below: its `tanh` sits between the scores and the mask.
+        let sdpa = SdpaParams::inference(1.0);
+        let mut ins = vec![t_qr, k_full, v_full];
+        ins.extend(mask);
         gb.node(
-            "add_fwd_bf16",
-            &p("mask"),
-            &[t_sc, mask],
-            &[masked],
-            none.0,
-            none.1,
+            "sdpa_recomp_fwd_bf16",
+            &p("sdpa"),
+            &ins,
+            &[t_at],
+            (&raw const sdpa).cast::<c_void>(),
+            core::mem::size_of::<SdpaParams>() as u32,
         )?;
-        masked
     } else {
-        t_sc
-    };
-    gb.node(
-        "softmax_fwd_bf16",
-        &p("softmax"),
-        &[sm_in],
-        &[t_pr],
-        ps.0,
-        ps.1,
-    )?;
-    gb.node("batch_gemm", &p("av"), &[t_pr, v_full], &[t_at], pg.0, pg.1)?;
+        let t_sc = gb.mid(&p("scores"), &[keys, t, hpg, groups], bf)?;
+        let t_pr = gb.mid(&p("probs"), &[keys, t, hpg, groups], bf)?;
+        // scores[key, query] per head = q @ k^T with K in its natural layout.
+        gb.node(
+            "batch_gemm",
+            &p("qk"),
+            &[t_qr, k_full],
+            &[t_sc],
+            pgt.0,
+            pgt.1,
+        )?;
+        // Gemma-2: softcap the scores (which carry `1 / cap`) before the mask.
+        let t_sc = match w.attn_softcap {
+            Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, t, hpg, groups], cap)?,
+            None => t_sc,
+        };
+        let sm_in = if let Some(mask) = mask {
+            let masked = gb.mid(&p("masked"), &[keys, t, hpg, groups], bf)?;
+            gb.node(
+                "add_fwd_bf16",
+                &p("mask"),
+                &[t_sc, mask],
+                &[masked],
+                none.0,
+                none.1,
+            )?;
+            masked
+        } else {
+            t_sc
+        };
+        gb.node(
+            "softmax_fwd_bf16",
+            &p("softmax"),
+            &[sm_in],
+            &[t_pr],
+            ps.0,
+            ps.1,
+        )?;
+        gb.node("batch_gemm", &p("av"), &[t_pr, v_full], &[t_at], pg.0, pg.1)?;
+    }
     // [hd, t, hpg, groups] -> [hd, t, heads] -> [hd, heads, t] = [hidden, t].
     gb.node("reshape", &p("at_3d"), &[t_at], &[t_at3], none.0, none.1)?;
     gb.node(
@@ -1394,6 +1472,9 @@ pub(crate) struct SharedBatched {
     pub kidx: synTensor,
     pub capacity: usize,
     pub batch: usize,
+    /// Fused attention, see [`Shared::sdpa`]; the kernel takes the 5-D
+    /// tensors with one mask row per sequence.
+    pub sdpa: bool,
 }
 
 /// Append one decoder layer for `B` sequences of one token each, reading `x`
@@ -1494,9 +1575,6 @@ pub(crate) fn build_layer_batched<'a>(
     let vco = gb.scratch_alias(&n_vco, &[hd, keys, 1, groups, b], &n_vci)?;
     let t_kru = gb.mid(&p("kru"), &[hd, groups * b], bf)?;
     let t_vu = gb.mid(&p("vu"), &[hd, groups * b], bf)?;
-    let t_sc = gb.mid(&p("scores"), &[keys, 1, hpg, groups, b], bf)?;
-    let t_masked = gb.mid(&p("masked"), &[keys, 1, hpg, groups, b], bf)?;
-    let t_pr = gb.mid(&p("probs"), &[keys, 1, hpg, groups, b], bf)?;
     let t_at = gb.mid(&p("at"), &[hd, 1, hpg, groups, b], bf)?;
     let t_attn = gb.mid(&p("attn"), &[qw, b], bf)?;
     let t_o = gb.mid(&p("o"), &[h, b], bf)?;
@@ -1723,28 +1801,44 @@ pub(crate) fn build_layer_batched<'a>(
         )?;
         (kco, vco)
     };
-    gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
-    let t_sc = match w.attn_softcap {
-        Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, 1, hpg, groups, b], cap)?,
-        None => t_sc,
-    };
-    gb.node(
-        "add_fwd_bf16",
-        &p("mask"),
-        &[t_sc, t_mask],
-        &[t_masked],
-        none.0,
-        none.1,
-    )?;
-    gb.node(
-        "softmax_fwd_bf16",
-        &p("softmax"),
-        &[t_masked],
-        &[t_pr],
-        ps.0,
-        ps.1,
-    )?;
-    gb.node("batch_gemm", &p("av"), &[t_pr, vco], &[t_at], pg.0, pg.1)?;
+    if sh.sdpa && w.attn_softcap.is_none() {
+        // Fused attention over the 5-D tensors (see `build_layer`).
+        let sdpa = SdpaParams::inference(1.0);
+        gb.node(
+            "sdpa_recomp_fwd_bf16",
+            &p("sdpa"),
+            &[t_qr, kco, vco, t_mask],
+            &[t_at],
+            (&raw const sdpa).cast::<c_void>(),
+            core::mem::size_of::<SdpaParams>() as u32,
+        )?;
+    } else {
+        let t_sc = gb.mid(&p("scores"), &[keys, 1, hpg, groups, b], bf)?;
+        let t_masked = gb.mid(&p("masked"), &[keys, 1, hpg, groups, b], bf)?;
+        let t_pr = gb.mid(&p("probs"), &[keys, 1, hpg, groups, b], bf)?;
+        gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
+        let t_sc = match w.attn_softcap {
+            Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, 1, hpg, groups, b], cap)?,
+            None => t_sc,
+        };
+        gb.node(
+            "add_fwd_bf16",
+            &p("mask"),
+            &[t_sc, t_mask],
+            &[t_masked],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "softmax_fwd_bf16",
+            &p("softmax"),
+            &[t_masked],
+            &[t_pr],
+            ps.0,
+            ps.1,
+        )?;
+        gb.node("batch_gemm", &p("av"), &[t_pr, vco], &[t_at], pg.0, pg.1)?;
+    }
     gb.node("reshape", &p("attn_2d"), &[t_at], &[t_attn], none.0, none.1)?;
     gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pgt.0, pgt.1)?;
     // Post-norm branches, as in `build_layer`.
@@ -2112,6 +2206,7 @@ fn build_stack<'a>(
         cache: None,
         kidx: None,
         inplace: true,
+        sdpa: fused_sdpa(false),
     };
     let persist = env_on("RENG_PERSIST_LAYERS");
     let mut cur = t_x;

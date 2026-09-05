@@ -19,7 +19,7 @@
 use crate::f32_to_bf16;
 use crate::model::{
     Gb, MASK_NEG, ModelWeights, RopeTables, Shared, build_head, build_layer, cache_names,
-    common_window, uses_full_mask, uses_local_rope,
+    common_window, fused_sdpa, uses_full_mask, uses_local_rope,
 };
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::Runtime;
@@ -211,6 +211,9 @@ impl<'a> CachedModel<'a> {
             cache: Some(capacity),
             kidx: Some(t_kidx),
             inplace,
+            // The in-place recipe is the decode one (small blocks), where
+            // the fused attention node is the default.
+            sdpa: fused_sdpa(inplace),
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {

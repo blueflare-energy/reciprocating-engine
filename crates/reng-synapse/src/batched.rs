@@ -21,7 +21,7 @@
 use crate::f32_to_bf16;
 use crate::model::{
     Gb, MASK_NEG, ModelWeights, RopeTables, Shared, SharedBatched, build_head, build_layer,
-    build_layer_batched, cache_names, common_window, uses_full_mask, uses_local_rope,
+    build_layer_batched, cache_names, common_window, fused_sdpa, uses_full_mask, uses_local_rope,
 };
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::{Out, Runtime};
@@ -249,6 +249,7 @@ impl<'a> BatchedModel<'a> {
             kidx: t_kidx,
             capacity: cap,
             batch,
+            sdpa: fused_sdpa(false),
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {
@@ -308,6 +309,7 @@ impl<'a> BatchedModel<'a> {
             cache: Some(cap),
             kidx: Some(t_kidx),
             inplace: false,
+            sdpa: fused_sdpa(false),
         };
         let mut cur = t_x;
         for (li, lw) in m.layers.iter().enumerate() {

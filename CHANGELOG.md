@@ -94,6 +94,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`sdpa_recomp_fwd_bf16`) and masked-softmax kernels against host
   references; `tools/profile/` holds the trace timeline and decode-step
   gap scripts.
+- Fused attention: one `sdpa_recomp_fwd_bf16` node per layer replaces
+  the qk `batch_gemm`, mask add, softmax and av `batch_gemm`. The kernel
+  takes the engine's own tensors: it broadcasts the size-1 K/V heads dim
+  of `[hd, keys, 1, groups]` over the query heads of a group, reads the
+  additive `[keys, queries, 1, 1]` mask (and the batched recipe's 5-D
+  tensors with one mask row per sequence) as they are, so no tiling or
+  reshape is needed; the scale stays folded into q. Softcapped layers
+  (Gemma-2) keep the four nodes. It is the default in the single-sequence
+  decode recipe, where a step is never slower and Llama-3.2-3B's is 2%
+  faster; prefill blocks and batched decode keep the chain (a wash on
+  SmolLM2-1.7B, Llama-3.2-3B and Qwen2.5-7B, 5% and 2.5% slower on
+  Qwen2.5-1.5B). `RENG_SDPA=1` fuses every recipe, `RENG_SDPA=0` none
+  (read when a graph is built). Every verified model agrees with its
+  reference as before (two near-ties become exact matches);
+  `reng-sdpa-shapes` probes the kernel's mask, batch and rank contracts
+  at the target models' shapes.
 - `reng-argmax-test`: probes the argmax kernels with the row maximum
   planted at chosen positions and values, single and multi row.
 - `RENG_HOST_ARGMAX=1` makes `reng-generate` read the logits and take

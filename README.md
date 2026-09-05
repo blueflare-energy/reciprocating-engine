@@ -116,7 +116,12 @@ shape skips the graph compiler on later runs.
 
 The KV cache is updated in place by a ScatterND node and the greedy token
 is an argmax on the device, so a decode step moves four bytes per sequence
-over the bus. Attention reads the whole cache every step, so the batched
+over the bus. Attention is four nodes per layer (two `batch_gemm`s, the
+mask add and the softmax) in the prefill and batched decode recipes and
+the fused `sdpa_recomp_fwd_bf16` kernel over the same tensors in the
+single-sequence decode recipe, where it is never slower and up to 2%
+faster; `RENG_SDPA=1` fuses every recipe and `RENG_SDPA=0` none.
+Attention reads the whole cache every step, so the batched
 decoder compiles its recipes for the smallest bucket of positions (256,
 doubling) that holds the longest live sequence and grows on demand,
 recompiling and copying the used rows across. Single-sequence decode is

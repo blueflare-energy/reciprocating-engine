@@ -42,6 +42,22 @@ pub enum Activation {
     GeluTanh,
 }
 
+/// What `RENG_SDPA` (its value, `None` when unset) says about the fused
+/// attention node of the decoder recipes: `Some(false)` for `0`, `off`,
+/// `false`, `no` or an empty value, `Some(true)` for any other value, and
+/// `None` when the variable is unset, which leaves the choice to the
+/// recipe (fused in the single-sequence decode recipe, the four-node
+/// chain elsewhere; see `model.rs`).
+#[must_use]
+pub fn sdpa_switch(value: Option<&str>) -> Option<bool> {
+    value.map(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        )
+    })
+}
+
 /// `w * scale` in bf16: one rounding of the f32 product per element, as
 /// the device would see a scalar folded into a weight. Exact for
 /// power-of-two scales.
@@ -543,6 +559,17 @@ mod tests {
                 (b - exact).abs() <= exact.abs() * (1.0 / 256.0),
                 "{b} vs {exact}"
             );
+        }
+    }
+
+    #[test]
+    fn sdpa_switch_reads_the_variable() {
+        assert_eq!(sdpa_switch(None), None);
+        for off in ["", "0", "off", "OFF", "false", "no", " 0 "] {
+            assert_eq!(sdpa_switch(Some(off)), Some(false), "{off:?}");
+        }
+        for on in ["1", "on", "yes", "true", "2"] {
+            assert_eq!(sdpa_switch(Some(on)), Some(true), "{on:?}");
         }
     }
 

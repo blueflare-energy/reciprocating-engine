@@ -146,3 +146,8 @@ required-features = ["link-synapse"]
 name = "reng-norm-residual-test"
 path = "src/bin/norm_residual_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-sdpa-shapes"
+path = "src/bin/sdpa_shapes.rs"
+required-features = ["link-synapse"]
