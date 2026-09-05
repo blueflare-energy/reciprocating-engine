@@ -414,6 +414,86 @@ impl<'a> Generator<'a> {
     }
 }
 
+/// `B` sequences decoded in lockstep with a `B`-slot KV cache; prompts are
+/// prefilled one sequence at a time.
+#[cfg(feature = "link-synapse")]
+pub struct BatchedGenerator<'a> {
+    model: reng_synapse::BatchedModel,
+    w: &'a LlamaWeights,
+    cfg: &'a LlamaConfig,
+}
+
+#[cfg(feature = "link-synapse")]
+impl<'a> BatchedGenerator<'a> {
+    /// Compile for `batch` sequences over a cache of `capacity` positions,
+    /// with prefill blocks of `rows` tokens, and upload the weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation or the upload fails.
+    pub fn new(
+        w: &'a LlamaWeights,
+        cfg: &'a LlamaConfig,
+        batch: usize,
+        rows: usize,
+        capacity: usize,
+    ) -> Result<Self> {
+        let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
+        let m = layer_views(w, cfg, &sin, &cos);
+        let model = reng_synapse::BatchedModel::new(
+            &m,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.vocab_size,
+            batch,
+            rows,
+            capacity,
+            &sin,
+            &cos,
+        )?;
+        Ok(Self { model, w, cfg })
+    }
+
+    /// Number of sequences.
+    #[must_use]
+    pub fn batch(&self) -> usize {
+        self.model.batch()
+    }
+
+    /// Start sequence `b` afresh and feed it `ids`; returns the logits of
+    /// the last id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty or would overflow the cache.
+    pub fn prefill(&mut self, b: usize, ids: &[u32]) -> Result<Vec<f32>> {
+        assert!(!ids.is_empty());
+        self.model.reset(b)?;
+        let x = embed_tokens(self.w, self.cfg, ids);
+        self.model.prefill(b, &x)
+    }
+
+    /// Advance every sequence by one token (`ids.len() == batch`) and return
+    /// the logits `[batch, vocab]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is not one id per sequence.
+    pub fn step(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        assert_eq!(ids.len(), self.model.batch());
+        let x = embed_tokens(self.w, self.cfg, ids);
+        self.model.step(&x)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

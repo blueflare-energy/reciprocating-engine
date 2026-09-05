@@ -10,7 +10,11 @@
 //! 4. `rope_st2_fwd_bf16` on `[hd, rows, heads]` with a 2-D `[hd, rows]` table;
 //! 5. `transpose` `[hd, heads, rows] -> [hd, rows, heads]`;
 //! 6. `slice` of a batch dim: `[hd, rows, 5, g]` rows 0..3 of dim 2;
-//! 7. `softmax_fwd_bf16` with a second (mask) input, added before the softmax.
+//! 7. `softmax_fwd_bf16` with a second (mask) input, added before the softmax;
+//! 8. `batch_gemm` 5-D: per-sequence batch outermost, weights broadcast over
+//!    it (`[k, 1, 1, 1, B]` against `[n, k, hpg, groups, 1]`), for batched decode;
+//! 9. `rope_st2_fwd_bf16` on `[hd, 1, heads, 1, B]` with a per-sequence table
+//!    `[hd, 1, 1, 1, B]`.
 //!
 //! `cargo run -p reng-synapse --features link-synapse --bin reng-batched-test -- [case]`
 
@@ -381,6 +385,108 @@ fn case_softmax_mask() -> reng_core::Result<f32> {
     Ok(rel(&hpu, &c))
 }
 
+/// Case 8: `C[b][j,g] = A[b] @ W[j,g]` over 5-D tensors, B sequences of one row.
+fn case_batched_decode_gemm() -> reng_core::Result<f32> {
+    let (k, n, hpg, groups, bsz) = (256usize, 64usize, 3usize, 3usize, 4usize);
+    let a = ramp(k * bsz, 10);
+    let w = ramp(n * k * hpg * groups, 11);
+    let p = synGEMMParams {
+        transpose_a: false,
+        transpose_b: false,
+    };
+    let (pp, ps) = params(&p);
+    let hpu = run_node(
+        "batch_gemm",
+        &[
+            NodeInput {
+                name: "A",
+                sizes: &[k as u64, 1, 1, 1, bsz as u64],
+                data: &a,
+            },
+            NodeInput {
+                name: "W",
+                sizes: &[n as u64, k as u64, hpg as u64, groups as u64, 1],
+                data: &w,
+            },
+        ],
+        &[n as u64, 1, hpg as u64, groups as u64, bsz as u64],
+        pp,
+        ps,
+    )?;
+    let mut c = vec![0.0f32; n * hpg * groups * bsz];
+    for b in 0..bsz {
+        for g in 0..groups {
+            for j in 0..hpg {
+                for col in 0..n {
+                    let mut s = 0.0;
+                    for q in 0..k {
+                        s += a[q + k * b] * w[col + n * (q + k * (j + hpg * g))];
+                    }
+                    c[col + n * (j + hpg * (g + groups * b))] = s;
+                }
+            }
+        }
+    }
+    Ok(rel(&hpu, &c))
+}
+
+/// Case 9: RoPE with one table row per sequence, `[hd, 1, 1, 1, B]`.
+fn case_rope_per_sequence() -> reng_core::Result<f32> {
+    let (hd, heads, bsz) = (64usize, 9usize, 4usize);
+    let x = ramp(hd * heads * bsz, 12);
+    let half = hd / 2;
+    let mut sin = vec![0.0f32; hd * bsz];
+    let mut cos = vec![0.0f32; hd * bsz];
+    for b in 0..bsz {
+        let pos = 7 + 5 * b;
+        for d in 0..hd {
+            let ang = pos as f32 * 10000f32.powf(-2.0 * ((d % half) as f32) / hd as f32);
+            sin[b * hd + d] = ang.sin();
+            cos[b * hd + d] = ang.cos();
+        }
+    }
+    let p = RopeParams { offset: 0, mode: 0 };
+    let (pp, ps) = params(&p);
+    let hpu = run_node(
+        "rope_st2_fwd_bf16",
+        &[
+            NodeInput {
+                name: "X",
+                sizes: &[hd as u64, 1, heads as u64, 1, bsz as u64],
+                data: &x,
+            },
+            NodeInput {
+                name: "SIN",
+                sizes: &[hd as u64, 1, 1, 1, bsz as u64],
+                data: &sin,
+            },
+            NodeInput {
+                name: "COS",
+                sizes: &[hd as u64, 1, 1, 1, bsz as u64],
+                data: &cos,
+            },
+        ],
+        &[hd as u64, 1, heads as u64, 1, bsz as u64],
+        pp,
+        ps,
+    )?;
+    let mut c = vec![0.0f32; x.len()];
+    for b in 0..bsz {
+        for h in 0..heads {
+            let base = hd * (h + heads * b);
+            for d in 0..hd {
+                let rot = if d < half {
+                    -x[base + d + half]
+                } else {
+                    x[base + d - half]
+                };
+                c[base + d] = x[base + d] * cos[b * hd + d] + rot * sin[b * hd + d];
+            }
+        }
+    }
+    Ok(rel(&hpu, &c))
+}
+
 fn main() -> reng_core::Result<()> {
     let names = [
         "batch_gemm GQA inner-batch broadcast (transpose_b)",
@@ -391,6 +497,8 @@ fn main() -> reng_core::Result<()> {
         "transpose [hd,heads,rows] -> [hd,rows,heads]",
         "slice dim 2 of [hd,rows,5,g] to 0..3",
         "softmax_fwd_bf16 with a mask input",
+        "batch_gemm 5-D, weights broadcast over the sequence batch",
+        "rope_st2_fwd_bf16 with a per-sequence 5-D table",
     ];
     let selected: Vec<usize> = match std::env::args()
         .nth(1)
@@ -409,7 +517,9 @@ fn main() -> reng_core::Result<()> {
             4 => case_rope3d(),
             5 => case_transpose(),
             6 => case_slice(),
-            _ => case_softmax_mask(),
+            7 => case_softmax_mask(),
+            8 => case_batched_decode_gemm(),
+            _ => case_rope_per_sequence(),
         };
         match res {
             Ok(r) if r < 0.02 => println!("case {ci}: {}: rel_L2={r:.4} ok", names[ci]),

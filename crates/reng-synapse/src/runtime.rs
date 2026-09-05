@@ -119,7 +119,8 @@ pub(crate) struct Runtime {
     info_index: HashMap<String, usize>,
     /// Device buffer per persistent tensor, by name.
     addrs: HashMap<String, u64>,
-    /// Shape per persistent tensor, by name (sharing requires equal shapes).
+    /// Shape per persistent tensor, by name (sharing requires equal element
+    /// counts).
     shapes: HashMap<String, Vec<u64>>,
     /// Whether this runtime acquired the device (else it borrows a parent's).
     owns_device: bool,
@@ -187,12 +188,14 @@ impl Runtime {
             }
         };
         // A tensor is shared with the parent when it has the same name AND
-        // the same shape (the per-step inputs of a narrower recipe have the
-        // same names as the parent's but different shapes).
+        // the same element count (a weight may be declared 4-D in one graph
+        // and 5-D with a trailing 1 in another; the per-step inputs of a
+        // narrower recipe have the same names but different counts).
         let shared = |name: &CString, sizes: &[u64]| -> Option<u64> {
             let key = name.to_str().unwrap();
+            let elems = sizes.iter().product::<u64>();
             parent.and_then(|p| match (p.addrs.get(key), p.shapes.get(key)) {
-                (Some(&d), Some(sh)) if sh == sizes => Some(d),
+                (Some(&d), Some(sh)) if sh.iter().product::<u64>() == elems => Some(d),
                 _ => None,
             })
         };

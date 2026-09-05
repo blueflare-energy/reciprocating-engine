@@ -2,10 +2,10 @@ name: bench
 
 # Throughput on real Gaudi2 hardware, recorded on every merge to main. Runs on
 # a self-hosted runner labelled `gaudi2`; the runner's environment provides
-# RENG_MODEL_DIR (a Hugging Face model directory) and RENG_DEVICE (the accel
-# index to use), so nothing machine-specific lives in this file. Fork pull
-# requests never reach this job: it only runs on pushes to main and manual
-# dispatch.
+# RENG_MODEL_DIRS (Hugging Face model directories, colon separated) and
+# RENG_DEVICE (the accel index to use), so nothing machine-specific lives in
+# this file. Fork pull requests never reach this job: it only runs on pushes
+# to main and manual dispatch.
 
 on:
   push:
@@ -39,9 +39,23 @@ jobs:
       - name: run
         run: |
           set -euo pipefail
-          : "${RENG_MODEL_DIR:?the runner must export RENG_MODEL_DIR}"
-          HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
-            ./target/release/reng-bench "$RENG_MODEL_DIR" bench.json --prompt 128 --new 64
+          : "${RENG_MODEL_DIRS:?the runner must export RENG_MODEL_DIRS}"
+          rm -f bench.json
+          IFS=: read -ra dirs <<< "$RENG_MODEL_DIRS"
+          for dir in "${dirs[@]}"; do
+            name=$(basename "$dir")
+            HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
+              ./target/release/reng-bench "$dir" "bench-$name-b1.json" --prompt 128 --new 64
+            HABANA_VISIBLE_DEVICES="${RENG_DEVICE:-0}" \
+              ./target/release/reng-bench "$dir" "bench-$name-b8.json" --prompt 128 --new 32 --batch 8 --warmup 1
+          done
+          python3 -c '
+          import json, sys
+          out = []
+          for f in sys.argv[1:]:
+              out.extend(json.load(open(f)))
+          json.dump(out, open("bench.json", "w"), indent=2)
+          ' bench-*.json
           cat bench.json
       - name: record
         uses: benchmark-action/github-action-benchmark@v1

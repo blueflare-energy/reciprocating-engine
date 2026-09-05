@@ -617,6 +617,329 @@ pub(crate) fn build_layer(
     Ok(t_out)
 }
 
+/// Per-graph tensors of the batched decode layer: one row per sequence,
+/// everything per-sequence carried in the outermost (fifth) dimension.
+pub(crate) struct SharedBatched {
+    /// RoPE rows per sequence, `[hd, 1, 1, 1, B]`.
+    pub sin: synTensor,
+    pub cos: synTensor,
+    /// Additive mask per sequence, `[keys, 1, 1, 1, B]`.
+    pub mask: synTensor,
+    /// Placement per sequence, `[1, keys, 1, 1, B]`.
+    pub place: synTensor,
+    pub capacity: usize,
+    pub batch: usize,
+}
+
+/// Append one decoder layer for `B` sequences of one token each, reading `x`
+/// (`[hidden, B]`) and returning the layer output in the same shape. The
+/// attention path is the 4-D batched one of [`build_layer`] with the
+/// sequence batch as a fifth, outermost dimension: the projections read the
+/// input as `[hidden, 1, 1, 1, B]` against weights `[hd, hidden, .., 1]`
+/// (broadcast over sequences), every sequence has its own RoPE row, cache
+/// slot, placement column and mask, and with one query row per sequence the
+/// context `[hd, 1, hpg, groups, B]` already is `[hidden, B]` in memory.
+/// Weights carry the same names and element counts as in [`build_layer`],
+/// so a runtime can share them with a prefill recipe.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) fn build_layer_batched(
+    gb: &mut Gb,
+    li: usize,
+    x: synTensor,
+    w: &LayerWeights<'_>,
+    sh: &SharedBatched,
+    hidden: usize,
+    inter: usize,
+) -> Result<synTensor> {
+    let (nh, nkv) = (w.n_heads, w.n_kv_heads);
+    assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
+    let hd_us = hidden / nh;
+    let hpg_us = nh / nkv;
+    let (h, i, hd, hpg, groups, keys, b) = (
+        hidden as u64,
+        inter as u64,
+        hd_us as u64,
+        hpg_us as u64,
+        nkv as u64,
+        sh.capacity as u64,
+        sh.batch as u64,
+    );
+    let bf = SYN_TYPE_BF16;
+    let p = |s: &str| format!("l{li}_{s}");
+    let blocks = |m: &[f32], cols: usize, per_group: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(hidden * cols);
+        for g in 0..nkv {
+            for j in 0..per_group {
+                let head = g * per_group + j;
+                for r in 0..hidden {
+                    v.extend_from_slice(&m[r * cols + head * hd_us..r * cols + (head + 1) * hd_us]);
+                }
+            }
+        }
+        v
+    };
+    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
+    let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
+    let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
+    let t_wq = gb.input(
+        &p("wq"),
+        &[hd, h, hpg, groups, 1],
+        &blocks(&wq_scaled, hidden, hpg_us),
+    )?;
+    let t_wk = gb.input(
+        &p("wk"),
+        &[hd, h, 1, groups, 1],
+        &blocks(w.wk, nkv * hd_us, 1),
+    )?;
+    let t_wv = gb.input(
+        &p("wv"),
+        &[hd, h, 1, groups, 1],
+        &blocks(w.wv, nkv * hd_us, 1),
+    )?;
+    let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
+    let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
+    let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
+    let t_wd = gb.input(&p("wd"), &[h, i], w.wd)?;
+
+    let t_n1 = gb.mid(&p("n1"), &[h, b], bf)?;
+    let t_inv1 = gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32)?;
+    let t_n1_5 = gb.mid(&p("n1_5"), &[h, 1, 1, 1, b], bf)?;
+    let t_q = gb.mid(&p("q"), &[hd, 1, hpg, groups, b], bf)?;
+    let t_qr = gb.mid(&p("qr"), &[hd, 1, hpg, groups, b], bf)?;
+    let t_k = gb.mid(&p("k"), &[hd, 1, 1, groups, b], bf)?;
+    let t_kr = gb.mid(&p("kr"), &[hd, 1, 1, groups, b], bf)?;
+    let t_v = gb.mid(&p("v"), &[hd, 1, 1, groups, b], bf)?;
+    let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
+    let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups, b])?;
+    let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups, b])?;
+    let kco = gb.scratch(&n_kco, &[hd, keys, 1, groups, b])?;
+    let vco = gb.scratch(&n_vco, &[hd, keys, 1, groups, b])?;
+    let t_kp = gb.mid(&p("kp"), &[hd, keys, 1, groups, b], bf)?;
+    let t_vp = gb.mid(&p("vp"), &[hd, keys, 1, groups, b], bf)?;
+    let t_sc = gb.mid(&p("scores"), &[keys, 1, hpg, groups, b], bf)?;
+    let t_masked = gb.mid(&p("masked"), &[keys, 1, hpg, groups, b], bf)?;
+    let t_pr = gb.mid(&p("probs"), &[keys, 1, hpg, groups, b], bf)?;
+    let t_at = gb.mid(&p("at"), &[hd, 1, hpg, groups, b], bf)?;
+    let t_attn = gb.mid(&p("attn"), &[h, b], bf)?;
+    let t_o = gb.mid(&p("o"), &[h, b], bf)?;
+    let t_h = gb.mid(&p("h"), &[h, b], bf)?;
+    let t_n2 = gb.mid(&p("n2"), &[h, b], bf)?;
+    let t_inv2 = gb.mid(&p("inv2"), &[1, b], SYN_TYPE_F32)?;
+    let t_gate = gb.mid(&p("gate"), &[i, b], bf)?;
+    let t_up = gb.mid(&p("up"), &[i, b], bf)?;
+    let t_sg = gb.mid(&p("sg"), &[i, b], bf)?;
+    let t_silu = gb.mid(&p("silu"), &[i, b], bf)?;
+    let t_gated = gb.mid(&p("gated"), &[i, b], bf)?;
+    let t_down = gb.mid(&p("down"), &[h, b], bf)?;
+    let t_out = gb.mid(&p("out"), &[h, b], bf)?;
+
+    let rms = RmsNormParams {
+        epsilon: w.eps,
+        fused_gamma_beta: false,
+        use_stages: false,
+        bwd_mode: 0,
+    };
+    let rope = RopeParams { offset: 0, mode: 0 };
+    let gemm = synGEMMParams {
+        transpose_a: false,
+        transpose_b: false,
+    };
+    let gemm_bt = synGEMMParams {
+        transpose_a: false,
+        transpose_b: true,
+    };
+    let sm = synSoftmaxParams { dim: 0 };
+    let prm = (
+        (&raw const rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    );
+    let pr = (
+        (&raw const rope).cast::<c_void>(),
+        core::mem::size_of::<RopeParams>() as u32,
+    );
+    let pg = (
+        (&raw const gemm).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    );
+    let pgt = (
+        (&raw const gemm_bt).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    );
+    let ps = (
+        (&raw const sm).cast::<c_void>(),
+        core::mem::size_of::<synSoftmaxParams>() as u32,
+    );
+    let none = (core::ptr::null::<c_void>(), 0u32);
+
+    gb.node(
+        "rms_norm_fwd_bf16",
+        &p("norm1"),
+        &[x, t_g1],
+        &[t_n1, t_inv1],
+        prm.0,
+        prm.1,
+    )?;
+    gb.node("reshape", &p("n1_5d"), &[t_n1], &[t_n1_5], none.0, none.1)?;
+    gb.node(
+        "batch_gemm",
+        &p("q_proj"),
+        &[t_n1_5, t_wq],
+        &[t_q],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("k_proj"),
+        &[t_n1_5, t_wk],
+        &[t_k],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("v_proj"),
+        &[t_n1_5, t_wv],
+        &[t_v],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "rope_st2_fwd_bf16",
+        &p("rope_q"),
+        &[t_q, sh.sin, sh.cos],
+        &[t_qr],
+        pr.0,
+        pr.1,
+    )?;
+    gb.node(
+        "rope_st2_fwd_bf16",
+        &p("rope_k"),
+        &[t_k, sh.sin, sh.cos],
+        &[t_kr],
+        pr.0,
+        pr.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("k_place"),
+        &[sh.place, t_kr],
+        &[t_kp],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("v_place"),
+        &[sh.place, t_v],
+        &[t_vp],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("k_cache"),
+        &[kci, t_kp],
+        &[kco],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("v_cache"),
+        &[vci, t_vp],
+        &[vco],
+        none.0,
+        none.1,
+    )?;
+    gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("mask"),
+        &[t_sc, sh.mask],
+        &[t_masked],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "softmax_fwd_bf16",
+        &p("softmax"),
+        &[t_masked],
+        &[t_pr],
+        ps.0,
+        ps.1,
+    )?;
+    gb.node("batch_gemm", &p("av"), &[t_pr, vco], &[t_at], pg.0, pg.1)?;
+    gb.node("reshape", &p("attn_2d"), &[t_at], &[t_attn], none.0, none.1)?;
+    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pg.0, pg.1)?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("res1"),
+        &[x, t_o],
+        &[t_h],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "rms_norm_fwd_bf16",
+        &p("norm2"),
+        &[t_h, t_g2],
+        &[t_n2, t_inv2],
+        prm.0,
+        prm.1,
+    )?;
+    gb.node(
+        "gemm",
+        &p("gate_proj"),
+        &[t_n2, t_wg],
+        &[t_gate],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pg.0, pg.1)?;
+    gb.node(
+        "sigmoid_fwd_bf16",
+        &p("sig"),
+        &[t_gate],
+        &[t_sg],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("silu"),
+        &[t_gate, t_sg],
+        &[t_silu],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gate_x_up"),
+        &[t_silu, t_up],
+        &[t_gated],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "gemm",
+        &p("down_proj"),
+        &[t_gated, t_wd],
+        &[t_down],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("res2"),
+        &[t_h, t_down],
+        &[t_out],
+        none.0,
+        none.1,
+    )?;
+    Ok(t_out)
+}
+
 /// Append the final RMSNorm and LM head reading `cur` and return the logits
 /// output `[vocab, tokens]` as the graph's read-back tensor.
 pub(crate) fn build_head(

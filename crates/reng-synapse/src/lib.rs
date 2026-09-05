@@ -116,6 +116,12 @@ mod cached;
 pub use cached::CachedModel;
 
 #[cfg(feature = "link-synapse")]
+mod batched;
+
+#[cfg(feature = "link-synapse")]
+pub use batched::BatchedModel;
+
+#[cfg(feature = "link-synapse")]
 mod probe;
 
 #[cfg(feature = "link-synapse")]
