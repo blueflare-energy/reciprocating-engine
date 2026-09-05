@@ -57,6 +57,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Verified on the roster: Llama-3.2-1B, Llama-3.2-3B, Llama-3.1-8B
   (llama3 rope scaling), Qwen3-4B, Qwen3-8B, phi-4 (14.7B: 72 tok/s at
   batch 1, 84% of the HBM ceiling).
+- OLMo-2 (`model_type: olmo2`): the two layer norms sit on the branch
+  outputs (`post_attention_layernorm` and `post_feedforward_layernorm`
+  normalise the attention and MLP outputs before the residual adds; no
+  input norm) and the q/k norms span the whole projection (one RMSNorm
+  over `n_heads * head_dim` before the head reshape, distinct from the
+  Qwen3 per-head form, chosen from the gain length). Verified
+  OLMo-2-0425-1B: 8/8 exact, prefill at 257 tokens 249/257 argmax
+  agreement with last-logits cosine 1.0000; b1 512 tok/s, b8 4205.
+  `reng-layer-test` uses the dense input generator of the other tests
+  and `reng-norm-test` takes `[scale] [eps]`.
 - `reng-argmax-test`: probes the argmax kernels with the row maximum
   planted at chosen positions and values, single and multi row.
 - `RENG_HOST_ARGMAX=1` makes `reng-generate` read the logits and take
@@ -120,6 +130,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- RMSNorm uses the epsilon from the config. The `rms_norm_fwd_bf16` node
+  was given the backward kernel's `ns_RmsNorm` parameter layout (epsilon
+  first), which the forward kernel ignores in favour of a fixed 1e-5; it
+  now gets `ns_LayerNormKernel::ParamsRmsNorm` (`epsValid`, `eps`, axis
+  bitmaps, `normalizedShapeDims`, `fastMath`). Invisible for real
+  activations (mean squares far above the epsilon) but exact now for
+  every model that says 1e-6; `reng-norm-test 256 256 0.001 <eps>` shows
+  the difference (rel_L2 0.54 before, 0.0027 after at eps 1e-6).
 - The device argmax of the LM head casts the logits to f32 first:
   `argmax_fwd_bf16` is wrong for a single-row input (the decode shape)
   whenever the row's maximum is small or negative, returning 0 or an

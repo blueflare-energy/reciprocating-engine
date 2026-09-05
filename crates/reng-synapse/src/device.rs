@@ -615,18 +615,28 @@ impl Device {
         // The kernel requires the inverse-RMS output in f32, shape [1, tokens].
         let t_inv = self.tensor_nd(graph, &n_inv, &[1, t], SYN_TYPE_F32, true)?;
 
+        // ns_LayerNormKernel::ParamsRmsNorm (perf_lib_layer_params.h); see
+        // model.rs for why the layout matters.
         #[repr(C)]
         struct RmsNormParams {
-            epsilon: f32,
-            fused_gamma_beta: bool,
-            use_stages: bool,
-            bwd_mode: i32,
+            eps_valid: u8,
+            _pad0: [u8; 3],
+            eps: f32,
+            norm_axis_bmp: i32,
+            param_axis_bmp: i32,
+            normalized_shape_dims: u32,
+            fast_math: u8,
+            _pad1: [u8; 3],
         }
         let params = RmsNormParams {
-            epsilon: eps,
-            fused_gamma_beta: false,
-            use_stages: false,
-            bwd_mode: 0,
+            eps_valid: 1,
+            _pad0: [0; 3],
+            eps,
+            norm_axis_bmp: 1,
+            param_axis_bmp: 1,
+            normalized_shape_dims: 1,
+            fast_math: 0,
+            _pad1: [0; 3],
         };
         let inputs = [t_x, t_g];
         let outputs = [t_y, t_inv];

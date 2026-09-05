@@ -1,7 +1,11 @@
 //! Verify our direct RMSNorm (`rms_norm_fwd_bf16`) against a CPU reference at a
 //! reliable size.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-norm-test -- [features] [tokens]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-norm-test -- [features] [tokens] [scale] [eps]`.
+//!
+//! `scale` multiplies the input (default 1) and `eps` is the norm's epsilon
+//! (default 1e-6); small scales probe the regime where the mean square
+//! approaches the epsilon.
 
 use reng_synapse::{rms_norm_bf16, rms_norm_cpu};
 
@@ -14,16 +18,23 @@ fn main() -> reng_core::Result<()> {
         .nth(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or(256usize);
-    let eps = 1e-6f32;
+    let scale: f32 = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1.0);
+    let eps: f32 = std::env::args()
+        .nth(4)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1e-6);
 
     let x: Vec<f32> = (0..features * tokens)
-        .map(|i| (((i * 7 + 3) % 29) as f32 - 14.0) / 7.0)
+        .map(|i| (((i * 7 + 3) % 29) as f32 - 14.0) / 7.0 * scale)
         .collect();
     let gamma: Vec<f32> = (0..features)
         .map(|i| 0.5 + ((i % 11) as f32) / 10.0)
         .collect();
 
-    println!("rms_norm: features={features}, tokens={tokens}");
+    println!("rms_norm: features={features}, tokens={tokens}, scale={scale}, eps={eps}");
     let hpu = rms_norm_bf16(&x, &gamma, features, tokens, eps)?;
     let cpu = rms_norm_cpu(&x, &gamma, features, tokens, eps);
 

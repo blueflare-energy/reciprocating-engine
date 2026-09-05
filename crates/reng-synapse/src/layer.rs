@@ -1,5 +1,5 @@
-//! One transformer decoder layer (pre-norm, RoPE, grouped-query attention,
-//! SwiGLU MLP) as a fused SynapseAI recipe. The graph construction and the
+//! One transformer decoder layer (pre-norm or OLMo-2 post-norm, RoPE,
+//! grouped-query attention, SwiGLU MLP) as a fused SynapseAI recipe. The graph construction and the
 //! launch/readback protocol live in `model.rs`; this module holds the layer's
 //! weight description and a single-layer convenience entry point built on the
 //! model runner so that every device path shares one readback implementation.
@@ -20,9 +20,18 @@ pub struct LayerWeights<'a> {
     /// config, and `n_heads * head_dim` (the q width) may differ from
     /// `hidden`.
     pub head_dim: usize,
-    /// RMSNorm gains, each length `hidden`.
+    /// RMSNorm gains, each length `hidden`. With `post_norm` off, `g1`
+    /// normalises the block input before attention and `g2` the residual
+    /// before the MLP (Llama); with it on, `g1` normalises the attention
+    /// output and `g2` the MLP output, each before its residual add
+    /// (OLMo-2's `post_attention_layernorm` and
+    /// `post_feedforward_layernorm`).
     pub g1: &'a [f32],
     pub g2: &'a [f32],
+    /// Norm placement: false for pre-norm (`n = rms(x); h = x + attn(n)`),
+    /// true for OLMo-2 post-norm (`h = x + rms(attn(x))`), as described at
+    /// `g1`.
+    pub post_norm: bool,
     /// Projections stored `[out, in]`, bf16: `wq` is `(n_heads * head_dim)
     /// x hidden` and `wo` is `hidden x (n_heads * head_dim)`; `wk`, `wv`
     /// are `(n_kv_heads * head_dim) x hidden`.
@@ -35,10 +44,14 @@ pub struct LayerWeights<'a> {
     pub bq: &'a [f32],
     pub bk: &'a [f32],
     pub bv: &'a [f32],
-    /// Qwen3-style per-head RMSNorm gains over `head_dim`, applied to every
-    /// query head (`qn`) and every key head (`kn`) after the projection
-    /// (and bias) and before RoPE; empty when the model has none. With
-    /// `qn` present the attention scale is folded into it, not into `wq`.
+    /// q/k RMSNorm gains applied after the projection and before RoPE;
+    /// empty when the model has none. Length `head_dim`: the Qwen3 form,
+    /// one RMS per query head (`qn`) and key head (`kn`), applied after
+    /// the bias when there is one. Length `n_heads * head_dim` for `qn`
+    /// and `n_kv_heads * head_dim` for `kn`: the OLMo-2 form, one RMS
+    /// over the whole projected width before the head reshape (both gains
+    /// take the same form, which excludes attention biases). With `qn`
+    /// present the attention scale is folded into it, not into `wq`.
     pub qn: &'a [f32],
     pub kn: &'a [f32],
     /// Whether this layer applies RoPE to q and k (false for the NoPE

@@ -97,6 +97,7 @@ fn main() -> reng_core::Result<()> {
             head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
+            post_norm: false,
             wq: &o.wq,
             wk: &o.wk,
             wv: &o.wv,

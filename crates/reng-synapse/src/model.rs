@@ -47,15 +47,37 @@ macro_rules! syn {
     }};
 }
 
+/// `ns_LayerNormKernel::ParamsRmsNorm` (`perf_lib_layer_params.h`), the
+/// params of the forward `rms_norm_fwd_*` guids. With the backward kernel's
+/// `ns_RmsNorm` layout (epsilon first) the node compiles and runs but
+/// applies a fixed epsilon of 1e-5 whatever is passed. Padding is explicit
+/// and zeroed: the raw bytes go into the recipe cache key.
 #[repr(C)]
 struct RmsNormParams {
-    epsilon: f32,
-    fused_gamma_beta: bool,
-    use_stages: bool,
-    /// Explicit padding, zeroed: the raw bytes go into the recipe cache
-    /// key, and compiler-inserted padding would carry stack garbage.
-    _pad: [u8; 2],
-    bwd_mode: i32,
+    eps_valid: u8,
+    _pad0: [u8; 3],
+    eps: f32,
+    /// Bitmaps of the normalised and parameter axes (CWHN); the FCD.
+    norm_axis_bmp: i32,
+    param_axis_bmp: i32,
+    normalized_shape_dims: u32,
+    fast_math: u8,
+    _pad1: [u8; 3],
+}
+
+impl RmsNormParams {
+    const fn new(eps: f32) -> Self {
+        Self {
+            eps_valid: 1,
+            _pad0: [0; 3],
+            eps,
+            norm_axis_bmp: 1,
+            param_axis_bmp: 1,
+            normalized_shape_dims: 1,
+            fast_math: 0,
+            _pad1: [0; 3],
+        }
+    }
 }
 
 #[repr(C)]
@@ -77,6 +99,43 @@ fn scaled_wq<'a>(w: &LayerWeights<'a>) -> std::borrow::Cow<'a, [u16]> {
     } else {
         std::borrow::Cow::Borrowed(w.wq)
     }
+}
+
+/// Whether the layer's q/k norms take the OLMo-2 full-width form (gains
+/// over the whole projection) rather than the Qwen3 per-head form; see
+/// [`LayerWeights::qn`].
+///
+/// # Panics
+///
+/// Panics if a gain has neither length, the two gains take different
+/// forms, or the full-width form meets attention biases.
+fn wide_qk_norm(w: &LayerWeights<'_>) -> bool {
+    if w.qn.is_empty() {
+        assert!(w.kn.is_empty(), "k_norm gain without a q_norm gain");
+        return false;
+    }
+    let hd = w.head_dim;
+    let (qw, kvd) = (w.n_heads * hd, w.n_kv_heads * hd);
+    let wide = w.qn.len() != hd;
+    if wide {
+        assert!(
+            w.qn.len() == qw && w.kn.len() == kvd,
+            "q/k norm gains of {} and {} for widths {qw} and {kvd}",
+            w.qn.len(),
+            w.kn.len()
+        );
+        assert!(
+            w.bq.is_empty(),
+            "full-width q/k norms with attention biases are not supported"
+        );
+    } else {
+        assert!(
+            w.kn.len() == hd,
+            "k_norm gain of {} for head_dim {hd}",
+            w.kn.len()
+        );
+    }
+    wide
 }
 
 fn env_on(name: &str) -> bool {
@@ -486,6 +545,11 @@ struct ScatterNdUpdateParams {
 /// per-head weight blocks, RoPE runs on the batched tensors with one 2-D
 /// table, and the per-head outputs go through one transpose back to
 /// `[hidden, tokens]` for the output projection.
+///
+/// With `w.post_norm` the two layer norms move from the branch inputs to
+/// the branch outputs (`h = x + rms(attn(x))`, `y = h + rms(mlp(h))`), and
+/// full-width q/k norm gains (see [`LayerWeights::qn`]) are applied to the
+/// flat `[width, tokens]` projections before the head reshape.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn build_layer<'a>(
     gb: &mut Gb<'a>,
@@ -527,11 +591,15 @@ pub(crate) fn build_layer<'a>(
     // batch_gemm over per-head blocks runs each head as an N = hd gemm at
     // a fraction of the rate (12% of a 1.7B prefill), so the plain form is
     // the default and diagnostic `RENG_HEAD_BLOCKS` keeps the per-head one.
-    let head_blocks = env_on("RENG_HEAD_BLOCKS");
+    let post_norm = w.post_norm;
+    // Full-width q/k norms run on the flat 2-D projections, which the
+    // per-head projection form does not produce.
+    let wide_qk = wide_qk_norm(w);
+    let head_blocks = env_on("RENG_HEAD_BLOCKS") && !wide_qk;
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    // With a per-head q norm the scale cannot ride on `wq` (the norm would
-    // divide it out again); it goes on the norm gain instead.
+    // With a q norm the scale cannot ride on `wq` (the norm would divide
+    // it out again); it goes on the norm gain instead.
     let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
     let wq_scaled = scaled_wq(w);
     let (t_wq, t_wk, t_wv) = if head_blocks {
@@ -568,8 +636,14 @@ pub(crate) fn build_layer<'a>(
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
     let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
 
-    let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
-    let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
+    // The pre-norm tensors; a post-norm layer feeds the block input to the
+    // projections and normalises the branch outputs instead (below).
+    let t_n1 = (!post_norm)
+        .then(|| gb.mid(&p("n1"), &[h, t], bf))
+        .transpose()?;
+    let t_inv1 = (!post_norm)
+        .then(|| gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32))
+        .transpose()?;
     let t_n1_4 = gb.mid(&p("n1_4"), &[h, t, 1, 1], bf)?;
     let t_q = gb.mid(&p("q"), &[hd, t, hpg, groups], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, t, 1, groups], bf)?;
@@ -582,8 +656,12 @@ pub(crate) fn build_layer<'a>(
     let t_attn = gb.mid(&p("attn"), &[qw, t], bf)?;
     let t_o = gb.mid(&p("o"), &[h, t], bf)?;
     let t_h = gb.mid(&p("h"), &[h, t], bf)?;
-    let t_n2 = gb.mid(&p("n2"), &[h, t], bf)?;
-    let t_inv2 = gb.mid(&p("inv2"), &[1, t], SYN_TYPE_F32)?;
+    let t_n2 = (!post_norm)
+        .then(|| gb.mid(&p("n2"), &[h, t], bf))
+        .transpose()?;
+    let t_inv2 = (!post_norm)
+        .then(|| gb.mid(&p("inv2"), &[1, t], SYN_TYPE_F32))
+        .transpose()?;
     let t_gate = gb.mid(&p("gate"), &[i, t], bf)?;
     let t_up = gb.mid(&p("up"), &[i, t], bf)?;
     let t_sg = gb.mid(&p("sg"), &[i, t], bf)?;
@@ -595,13 +673,7 @@ pub(crate) fn build_layer<'a>(
         None => gb.mid(&p("out"), &[h, t], bf)?,
     };
 
-    let rms = RmsNormParams {
-        epsilon: w.eps,
-        fused_gamma_beta: false,
-        use_stages: false,
-        _pad: [0; 2],
-        bwd_mode: 0,
-    };
+    let rms = RmsNormParams::new(w.eps);
     let rope = RopeParams { offset: 0, mode: 0 };
     let gemm = synGEMMParams {
         transpose_a: false,
@@ -647,16 +719,24 @@ pub(crate) fn build_layer<'a>(
     );
     let none = (core::ptr::null::<c_void>(), 0u32);
 
-    gb.node(
-        "rms_norm_fwd_bf16",
-        &p("norm1"),
-        &[x, t_g1],
-        &[t_n1, t_inv1],
-        prm.0,
-        prm.1,
-    )?;
+    // What the projections read: the normalised block input, or the block
+    // input itself when the norms sit on the branch outputs.
+    let t_ain = match (t_n1, t_inv1) {
+        (Some(n1), Some(inv1)) => {
+            gb.node(
+                "rms_norm_fwd_bf16",
+                &p("norm1"),
+                &[x, t_g1],
+                &[n1, inv1],
+                prm.0,
+                prm.1,
+            )?;
+            n1
+        }
+        _ => x,
+    };
     if head_blocks {
-        gb.node("reshape", &p("n1_4d"), &[t_n1], &[t_n1_4], none.0, none.1)?;
+        gb.node("reshape", &p("n1_4d"), &[t_ain], &[t_n1_4], none.0, none.1)?;
         gb.node(
             "batch_gemm",
             &p("q_proj"),
@@ -693,10 +773,22 @@ pub(crate) fn build_layer<'a>(
             (&raw const tr_in).cast::<c_void>(),
             core::mem::size_of::<TransposeParams>() as u32,
         );
-        for (name, wt, n_out, heads, out) in [
-            ("q", t_wq, qw, hpg * groups, t_q),
-            ("k", t_wk, hd * groups, groups, t_k),
-            ("v", t_wv, hd * groups, groups, t_v),
+        // Full-width q/k norm gains (OLMo-2), applied to the flat
+        // projections before the head reshape; the scale rides on the q
+        // gain, as in the per-head form.
+        let (t_qn_w, t_kn_w) = if wide_qk {
+            let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+            (
+                Some(gb.input(&p("qn"), &[qw], &qn_scaled)?),
+                Some(gb.input(&p("kn"), &[hd * groups], w.kn)?),
+            )
+        } else {
+            (None, None)
+        };
+        for (name, wt, n_out, heads, out, gain) in [
+            ("q", t_wq, qw, hpg * groups, t_q, t_qn_w),
+            ("k", t_wk, hd * groups, groups, t_k, t_kn_w),
+            ("v", t_wv, hd * groups, groups, t_v, None),
         ] {
             let flat = gb.mid(&p(&format!("{name}2")), &[n_out, t], bf)?;
             let by_head = gb.mid(&p(&format!("{name}_heads")), &[hd, heads, t], bf)?;
@@ -704,11 +796,27 @@ pub(crate) fn build_layer<'a>(
             gb.node(
                 "gemm",
                 &p(&format!("{name}_proj")),
-                &[t_n1, wt],
+                &[t_ain, wt],
                 &[flat],
                 pgt.0,
                 pgt.1,
             )?;
+            let flat = match gain {
+                Some(g) => {
+                    let normed = gb.mid(&p(&format!("{name}2n")), &[n_out, t], bf)?;
+                    let inv = gb.mid(&p(&format!("{name}2inv")), &[1, t], SYN_TYPE_F32)?;
+                    gb.node(
+                        "rms_norm_fwd_bf16",
+                        &p(&format!("{name}_norm")),
+                        &[flat, g],
+                        &[normed, inv],
+                        prm.0,
+                        prm.1,
+                    )?;
+                    normed
+                }
+                None => flat,
+            };
             gb.node(
                 "reshape",
                 &p(&format!("{name}_3d")),
@@ -775,7 +883,7 @@ pub(crate) fn build_layer<'a>(
     // Qwen3 q/k norms (when present): an RMSNorm over the head dim (the
     // FCD) of every query and key head, the gain `[hd]` broadcast over the
     // outer dims, exactly like the layer norms over `[hidden, t]`.
-    let (t_q, t_k) = if w.qn.is_empty() {
+    let (t_q, t_k) = if w.qn.is_empty() || wide_qk {
         (t_q, t_k)
     } else {
         let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
@@ -923,31 +1031,56 @@ pub(crate) fn build_layer<'a>(
         none.1,
     )?;
     gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pgt.0, pgt.1)?;
+    // Post-norm: the attention output is normalised (g1) before it joins
+    // the residual stream.
+    let t_res1 = if post_norm {
+        let t_on = gb.mid(&p("on"), &[h, t], bf)?;
+        let t_oinv = gb.mid(&p("oinv"), &[1, t], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("norm1"),
+            &[t_o, t_g1],
+            &[t_on, t_oinv],
+            prm.0,
+            prm.1,
+        )?;
+        t_on
+    } else {
+        t_o
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
-        &[x, t_o],
+        &[x, t_res1],
         &[t_h],
         none.0,
         none.1,
     )?;
-    gb.node(
-        "rms_norm_fwd_bf16",
-        &p("norm2"),
-        &[t_h, t_g2],
-        &[t_n2, t_inv2],
-        prm.0,
-        prm.1,
-    )?;
+    // What the MLP reads: the normalised residual, or the residual itself
+    // when g2 normalises the MLP output instead (below).
+    let t_min = match (t_n2, t_inv2) {
+        (Some(n2), Some(inv2)) => {
+            gb.node(
+                "rms_norm_fwd_bf16",
+                &p("norm2"),
+                &[t_h, t_g2],
+                &[n2, inv2],
+                prm.0,
+                prm.1,
+            )?;
+            n2
+        }
+        _ => t_h,
+    };
     gb.node(
         "gemm",
         &p("gate_proj"),
-        &[t_n2, t_wg],
+        &[t_min, t_wg],
         &[t_gate],
         pgt.0,
         pgt.1,
     )?;
-    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("up_proj"), &[t_min, t_wu], &[t_up], pgt.0, pgt.1)?;
     gb.node(
         "sigmoid_fwd_bf16",
         &p("sig"),
@@ -980,10 +1113,26 @@ pub(crate) fn build_layer<'a>(
         pgt.0,
         pgt.1,
     )?;
+    // Post-norm: the MLP output is normalised (g2) before the residual add.
+    let t_res2 = if post_norm {
+        let t_dn = gb.mid(&p("dn"), &[h, t], bf)?;
+        let t_dinv = gb.mid(&p("dinv"), &[1, t], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("norm2"),
+            &[t_down, t_g2],
+            &[t_dn, t_dinv],
+            prm.0,
+            prm.1,
+        )?;
+        t_dn
+    } else {
+        t_down
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res2"),
-        &[t_h, t_down],
+        &[t_h, t_res2],
         &[t_out],
         none.0,
         none.1,
@@ -1045,6 +1194,8 @@ pub(crate) fn build_layer_batched<'a>(
     let p = |s: &str| format!("l{li}_{s}");
     // See `build_layer`: the scale rides on the q norm gain when there is one.
     let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let post_norm = w.post_norm;
+    let wide_qk = wide_qk_norm(w);
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
     // With one row per sequence the projections are plain gemms with
@@ -1069,8 +1220,13 @@ pub(crate) fn build_layer_batched<'a>(
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
     let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
 
-    let t_n1 = gb.mid(&p("n1"), &[h, b], bf)?;
-    let t_inv1 = gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32)?;
+    // Pre-norm tensors (see `build_layer`).
+    let t_n1 = (!post_norm)
+        .then(|| gb.mid(&p("n1"), &[h, b], bf))
+        .transpose()?;
+    let t_inv1 = (!post_norm)
+        .then(|| gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32))
+        .transpose()?;
     let t_q2 = gb.mid(&p("q2"), &[qw, b], bf)?;
     let t_k2 = gb.mid(&p("k2"), &[hd * groups, b], bf)?;
     let t_v2 = gb.mid(&p("v2"), &[hd * groups, b], bf)?;
@@ -1091,8 +1247,12 @@ pub(crate) fn build_layer_batched<'a>(
     let t_attn = gb.mid(&p("attn"), &[qw, b], bf)?;
     let t_o = gb.mid(&p("o"), &[h, b], bf)?;
     let t_h = gb.mid(&p("h"), &[h, b], bf)?;
-    let t_n2 = gb.mid(&p("n2"), &[h, b], bf)?;
-    let t_inv2 = gb.mid(&p("inv2"), &[1, b], SYN_TYPE_F32)?;
+    let t_n2 = (!post_norm)
+        .then(|| gb.mid(&p("n2"), &[h, b], bf))
+        .transpose()?;
+    let t_inv2 = (!post_norm)
+        .then(|| gb.mid(&p("inv2"), &[1, b], SYN_TYPE_F32))
+        .transpose()?;
     let t_gate = gb.mid(&p("gate"), &[i, b], bf)?;
     let t_up = gb.mid(&p("up"), &[i, b], bf)?;
     let t_sg = gb.mid(&p("sg"), &[i, b], bf)?;
@@ -1101,13 +1261,7 @@ pub(crate) fn build_layer_batched<'a>(
     let t_down = gb.mid(&p("down"), &[h, b], bf)?;
     let t_out = gb.mid(&p("out"), &[h, b], bf)?;
 
-    let rms = RmsNormParams {
-        epsilon: w.eps,
-        fused_gamma_beta: false,
-        use_stages: false,
-        _pad: [0; 2],
-        bwd_mode: 0,
-    };
+    let rms = RmsNormParams::new(w.eps);
     let rope = RopeParams { offset: 0, mode: 0 };
     let gemm = synGEMMParams {
         transpose_a: false,
@@ -1145,17 +1299,53 @@ pub(crate) fn build_layer_batched<'a>(
     );
     let none = (core::ptr::null::<c_void>(), 0u32);
 
-    gb.node(
-        "rms_norm_fwd_bf16",
-        &p("norm1"),
-        &[x, t_g1],
-        &[t_n1, t_inv1],
-        prm.0,
-        prm.1,
-    )?;
-    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q2], pgt.0, pgt.1)?;
-    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k2], pgt.0, pgt.1)?;
-    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v2], pgt.0, pgt.1)?;
+    let t_ain = match (t_n1, t_inv1) {
+        (Some(n1), Some(inv1)) => {
+            gb.node(
+                "rms_norm_fwd_bf16",
+                &p("norm1"),
+                &[x, t_g1],
+                &[n1, inv1],
+                prm.0,
+                prm.1,
+            )?;
+            n1
+        }
+        _ => x,
+    };
+    gb.node("gemm", &p("q_proj"), &[t_ain, t_wq], &[t_q2], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("k_proj"), &[t_ain, t_wk], &[t_k2], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("v_proj"), &[t_ain, t_wv], &[t_v2], pgt.0, pgt.1)?;
+    // Full-width q/k norms (OLMo-2) on the flat projections, as in
+    // `build_layer`; the inputs carry the same names and sizes.
+    let (t_q2, t_k2) = if wide_qk {
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let t_qn = gb.input(&p("qn"), &[qw], &qn_scaled)?;
+        let t_kn = gb.input(&p("kn"), &[hd * groups], w.kn)?;
+        let q2n = gb.mid(&p("q2n"), &[qw, b], bf)?;
+        let q2inv = gb.mid(&p("q2inv"), &[1, b], SYN_TYPE_F32)?;
+        let k2n = gb.mid(&p("k2n"), &[hd * groups, b], bf)?;
+        let k2inv = gb.mid(&p("k2inv"), &[1, b], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("q_norm"),
+            &[t_q2, t_qn],
+            &[q2n, q2inv],
+            prm.0,
+            prm.1,
+        )?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("k_norm"),
+            &[t_k2, t_kn],
+            &[k2n, k2inv],
+            prm.0,
+            prm.1,
+        )?;
+        (q2n, k2n)
+    } else {
+        (t_q2, t_k2)
+    };
     gb.node("reshape", &p("q_5d"), &[t_q2], &[t_q], none.0, none.1)?;
     gb.node("reshape", &p("k_5d"), &[t_k2], &[t_k], none.0, none.1)?;
     gb.node("reshape", &p("v_5d"), &[t_v2], &[t_v], none.0, none.1)?;
@@ -1197,7 +1387,7 @@ pub(crate) fn build_layer_batched<'a>(
         (qb, kb, vb)
     };
     // Qwen3 q/k norms (when present), as in `build_layer`.
-    let (t_q, t_k) = if w.qn.is_empty() {
+    let (t_q, t_k) = if w.qn.is_empty() || wide_qk {
         (t_q, t_k)
     } else {
         let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
@@ -1300,31 +1490,53 @@ pub(crate) fn build_layer_batched<'a>(
     gb.node("batch_gemm", &p("av"), &[t_pr, vco], &[t_at], pg.0, pg.1)?;
     gb.node("reshape", &p("attn_2d"), &[t_at], &[t_attn], none.0, none.1)?;
     gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pgt.0, pgt.1)?;
+    // Post-norm branches, as in `build_layer`.
+    let t_res1 = if post_norm {
+        let t_on = gb.mid(&p("on"), &[h, b], bf)?;
+        let t_oinv = gb.mid(&p("oinv"), &[1, b], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("norm1"),
+            &[t_o, t_g1],
+            &[t_on, t_oinv],
+            prm.0,
+            prm.1,
+        )?;
+        t_on
+    } else {
+        t_o
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
-        &[x, t_o],
+        &[x, t_res1],
         &[t_h],
         none.0,
         none.1,
     )?;
-    gb.node(
-        "rms_norm_fwd_bf16",
-        &p("norm2"),
-        &[t_h, t_g2],
-        &[t_n2, t_inv2],
-        prm.0,
-        prm.1,
-    )?;
+    let t_min = match (t_n2, t_inv2) {
+        (Some(n2), Some(inv2)) => {
+            gb.node(
+                "rms_norm_fwd_bf16",
+                &p("norm2"),
+                &[t_h, t_g2],
+                &[n2, inv2],
+                prm.0,
+                prm.1,
+            )?;
+            n2
+        }
+        _ => t_h,
+    };
     gb.node(
         "gemm",
         &p("gate_proj"),
-        &[t_n2, t_wg],
+        &[t_min, t_wg],
         &[t_gate],
         pgt.0,
         pgt.1,
     )?;
-    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("up_proj"), &[t_min, t_wu], &[t_up], pgt.0, pgt.1)?;
     gb.node(
         "sigmoid_fwd_bf16",
         &p("sig"),
@@ -1357,10 +1569,25 @@ pub(crate) fn build_layer_batched<'a>(
         pgt.0,
         pgt.1,
     )?;
+    let t_res2 = if post_norm {
+        let t_dn = gb.mid(&p("dn"), &[h, b], bf)?;
+        let t_dinv = gb.mid(&p("dinv"), &[1, b], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("norm2"),
+            &[t_down, t_g2],
+            &[t_dn, t_dinv],
+            prm.0,
+            prm.1,
+        )?;
+        t_dn
+    } else {
+        t_down
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res2"),
-        &[t_h, t_down],
+        &[t_h, t_res2],
         &[t_out],
         none.0,
         none.1,
@@ -1409,13 +1636,7 @@ pub(crate) fn build_head<'a>(
     } else {
         t_logits
     };
-    let rms = RmsNormParams {
-        epsilon: m.layers[0].eps,
-        fused_gamma_beta: false,
-        use_stages: false,
-        _pad: [0; 2],
-        bwd_mode: 0,
-    };
+    let rms = RmsNormParams::new(m.layers[0].eps);
     gb.node(
         "rms_norm_fwd_bf16",
         "final_norm",
@@ -1715,23 +1936,31 @@ pub fn layer_cpu(
         }
     };
 
-    // Per-head RMSNorm over `hd` of every head of a `[tokens, stride]`
-    // tensor (Qwen3 q/k norms), in place; a no-op without a gain.
+    // q/k RMSNorm of a `[tokens, stride]` tensor, in place: over every
+    // `hd`-wide head with a `[hd]` gain (Qwen3), or over the whole row with
+    // a `[stride]` gain (OLMo-2); a no-op without a gain.
     let head_norm = |m: &mut [f32], stride: usize, g: &[f32]| {
         if g.is_empty() {
             return;
         }
+        let width = g.len();
         for row in m.chunks_exact_mut(stride) {
-            for head in row.chunks_exact_mut(hd) {
-                let ms = head.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+            for part in row.chunks_exact_mut(width) {
+                let ms = part.iter().map(|v| v * v).sum::<f32>() / width as f32;
                 let inv = 1.0 / (ms + w.eps).sqrt();
-                for (v, gain) in head.iter_mut().zip(g) {
+                for (v, gain) in part.iter_mut().zip(g) {
                     *v *= inv * gain;
                 }
             }
         }
     };
-    let n1 = rmsnorm(x, w.g1);
+    // Pre-norm feeds the normalised input to attention; post-norm (OLMo-2)
+    // feeds the input itself and normalises each branch's output instead.
+    let n1 = if w.post_norm {
+        x.to_vec()
+    } else {
+        rmsnorm(x, w.g1)
+    };
     // The scale rides on `wq` (and `bq`), or on the q norm gain when the
     // model has one (the norm would divide it out of `wq`).
     let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
@@ -1795,8 +2024,13 @@ pub fn layer_cpu(
         }
     }
     let o = matmul(&attn, w.wo, qw, hidden);
+    let o = if w.post_norm { rmsnorm(&o, w.g1) } else { o };
     let hres: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
-    let n2 = rmsnorm(&hres, w.g2);
+    let n2 = if w.post_norm {
+        hres.clone()
+    } else {
+        rmsnorm(&hres, w.g2)
+    };
     let gate = matmul(&n2, w.wg, hidden, inter);
     let up = matmul(&n2, w.wu, hidden, inter);
     let gated: Vec<f32> = gate
@@ -1805,6 +2039,11 @@ pub fn layer_cpu(
         .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
         .collect();
     let down = matmul(&gated, w.wd, inter, hidden);
+    let down = if w.post_norm {
+        rmsnorm(&down, w.g2)
+    } else {
+        down
+    };
     hres.iter().zip(&down).map(|(a, b)| a + b).collect()
 }
 

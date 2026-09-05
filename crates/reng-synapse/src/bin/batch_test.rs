@@ -3,7 +3,10 @@
 //! time, then advanced together for several steps; every sequence's step
 //! logits must match the CPU reference over that sequence alone.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps] [batch]`
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps] [batch] [post_norm] [qk_norm]`
+//!
+//! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
+//! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
 
 use reng_synapse::{BatchedModel, LayerWeights, ModelWeights, model_forward_cpu, to_bf16};
 use std::time::Instant;
@@ -26,6 +29,8 @@ fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> 
 struct Owned {
     g1: Vec<f32>,
     g2: Vec<f32>,
+    qn: Vec<f32>,
+    kn: Vec<f32>,
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
@@ -64,6 +69,8 @@ fn main() -> reng_core::Result<()> {
     // Prompt lengths: one launch, two launches, exactly one full block;
     // repeated cyclically up to `batch` sequences (10th arg, default 3).
     let batch = arg(10, 3usize);
+    let post_norm = arg(11, 0usize) != 0;
+    let qk_norm = arg(12, 0usize);
     let prompts: Vec<usize> = (0..batch)
         .map(|b| [40usize, rows + 44, rows][b % 3])
         .collect();
@@ -77,6 +84,18 @@ fn main() -> reng_core::Result<()> {
     let half = hd / 2;
     let fan = 1.0 / (hidden as f32).sqrt();
     let fan_i = 1.0 / (inter as f32).sqrt();
+    // q/k norm gains: none, per head (`hd`, Qwen3) or over the whole
+    // projection (OLMo-2).
+    let gain = |n: usize, base: f32, step: f32, l: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| base + (((i + l) % 11) as f32) * step)
+            .collect()
+    };
+    let (qn_len, kn_len) = match qk_norm {
+        0 => (0, 0),
+        1 => (hd, hd),
+        _ => (hidden, kvd),
+    };
 
     let rope = |positions: usize| {
         let mut sin = vec![0.0f32; positions * hd];
@@ -100,6 +119,8 @@ fn main() -> reng_core::Result<()> {
             g2: (0..hidden)
                 .map(|i| 1.1 - (((i + 2 * l) % 5) as f32) * 0.04)
                 .collect(),
+            qn: gain(qn_len, 0.95, 0.01, l),
+            kn: gain(kn_len, 1.05, -0.01, l + 1),
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
@@ -117,6 +138,7 @@ fn main() -> reng_core::Result<()> {
             head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
+            post_norm,
             wq: &o.wq,
             wk: &o.wk,
             wv: &o.wv,
@@ -124,8 +146,8 @@ fn main() -> reng_core::Result<()> {
             bq: &[],
             bk: &[],
             bv: &[],
-            qn: &[],
-            kn: &[],
+            qn: &o.qn,
+            kn: &o.kn,
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,
@@ -148,7 +170,7 @@ fn main() -> reng_core::Result<()> {
         .map(|b| seq(longest * hidden, 7 + b, 3 + 2 * b, 23, 1.0))
         .collect();
     println!(
-        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}"
+        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}"
     );
 
     let t0 = Instant::now();

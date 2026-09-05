@@ -13,6 +13,11 @@
 //! by the host gather, the attention multiplier is the per-layer attention
 //! scale, and the residual multiplier and `1/logits_scaling` are folded
 //! into `o_proj`/`down_proj` and the LM head at load.
+//! loaded when present (Llama has neither). OLMo-2 (`model_type: olmo2`)
+//! keeps its two layer norms on the branch outputs (`post_attention_layernorm`
+//! and `post_feedforward_layernorm`; no `input_layernorm`) and its q/k norms
+//! span the whole projection; they map onto `g1`/`g2` with `post_norm` set
+//! and the full-width `qn`/`kn` form of `LayerWeights`.
 
 use reng_core::{Error, Result};
 use reng_synapse::{bf16_to_f32, f32_to_bf16, scale_bf16};
@@ -27,6 +32,10 @@ fn default_theta() -> f32 {
 /// The subset of a HF Llama-style `config.json` the engine needs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlamaConfig {
+    /// HF `model_type`; `olmo2` selects the post-norm layer layout (see
+    /// [`LlamaConfig::post_norm`]). Absent from some older configs.
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
@@ -52,8 +61,6 @@ pub struct LlamaConfig {
     /// a NoPE layer; absent means every layer uses RoPE.
     #[serde(default)]
     pub no_rope_layers: Option<Vec<u8>>,
-    #[serde(default)]
-    pub model_type: Option<String>,
     /// Sliding window in positions (Phi-3, Mistral; Qwen2 only with
     /// `use_sliding_window`).
     #[serde(default)]
@@ -164,10 +171,20 @@ impl LlamaConfig {
         self.attention_multiplier
             .unwrap_or_else(|| 1.0 / (self.head_dim() as f32).sqrt())
     }
+
+    /// Whether the layers normalise their branch outputs instead of their
+    /// inputs (OLMo-2: `h = x + norm(attn(x))`, `y = h + norm(mlp(h))`).
+    #[must_use]
+    pub fn post_norm(&self) -> bool {
+        self.model_type.as_deref() == Some("olmo2")
+    }
 }
 
 /// One layer's weights in engine layout (`[in, out]` projections), owned.
 pub struct LayerTensors {
+    /// The layer's two RMSNorm gains: `input_layernorm` and
+    /// `post_attention_layernorm` (pre-norm), or `post_attention_layernorm`
+    /// and `post_feedforward_layernorm` (OLMo-2 post-norm).
     pub g1: Vec<f32>,
     pub g2: Vec<f32>,
     /// Projections as stored, bf16 `[out, in]`; `wo` (and `wd`) carry the
@@ -180,8 +197,9 @@ pub struct LayerTensors {
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
-    /// Qwen3 q/k norm gains, each `head_dim`; empty when the checkpoint
-    /// has none.
+    /// q/k norm gains: each `head_dim` (Qwen3, per head) or the full
+    /// projection widths (OLMo-2: `n_heads * head_dim` and `n_kv_heads *
+    /// head_dim`); empty when the checkpoint has none.
     pub qn: Vec<f32>,
     pub kn: Vec<f32>,
     pub wg: Vec<u16>,
@@ -286,15 +304,16 @@ fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// A 1-D tensor that a checkpoint may omit (attention biases, q/k norm
-/// gains): empty when absent, checked for length when present.
-fn optional_vec(st: &SafeTensors<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
+/// gains): empty when absent, checked against the accepted lengths when
+/// present.
+fn optional_vec(st: &SafeTensors<'_>, name: &str, lens: &[usize]) -> Result<Vec<f32>> {
     if st.tensor(name).is_err() {
         return Ok(Vec::new());
     }
     let (v, shape) = tensor_f32(st, name)?;
-    if shape != [len] {
+    if shape.len() != 1 || !lens.contains(&shape[0]) {
         return Err(Error::Other(format!(
-            "tensor {name}: shape {shape:?}, expected [{len}]"
+            "tensor {name}: shape {shape:?}, expected one of {lens:?}"
         )));
     }
     Ok(v)
@@ -407,6 +426,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             "embed_tokens shape {eshape:?}, expected [{v}, {h}]"
         )));
     }
+    let post_norm = cfg.post_norm();
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for l in 0..cfg.num_hidden_layers {
         let p = |s: &str| format!("model.layers.{l}.{s}");
@@ -462,9 +482,22 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
                 lin("mlp.up_proj.weight", i, h)?,
             )
         };
-        let opt = |name: &str, len: usize| -> Result<Vec<f32>> {
+        let opt = |name: &str, lens: &[usize]| -> Result<Vec<f32>> {
             let n = p(name);
-            optional_vec(st(&n), &n, len)
+            optional_vec(st(&n), &n, lens)
+        };
+        // OLMo-2 has no input norm: its two gains normalise the attention
+        // and MLP outputs (see `LayerWeights::post_norm`).
+        let (g1, g2) = if post_norm {
+            (
+                g("post_attention_layernorm.weight")?,
+                g("post_feedforward_layernorm.weight")?,
+            )
+        } else {
+            (
+                g("input_layernorm.weight")?,
+                g("post_attention_layernorm.weight")?,
+            )
         };
         // Granite: `x + branch * residual_multiplier` for both branches;
         // the scalar rides on the branches' output projections.
@@ -475,17 +508,18 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             }
         };
         layers.push(LayerTensors {
-            g1: g("input_layernorm.weight")?,
-            g2: g("post_attention_layernorm.weight")?,
+            g1,
+            g2,
             wq,
             wk,
             wv,
             wo: residual(lin("self_attn.o_proj.weight", h, qd)?),
-            bq: opt("self_attn.q_proj.bias", qd)?,
-            bk: opt("self_attn.k_proj.bias", kvd)?,
-            bv: opt("self_attn.v_proj.bias", kvd)?,
-            qn: opt("self_attn.q_norm.weight", hd)?,
-            kn: opt("self_attn.k_norm.weight", hd)?,
+            bq: opt("self_attn.q_proj.bias", &[qd])?,
+            bk: opt("self_attn.k_proj.bias", &[kvd])?,
+            bv: opt("self_attn.v_proj.bias", &[kvd])?,
+            // Per head (Qwen3) or over the whole projection (OLMo-2).
+            qn: opt("self_attn.q_norm.weight", &[hd, qd])?,
+            kn: opt("self_attn.k_norm.weight", &[hd, kvd])?,
             wg,
             wu,
             wd: residual(lin("mlp.down_proj.weight", h, i)?),
@@ -650,6 +684,7 @@ fn layer_views<'a>(
             head_dim: hd,
             g1: &l.g1,
             g2: &l.g2,
+            post_norm: cfg.post_norm(),
             wq: &l.wq,
             wk: &l.wk,
             wv: &l.wv,

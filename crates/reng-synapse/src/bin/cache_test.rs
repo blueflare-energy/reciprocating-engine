@@ -2,7 +2,10 @@
 //! compiled recipe (a full block, a partial block, then single rows) must
 //! produce the same logits as the CPU reference over the whole sequence.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size] [decode_rows]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size] [decode_rows] [post_norm] [qk_norm]`.
+//!
+//! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
+//! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
 
 use reng_synapse::{CachedModel, LayerWeights, ModelWeights, model_forward_cpu, to_bf16};
 use std::time::Instant;
@@ -27,6 +30,8 @@ fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> 
 struct Owned {
     g1: Vec<f32>,
     g2: Vec<f32>,
+    qn: Vec<f32>,
+    kn: Vec<f32>,
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
@@ -67,6 +72,8 @@ fn main() -> reng_core::Result<()> {
     let tail_size = arg(10, 1usize);
     // A separate decode recipe for blocks of up to this many rows (0: none).
     let decode_rows = arg(11, 0usize);
+    let post_norm = arg(12, 0usize) != 0;
+    let qk_norm = arg(13, 0usize);
     let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
         tokens <= capacity,
@@ -77,6 +84,18 @@ fn main() -> reng_core::Result<()> {
     let half = hd / 2;
     let fan = 1.0 / (hidden as f32).sqrt();
     let fan_i = 1.0 / (inter as f32).sqrt();
+    // q/k norm gains: none, per head (`hd`, Qwen3) or over the whole
+    // projection (OLMo-2).
+    let gain = |n: usize, base: f32, step: f32, l: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| base + (((i + l) % 11) as f32) * step)
+            .collect()
+    };
+    let (qn_len, kn_len) = match qk_norm {
+        0 => (0, 0),
+        1 => (hd, hd),
+        _ => (hidden, kvd),
+    };
 
     let x = seq(tokens * hidden, 7, 3, 23, 1.0);
     let rope = |positions: usize| {
@@ -102,6 +121,8 @@ fn main() -> reng_core::Result<()> {
             g2: (0..hidden)
                 .map(|i| 1.1 - (((i + 2 * l) % 5) as f32) * 0.04)
                 .collect(),
+            qn: gain(qn_len, 0.95, 0.01, l),
+            kn: gain(kn_len, 1.05, -0.01, l + 1),
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
@@ -119,6 +140,7 @@ fn main() -> reng_core::Result<()> {
             head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
+            post_norm,
             wq: &o.wq,
             wk: &o.wk,
             wv: &o.wv,
@@ -126,8 +148,8 @@ fn main() -> reng_core::Result<()> {
             bq: &[],
             bk: &[],
             bv: &[],
-            qn: &[],
-            kn: &[],
+            qn: &o.qn,
+            kn: &o.kn,
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,
@@ -146,7 +168,7 @@ fn main() -> reng_core::Result<()> {
         lm_head: &lm_head,
     };
     println!(
-        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}"
+        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}"
     );
 
     let t0 = Instant::now();
