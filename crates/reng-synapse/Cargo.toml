@@ -116,3 +116,8 @@ required-features = ["link-synapse"]
 name = "reng-scatter-bench"
 path = "src/bin/scatter_bench.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-guid-probe"
+path = "src/bin/guid_probe.rs"
+required-features = ["link-synapse"]
