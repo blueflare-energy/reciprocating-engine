@@ -613,11 +613,16 @@ impl<'a> Runtime<'a> {
     ///
     /// Panics if there is no such input.
     pub fn input_index(&self, name: &str) -> usize {
+        self.find_input(name)
+            .unwrap_or_else(|| panic!("no input named {name}"))
+    }
+
+    /// The index of input `name`, if the graph has one.
+    pub fn find_input(&self, name: &str) -> Option<usize> {
         self.gb
             .names
             .iter()
             .position(|n| n.to_str().unwrap() == name)
-            .unwrap_or_else(|| panic!("no input named {name}"))
     }
 
     /// Bind persistent tensor `name` to device address `addr` for the next

@@ -54,6 +54,46 @@ pub fn run_node(
     rt.launch_and_read(rows)
 }
 
+/// Like [`run_node`] but the node also writes `extra` further bf16 outputs
+/// (device-resident, never read back), for kernels that insist on a
+/// secondary output such as a "retain" tensor for their backward pass.
+///
+/// # Errors
+///
+/// As [`run_node`].
+pub fn run_node_extra(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    out_sizes: &[u64],
+    extra: &[&[u64]],
+    params: *const c_void,
+    params_size: u32,
+) -> Result<Vec<f32>> {
+    let mut gb = Gb::new()?;
+    let mut tensors = Vec::with_capacity(ins.len());
+    for i in ins {
+        if let Some((dtype, bytes)) = i.raw {
+            tensors.push(gb.input_raw(i.name, i.sizes, dtype, bytes)?);
+        } else {
+            assert_eq!(i.sizes.iter().product::<u64>() as usize, i.data.len());
+            tensors.push(gb.input(i.name, i.sizes, i.data)?);
+        }
+    }
+    let (t_out, n_out) = gb.output("OUT", out_sizes, SYN_TYPE_BF16)?;
+    let mut outs = vec![t_out];
+    for (k, sizes) in extra.iter().enumerate() {
+        outs.push(gb.scratch(&format!("EXTRA{k}"), sizes)?);
+    }
+    gb.node(guid, "probe", &tensors, &outs, params, params_size)?;
+    let out = Out {
+        name: n_out,
+        sizes: out_sizes.to_vec(),
+        kind: OutKind::Bf16,
+    };
+    let rows = *out_sizes.last().unwrap_or(&1) as usize;
+    Runtime::new(gb, out)?.launch_and_read(rows)
+}
+
 /// Like [`run_node`] but with an int32 output.
 ///
 /// # Errors

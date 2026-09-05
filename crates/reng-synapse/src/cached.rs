@@ -17,7 +17,10 @@
 //! steps, sharing the weights and the cache buffers (`Runtime::new_with`).
 
 use crate::f32_to_bf16;
-use crate::model::{Gb, MASK_NEG, ModelWeights, Shared, build_head, build_layer, cache_names};
+use crate::model::{
+    Gb, MASK_NEG, ModelWeights, RopeTables, Shared, build_head, build_layer, cache_names,
+    common_window, uses_full_mask, uses_local_rope,
+};
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::Runtime;
 use reng_core::Result;
@@ -31,12 +34,16 @@ enum Read {
     AllLogits,
 }
 
-/// Per-step input indices of one compiled recipe.
+/// Per-step input indices of one compiled recipe; the second RoPE rows
+/// and the two masks exist only when some layer reads them.
 struct Inputs {
     x: usize,
     sin: usize,
     cos: usize,
-    mask: usize,
+    sin_local: Option<usize>,
+    cos_local: Option<usize>,
+    mask: Option<usize>,
+    mask_window: Option<usize>,
     kidx: usize,
 }
 
@@ -54,12 +61,15 @@ pub struct CachedModel<'a> {
     head_dim: usize,
     n_kv: usize,
     pos: usize,
-    /// RoPE tables `[capacity, head_dim]`.
+    /// RoPE tables `[capacity, head_dim]`, and the second pair for the
+    /// layers with `local_rope` (empty otherwise).
     sin: Vec<f32>,
     cos: Vec<f32>,
+    sin_local: Vec<f32>,
+    cos_local: Vec<f32>,
     n_layers: usize,
-    /// Sliding window: a query attends only to the last `window` positions
-    /// (its own included) when set.
+    /// Sliding window of the windowed layers: such a layer's query attends
+    /// only to the last `window` positions (its own included).
     window: Option<usize>,
     /// Which of the two cache buffers per layer holds the cache: the wide
     /// recipe reads one and writes the other (its ScatterND is not in
@@ -73,9 +83,10 @@ pub struct CachedModel<'a> {
 
 impl<'a> CachedModel<'a> {
     /// Compile the recipe for blocks of `rows` positions over a cache of
-    /// `capacity` positions and upload the weights. `sin`/`cos` are RoPE
-    /// tables `[capacity, head_dim]`; the per-layer tables in `m` are unused.
-    /// With `decode_rows > 0` (and different from `rows`) a second recipe for
+    /// `capacity` positions and upload the weights. `rope` holds RoPE
+    /// tables `[capacity, head_dim]` (the local pair only when a layer
+    /// reads it); the per-layer tables in `m` are unused. With
+    /// `decode_rows > 0` (and different from `rows`) a second recipe for
     /// blocks of up to `decode_rows` positions is compiled over the same
     /// weights and cache; [`CachedModel::step`] picks it for small blocks.
     ///
@@ -96,14 +107,17 @@ impl<'a> CachedModel<'a> {
         rows: usize,
         decode_rows: usize,
         capacity: usize,
-        sin: &[f32],
-        cos: &[f32],
+        rope: &RopeTables<'_>,
     ) -> Result<Self> {
         assert!(!m.layers.is_empty() && rows > 0 && capacity > 0);
         let l0 = &m.layers[0];
         let hd = l0.head_dim;
-        assert_eq!(sin.len(), capacity * hd);
-        assert_eq!(cos.len(), capacity * hd);
+        assert_eq!(rope.sin.len(), capacity * hd);
+        assert_eq!(rope.cos.len(), capacity * hd);
+        if uses_local_rope(&m.layers) {
+            assert_eq!(rope.sin_local.len(), capacity * hd);
+            assert_eq!(rope.cos_local.len(), capacity * hd);
+        }
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
         let t0 = Instant::now();
@@ -131,12 +145,14 @@ impl<'a> CachedModel<'a> {
             head_dim: hd,
             n_kv: l0.n_kv_heads,
             pos: 0,
-            sin: sin.to_vec(),
-            cos: cos.to_vec(),
+            sin: rope.sin.to_vec(),
+            cos: rope.cos.to_vec(),
+            sin_local: rope.sin_local.to_vec(),
+            cos_local: rope.cos_local.to_vec(),
             n_layers: m.layers.len(),
             flipped: false,
             check_argmax: std::env::var_os("RENG_ARGMAX_CHECK").is_some(),
-            window: None,
+            window: common_window(&m.layers),
         })
     }
 
@@ -159,8 +175,26 @@ impl<'a> CachedModel<'a> {
         let t_x = gb.input("X", &[h, t], &vec![0.0; rows * hidden])?;
         let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
+        let (t_sin_local, t_cos_local) = if uses_local_rope(&m.layers) {
+            (
+                Some(gb.input("SINL", &[hd64, t], &vec![0.0; rows * hd])?),
+                Some(gb.input("COSL", &[hd64, t], &vec![0.0; rows * hd])?),
+            )
+        } else {
+            (None, None)
+        };
         let groups = m.layers[0].n_kv_heads as u64;
-        let t_mask = gb.input("MASK", &[keys, t, 1, 1], &vec![0.0; rows * (capacity + 1)])?;
+        let zero_mask = vec![0.0; rows * (capacity + 1)];
+        let t_mask = if uses_full_mask(&m.layers) {
+            Some(gb.input("MASK", &[keys, t, 1, 1], &zero_mask)?)
+        } else {
+            None
+        };
+        let t_mask_window = if common_window(&m.layers).is_some() {
+            Some(gb.input("MASKW", &[keys, t, 1, 1], &zero_mask)?)
+        } else {
+            None
+        };
         let t_kidx = gb.input_raw(
             "KIDX",
             &[3, t * groups],
@@ -170,7 +204,10 @@ impl<'a> CachedModel<'a> {
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
-            mask: Some(t_mask),
+            sin_local: t_sin_local,
+            cos_local: t_cos_local,
+            mask: t_mask,
+            mask_window: t_mask_window,
             cache: Some(capacity),
             kidx: Some(t_kidx),
             inplace,
@@ -188,7 +225,10 @@ impl<'a> CachedModel<'a> {
             x: rt.input_index("X"),
             sin: rt.input_index("SIN"),
             cos: rt.input_index("COS"),
-            mask: rt.input_index("MASK"),
+            sin_local: rt.find_input("SINL"),
+            cos_local: rt.find_input("COSL"),
+            mask: rt.find_input("MASK"),
+            mask_window: rt.find_input("MASKW"),
             kidx: rt.input_index("KIDX"),
         }
     }
@@ -215,12 +255,6 @@ impl<'a> CachedModel<'a> {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.capacity
-    }
-
-    /// Restrict attention to a sliding window of `window` positions (Phi-3,
-    /// Mistral); `None` is full causal attention.
-    pub fn set_window(&mut self, window: Option<usize>) {
-        self.window = window;
     }
 
     /// Forget the cached prefix. The cache contents need no clearing (the
@@ -324,29 +358,36 @@ impl<'a> CachedModel<'a> {
 
         let mut xb = vec![0.0f32; p * h];
         xb[..n * h].copy_from_slice(x);
-        let mut sb = vec![0.0f32; p * hd];
-        let mut cb = vec![1.0f32; p * hd];
-        for r in 0..p {
-            // Rows past the cache end are padding; any finite angle will do.
-            if pos + r < c {
-                let src = (pos + r) * hd;
-                sb[r * hd..(r + 1) * hd].copy_from_slice(&self.sin[src..src + hd]);
-                cb[r * hd..(r + 1) * hd].copy_from_slice(&self.cos[src..src + hd]);
+        // RoPE rows of the block's positions from a table; rows past the
+        // cache end are padding, any finite angle will do.
+        let rope_rows = |table: &[f32]| -> Vec<f32> {
+            let mut rows = vec![0.0f32; p * hd];
+            for r in 0..p {
+                if pos + r < c {
+                    let src = (pos + r) * hd;
+                    rows[r * hd..(r + 1) * hd].copy_from_slice(&table[src..src + hd]);
+                }
             }
-        }
+            rows
+        };
+        let sb = rope_rows(&self.sin);
+        let cb = rope_rows(&self.cos);
         // Mask laid out like the scores, [key (FCD), query]: query row q sits
         // at cache position pos + q and may see every position up to its own
         // (padding rows past the cache end see everything but the trash slot;
-        // they are discarded). Built directly in bf16: the largest per-step
-        // upload.
+        // they are discarded), and with a window none further back than
+        // it. Built directly in bf16: the largest per-step upload.
         let keys = c + 1;
         let neg = f32_to_bf16(MASK_NEG);
-        let mut mb = vec![neg; p * keys];
-        for q in 0..p {
-            let end = (pos + q + 1).min(c);
-            let start = self.window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
-            mb[q * keys + start..q * keys + end].fill(0);
-        }
+        let mask_rows = |window: Option<usize>| -> Vec<u16> {
+            let mut mb = vec![neg; p * keys];
+            for q in 0..p {
+                let end = (pos + q + 1).min(c);
+                let start = window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
+                mb[q * keys + start..q * keys + end].fill(0);
+            }
+            mb
+        };
         // Scatter indices, ONNX triples (g, 0, position) for update r + p * g
         // (row r of KV head g): real rows go to pos + r (< capacity by the
         // assert above), padded rows to the trash slot. Padded rows must not
@@ -367,7 +408,16 @@ impl<'a> CachedModel<'a> {
         rt.upload(ix.x, &xb)?;
         rt.upload(ix.sin, &sb)?;
         rt.upload(ix.cos, &cb)?;
-        rt.upload_bf16(ix.mask, &mb)?;
+        if let (Some(is), Some(ic)) = (ix.sin_local, ix.cos_local) {
+            rt.upload(is, &rope_rows(&self.sin_local))?;
+            rt.upload(ic, &rope_rows(&self.cos_local))?;
+        }
+        if let Some(im) = ix.mask {
+            rt.upload_bf16(im, &mask_rows(None))?;
+        }
+        if let Some(im) = ix.mask_window {
+            rt.upload_bf16(im, &mask_rows(self.window))?;
+        }
         rt.upload_raw(ix.kidx, &ib)?;
         rt.fence()?;
         let t_upload = t0.elapsed();

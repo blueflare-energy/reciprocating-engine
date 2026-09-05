@@ -20,8 +20,8 @@
 
 use crate::f32_to_bf16;
 use crate::model::{
-    Gb, MASK_NEG, ModelWeights, Shared, SharedBatched, build_head, build_layer,
-    build_layer_batched, cache_names,
+    Gb, MASK_NEG, ModelWeights, RopeTables, Shared, SharedBatched, build_head, build_layer,
+    build_layer_batched, cache_names, common_window, uses_full_mask, uses_local_rope,
 };
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::{Out, Runtime};
@@ -31,12 +31,17 @@ use reng_core::Result;
 /// value disables bucketing, a tiny one exercises growth in tests).
 const MIN_BUCKET: usize = 256;
 
+/// Per-step input indices of a recipe; the second RoPE rows and the two
+/// masks exist only when some layer reads them.
 #[derive(Clone, Copy)]
 struct Inputs {
     x: usize,
     sin: usize,
     cos: usize,
-    mask: usize,
+    sin_local: Option<usize>,
+    cos_local: Option<usize>,
+    mask: Option<usize>,
+    mask_window: Option<usize>,
     kidx: usize,
 }
 
@@ -69,12 +74,16 @@ pub struct BatchedModel<'a> {
     n_kv: usize,
     /// Position of each sequence.
     pos: Vec<usize>,
+    /// RoPE tables `[capacity, head_dim]`, and the second pair for the
+    /// layers with `local_rope` (empty otherwise).
     sin: Vec<f32>,
     cos: Vec<f32>,
+    sin_local: Vec<f32>,
+    cos_local: Vec<f32>,
     /// Per layer: the K buffer and the V buffer (5-D, all slots) of the
     /// current bucket.
     slots: Vec<(u64, u64)>,
-    /// Sliding window (see [`BatchedModel::set_window`]).
+    /// Sliding window of the windowed layers.
     window: Option<usize>,
 }
 
@@ -92,8 +101,8 @@ impl<'a> BatchedModel<'a> {
     /// Compile the batched decode recipe for `batch` sequences over caches of
     /// up to `capacity` positions (starting from the smallest bucket), plus a
     /// prefill recipe for blocks of `rows` positions sharing the weights.
-    /// `sin`/`cos` are RoPE tables `[capacity, head_dim]`; the layers' own
-    /// RoPE slices are unused here.
+    /// `rope` holds RoPE tables `[capacity, head_dim]` (the local pair only
+    /// when a layer reads it); the layers' own RoPE slices are unused here.
     ///
     /// # Errors
     ///
@@ -112,14 +121,17 @@ impl<'a> BatchedModel<'a> {
         batch: usize,
         rows: usize,
         capacity: usize,
-        sin: &[f32],
-        cos: &[f32],
+        rope: &RopeTables<'_>,
     ) -> Result<Self> {
         assert!(!m.layers.is_empty() && batch > 0 && rows > 0 && capacity > 0);
         let l0 = &m.layers[0];
         let hd = l0.head_dim;
-        assert_eq!(sin.len(), capacity * hd);
-        assert_eq!(cos.len(), capacity * hd);
+        assert_eq!(rope.sin.len(), capacity * hd);
+        assert_eq!(rope.cos.len(), capacity * hd);
+        if uses_local_rope(&m.layers) {
+            assert_eq!(rope.sin_local.len(), capacity * hd);
+            assert_eq!(rope.cos_local.len(), capacity * hd);
+        }
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
         let min_cap = std::env::var("RENG_MIN_CAP")
@@ -136,6 +148,7 @@ impl<'a> BatchedModel<'a> {
         let pf_ix = Self::prefill_inputs(&pf);
         let slots = Self::cache_slots(&base, m.layers.len());
         let n_kv = l0.n_kv_heads;
+        let window = common_window(&m.layers);
         Ok(Self {
             pf,
             pf_ix,
@@ -154,10 +167,12 @@ impl<'a> BatchedModel<'a> {
             head_dim: hd,
             n_kv,
             pos: vec![0; batch],
-            sin: sin.to_vec(),
-            cos: cos.to_vec(),
+            sin: rope.sin.to_vec(),
+            cos: rope.cos.to_vec(),
+            sin_local: rope.sin_local.to_vec(),
+            cos_local: rope.cos_local.to_vec(),
             slots,
-            window: None,
+            window,
         })
     }
 
@@ -191,11 +206,33 @@ impl<'a> BatchedModel<'a> {
             &[hd64, 1, 1, 1, b],
             &vec![0.0; batch * hd],
         )?;
-        let t_mask = gb.input(
-            &format!("MASKB{tag}"),
-            &[keys, 1, 1, 1, b],
-            &vec![0.0; batch * (cap + 1)],
-        )?;
+        let (t_sin_local, t_cos_local) = if uses_local_rope(&m.layers) {
+            (
+                Some(gb.input(
+                    &format!("SINLB{tag}"),
+                    &[hd64, 1, 1, 1, b],
+                    &vec![0.0; batch * hd],
+                )?),
+                Some(gb.input(
+                    &format!("COSLB{tag}"),
+                    &[hd64, 1, 1, 1, b],
+                    &vec![0.0; batch * hd],
+                )?),
+            )
+        } else {
+            (None, None)
+        };
+        let zero_mask = vec![0.0; batch * (cap + 1)];
+        let t_mask = if uses_full_mask(&m.layers) {
+            Some(gb.input(&format!("MASKB{tag}"), &[keys, 1, 1, 1, b], &zero_mask)?)
+        } else {
+            None
+        };
+        let t_mask_window = if common_window(&m.layers).is_some() {
+            Some(gb.input(&format!("MASKWB{tag}"), &[keys, 1, 1, 1, b], &zero_mask)?)
+        } else {
+            None
+        };
         let t_kidx = gb.input_raw(
             &format!("KIDXB{tag}"),
             &[4, groups * b],
@@ -205,7 +242,10 @@ impl<'a> BatchedModel<'a> {
         let sh = SharedBatched {
             sin: t_sin,
             cos: t_cos,
+            sin_local: t_sin_local,
+            cos_local: t_cos_local,
             mask: t_mask,
+            mask_window: t_mask_window,
             kidx: t_kidx,
             capacity: cap,
             batch,
@@ -233,7 +273,25 @@ impl<'a> BatchedModel<'a> {
         let t_x = gb.input("X", &[h, t], &vec![0.0; rows * hidden])?;
         let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
-        let t_mask = gb.input("MASK", &[keys, t, 1, 1], &vec![0.0; rows * (cap + 1)])?;
+        let (t_sin_local, t_cos_local) = if uses_local_rope(&m.layers) {
+            (
+                Some(gb.input("SINL", &[hd64, t], &vec![0.0; rows * hd])?),
+                Some(gb.input("COSL", &[hd64, t], &vec![0.0; rows * hd])?),
+            )
+        } else {
+            (None, None)
+        };
+        let zero_mask = vec![0.0; rows * (cap + 1)];
+        let t_mask = if uses_full_mask(&m.layers) {
+            Some(gb.input("MASK", &[keys, t, 1, 1], &zero_mask)?)
+        } else {
+            None
+        };
+        let t_mask_window = if common_window(&m.layers).is_some() {
+            Some(gb.input("MASKW", &[keys, t, 1, 1], &zero_mask)?)
+        } else {
+            None
+        };
         let t_kidx = gb.input_raw(
             "KIDX",
             &[3, t * groups as u64],
@@ -243,7 +301,10 @@ impl<'a> BatchedModel<'a> {
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
-            mask: Some(t_mask),
+            sin_local: t_sin_local,
+            cos_local: t_cos_local,
+            mask: t_mask,
+            mask_window: t_mask_window,
             cache: Some(cap),
             kidx: Some(t_kidx),
             inplace: false,
@@ -261,7 +322,10 @@ impl<'a> BatchedModel<'a> {
             x: rt.input_index(&format!("XB{tag}")),
             sin: rt.input_index(&format!("SINB{tag}")),
             cos: rt.input_index(&format!("COSB{tag}")),
-            mask: rt.input_index(&format!("MASKB{tag}")),
+            sin_local: rt.find_input(&format!("SINLB{tag}")),
+            cos_local: rt.find_input(&format!("COSLB{tag}")),
+            mask: rt.find_input(&format!("MASKB{tag}")),
+            mask_window: rt.find_input(&format!("MASKWB{tag}")),
             kidx: rt.input_index(&format!("KIDXB{tag}")),
         }
     }
@@ -271,7 +335,10 @@ impl<'a> BatchedModel<'a> {
             x: rt.input_index("X"),
             sin: rt.input_index("SIN"),
             cos: rt.input_index("COS"),
-            mask: rt.input_index("MASK"),
+            sin_local: rt.find_input("SINL"),
+            cos_local: rt.find_input("COSL"),
+            mask: rt.find_input("MASK"),
+            mask_window: rt.find_input("MASKW"),
             kidx: rt.input_index("KIDX"),
         }
     }
@@ -320,12 +387,6 @@ impl<'a> BatchedModel<'a> {
     /// Bytes of one sequence's slot in one cache buffer of `cap` positions.
     fn slot_bytes(&self, cap: usize) -> u64 {
         (self.head_dim * (cap + 1) * self.n_kv * 2) as u64
-    }
-
-    /// Restrict attention to a sliding window of `window` positions (Phi-3,
-    /// Mistral); `None` is full causal attention.
-    pub fn set_window(&mut self, window: Option<usize>) {
-        self.window = window;
     }
 
     /// Start sequence `b` afresh. Its cache slot needs no clearing (the mask
@@ -456,22 +517,26 @@ impl<'a> BatchedModel<'a> {
             let pos = self.pos[b];
             let mut xb = vec![0.0f32; p * h];
             xb[..n * h].copy_from_slice(chunk);
-            let mut sb = vec![0.0f32; p * hd];
-            let mut cb = vec![1.0f32; p * hd];
-            for r in 0..p {
-                if pos + r < c {
-                    let src = (pos + r) * hd;
-                    sb[r * hd..(r + 1) * hd].copy_from_slice(&self.sin[src..src + hd]);
-                    cb[r * hd..(r + 1) * hd].copy_from_slice(&self.cos[src..src + hd]);
+            let rope_rows = |table: &[f32]| -> Vec<f32> {
+                let mut rows = vec![0.0f32; p * hd];
+                for r in 0..p {
+                    if pos + r < c {
+                        let src = (pos + r) * hd;
+                        rows[r * hd..(r + 1) * hd].copy_from_slice(&table[src..src + hd]);
+                    }
                 }
-            }
+                rows
+            };
             let keys = c + 1;
-            let mut mb = vec![neg; p * keys];
-            for q in 0..p {
-                let end = (pos + q + 1).min(c);
-                let start = self.window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
-                mb[q * keys + start..q * keys + end].fill(0);
-            }
+            let mask_rows = |window: Option<usize>| -> Vec<u16> {
+                let mut mb = vec![neg; p * keys];
+                for q in 0..p {
+                    let end = (pos + q + 1).min(c);
+                    let start = window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
+                    mb[q * keys + start..q * keys + end].fill(0);
+                }
+                mb
+            };
             let mut ib: Vec<u8> = Vec::with_capacity(12 * p * self.n_kv);
             for g in 0..self.n_kv {
                 for r in 0..p {
@@ -481,11 +546,21 @@ impl<'a> BatchedModel<'a> {
                     }
                 }
             }
-            self.pf.upload(self.pf_ix.x, &xb)?;
-            self.pf.upload(self.pf_ix.sin, &sb)?;
-            self.pf.upload(self.pf_ix.cos, &cb)?;
-            self.pf.upload_bf16(self.pf_ix.mask, &mb)?;
-            self.pf.upload_raw(self.pf_ix.kidx, &ib)?;
+            let ix = self.pf_ix;
+            self.pf.upload(ix.x, &xb)?;
+            self.pf.upload(ix.sin, &rope_rows(&self.sin))?;
+            self.pf.upload(ix.cos, &rope_rows(&self.cos))?;
+            if let (Some(is), Some(ic)) = (ix.sin_local, ix.cos_local) {
+                self.pf.upload(is, &rope_rows(&self.sin_local))?;
+                self.pf.upload(ic, &rope_rows(&self.cos_local))?;
+            }
+            if let Some(im) = ix.mask {
+                self.pf.upload_bf16(im, &mask_rows(None))?;
+            }
+            if let Some(im) = ix.mask_window {
+                self.pf.upload_bf16(im, &mask_rows(self.window))?;
+            }
+            self.pf.upload_raw(ix.kidx, &ib)?;
             self.pf.fence()?;
             let ids = self.pf.launch_and_read_i32(n - 1, 1)?;
             last = if want_logits {
@@ -532,17 +607,27 @@ impl<'a> BatchedModel<'a> {
         let c = self.cap;
         let neg = f32_to_bf16(MASK_NEG);
         let keys = c + 1;
-        let mut sb = vec![0.0f32; nb * hd];
-        let mut cb = vec![0.0f32; nb * hd];
-        let mut mb = vec![neg; nb * keys];
+        // One RoPE row per sequence from a table.
+        let rope_rows = |table: &[f32]| -> Vec<f32> {
+            let mut rows = vec![0.0f32; nb * hd];
+            for (b, &pos) in self.pos.iter().enumerate() {
+                rows[b * hd..(b + 1) * hd].copy_from_slice(&table[pos * hd..(pos + 1) * hd]);
+            }
+            rows
+        };
+        // One mask row per sequence: its positions up to its own, and with
+        // a window none further back than it.
+        let mask_rows = |window: Option<usize>| -> Vec<u16> {
+            let mut mb = vec![neg; nb * keys];
+            for (b, &pos) in self.pos.iter().enumerate() {
+                let start = window.map_or(0, |w| (pos + 1).saturating_sub(w));
+                mb[b * keys + start..b * keys + pos + 1].fill(0);
+            }
+            mb
+        };
         // Scatter indices, ONNX (b, g, 0, position_b) for update g + groups * b.
         let mut ib: Vec<u8> = Vec::with_capacity(16 * self.n_kv * nb);
-        for b in 0..nb {
-            let pos = self.pos[b];
-            sb[b * hd..(b + 1) * hd].copy_from_slice(&self.sin[pos * hd..(pos + 1) * hd]);
-            cb[b * hd..(b + 1) * hd].copy_from_slice(&self.cos[pos * hd..(pos + 1) * hd]);
-            let start = self.window.map_or(0, |w| (pos + 1).saturating_sub(w));
-            mb[b * keys + start..b * keys + pos + 1].fill(0);
+        for (b, &pos) in self.pos.iter().enumerate() {
             for g in 0..self.n_kv {
                 for v in [b as i32, g as i32, 0i32, pos as i32] {
                     ib.extend_from_slice(&v.to_le_bytes());
@@ -550,11 +635,27 @@ impl<'a> BatchedModel<'a> {
             }
         }
         let ix = self.ix;
+        let sb = rope_rows(&self.sin);
+        let cb = rope_rows(&self.cos);
+        let local = ix
+            .sin_local
+            .map(|_| (rope_rows(&self.sin_local), rope_rows(&self.cos_local)));
+        let mb = ix.mask.map(|_| mask_rows(None));
+        let mbw = ix.mask_window.map(|_| mask_rows(self.window));
         let rt = self.rt();
         rt.upload(ix.x, x)?;
         rt.upload(ix.sin, &sb)?;
         rt.upload(ix.cos, &cb)?;
-        rt.upload_bf16(ix.mask, &mb)?;
+        if let (Some(is), Some(ic), Some((slb, clb))) = (ix.sin_local, ix.cos_local, &local) {
+            rt.upload(is, slb)?;
+            rt.upload(ic, clb)?;
+        }
+        if let (Some(im), Some(mb)) = (ix.mask, &mb) {
+            rt.upload_bf16(im, mb)?;
+        }
+        if let (Some(im), Some(mbw)) = (ix.mask_window, &mbw) {
+            rt.upload_bf16(im, mbw)?;
+        }
         rt.upload_raw(ix.kidx, &ib)?;
         rt.fence()?;
         let ids = rt.launch_and_read_i32(0, nb)?;

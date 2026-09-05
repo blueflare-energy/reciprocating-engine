@@ -418,10 +418,16 @@ pub fn model_from_hf_config(json: &str) -> Result<ModelShape> {
     let head_dim = u("head_dim").unwrap_or(hidden / u64::from(n_heads));
     let vocab = u("vocab_size").unwrap_or(0);
     let ff = u("intermediate_size").unwrap_or(0);
+    // Gemma configs omit the key; their HF config classes default it to
+    // true (no `lm_head` tensor in the checkpoints).
+    let gemma = matches!(
+        v.get("model_type").and_then(serde_json::Value::as_str),
+        Some("gemma" | "gemma2" | "gemma3_text" | "gemma3")
+    );
     let tied = v
         .get("tie_word_embeddings")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(gemma);
     let name = v
         .get("_name_or_path")
         .and_then(serde_json::Value::as_str)

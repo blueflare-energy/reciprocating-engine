@@ -27,9 +27,9 @@
 //! `RENG_PERSIST_LAYERS` (every layer output is a persistent tensor instead
 //! of a workspace tensor), `RENG_READBACK_TRACE` (print readback poll counts).
 
-use crate::LayerWeights;
 use crate::ffi::*;
 use crate::runtime::{Out, OutKind, Runtime};
+use crate::{Activation, LayerWeights};
 use crate::{bf16_to_f32, scale_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
@@ -95,10 +95,44 @@ pub(crate) const MASK_NEG: f32 = -30000.0;
 /// the scale out of `wq` again (it rides on the norm gain instead).
 fn scaled_wq<'a>(w: &LayerWeights<'a>) -> std::borrow::Cow<'a, [u16]> {
     if w.qn.is_empty() {
-        std::borrow::Cow::Owned(scale_bf16(w.wq, w.scale))
+        std::borrow::Cow::Owned(scale_bf16(w.wq, score_scale(w)))
     } else {
         std::borrow::Cow::Borrowed(w.wq)
     }
+}
+
+/// The factor on `q` before the scores: the attention scale, divided by
+/// the attention softcap when the layer has one (the scores then come out
+/// of the gemm as `scores / cap`, ready for the `tanh`).
+fn score_scale(w: &LayerWeights<'_>) -> f32 {
+    w.scale / w.attn_softcap.unwrap_or(1.0)
+}
+
+/// Gemma-2's attention softcap on scores that already carry `1 / cap`:
+/// `tanh(x) * cap` into a new tensor of `sizes` (`cap` a broadcast
+/// constant of the same rank).
+fn softcap_nodes(
+    gb: &mut Gb<'_>,
+    p: &dyn Fn(&str) -> String,
+    x: synTensor,
+    sizes: &[u64],
+    cap: f32,
+) -> Result<synTensor> {
+    let none = (core::ptr::null::<c_void>(), 0u32);
+    let ones = vec![1u64; sizes.len()];
+    let t_cap = gb.input(&p("softcap"), &ones, &[cap])?;
+    let th = gb.mid(&p("sc_tanh"), sizes, SYN_TYPE_BF16)?;
+    let out = gb.mid(&p("sc_capped"), sizes, SYN_TYPE_BF16)?;
+    gb.node("tanh_fwd_bf16", &p("sc_tanh"), &[x], &[th], none.0, none.1)?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("sc_cap"),
+        &[th, t_cap],
+        &[out],
+        none.0,
+        none.1,
+    )?;
+    Ok(out)
 }
 
 /// Whether the layer's q/k norms take the OLMo-2 full-width form (gains
@@ -140,6 +174,174 @@ fn wide_qk_norm(w: &LayerWeights<'_>) -> bool {
 
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
+}
+
+/// The sliding window of the windowed layers, which must all agree (one
+/// windowed mask per graph); `None` when no layer has one.
+///
+/// # Panics
+///
+/// Panics if two layers carry different windows.
+pub(crate) fn common_window(layers: &[LayerWeights<'_>]) -> Option<usize> {
+    let window = layers.iter().find_map(|l| l.window);
+    assert!(
+        layers
+            .iter()
+            .all(|l| l.window.is_none() || l.window == window),
+        "layers with different sliding windows"
+    );
+    window
+}
+
+/// Whether some layer reads the second ("local") RoPE table.
+pub(crate) fn uses_local_rope(layers: &[LayerWeights<'_>]) -> bool {
+    layers.iter().any(|l| l.local_rope)
+}
+
+/// Whether some layer uses full causal attention (reads the plain mask).
+pub(crate) fn uses_full_mask(layers: &[LayerWeights<'_>]) -> bool {
+    layers.iter().any(|l| l.window.is_none())
+}
+
+/// `gelu_pytorch_tanh` of `x` into `out` (bf16, same `sizes`) as
+/// `x * sigmoid(c1 * x + c3 * x^3)` with `c1 = 2 * sqrt(2 / pi)` and
+/// `c3 = 0.044715 * c1`: `0.5 * (1 + tanh(u)) == sigmoid(2u)`, an exact
+/// identity. Seven elementwise nodes; `gelu_fwd_bf16` computes only the
+/// erf form (reng-gelu-test), so Gemma's activation is composed.
+fn gelu_tanh_nodes(
+    gb: &mut Gb<'_>,
+    p: &dyn Fn(&str) -> String,
+    x: synTensor,
+    sizes: &[u64],
+    out: synTensor,
+) -> Result<()> {
+    const C1: f32 = 1.595_769;
+    const C3: f32 = 0.071_354_82;
+    let bf = SYN_TYPE_BF16;
+    let none = (core::ptr::null::<c_void>(), 0u32);
+    let ones = vec![1u64; sizes.len()];
+    let t_c1 = gb.input(&p("gelu_c1"), &ones, &[C1])?;
+    let t_c3 = gb.input(&p("gelu_c3"), &ones, &[C3])?;
+    let x2 = gb.mid(&p("gelu_x2"), sizes, bf)?;
+    let x3 = gb.mid(&p("gelu_x3"), sizes, bf)?;
+    let a = gb.mid(&p("gelu_a"), sizes, bf)?;
+    let b = gb.mid(&p("gelu_b"), sizes, bf)?;
+    let u = gb.mid(&p("gelu_u"), sizes, bf)?;
+    let sg = gb.mid(&p("gelu_sig"), sizes, bf)?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gelu_sq"),
+        &[x, x],
+        &[x2],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gelu_cube"),
+        &[x2, x],
+        &[x3],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gelu_c3x3"),
+        &[x3, t_c3],
+        &[a],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gelu_c1x"),
+        &[x, t_c1],
+        &[b],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "add_fwd_bf16",
+        &p("gelu_sum"),
+        &[a, b],
+        &[u],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "sigmoid_fwd_bf16",
+        &p("gelu_sigmoid"),
+        &[u],
+        &[sg],
+        none.0,
+        none.1,
+    )?;
+    gb.node(
+        "mult_fwd_bf16",
+        &p("gelu_out"),
+        &[x, sg],
+        &[out],
+        none.0,
+        none.1,
+    )?;
+    Ok(())
+}
+
+/// The gate activation on `x` into `out` (bf16, same `sizes`): SiLU as
+/// `x * sigmoid(x)` (two nodes) or the composed GELU-tanh.
+fn activation_nodes(
+    gb: &mut Gb<'_>,
+    p: &dyn Fn(&str) -> String,
+    act: Activation,
+    x: synTensor,
+    sizes: &[u64],
+    out: synTensor,
+) -> Result<()> {
+    match act {
+        Activation::Silu => {
+            let none = (core::ptr::null::<c_void>(), 0u32);
+            let sg = gb.mid(&p("sg"), sizes, SYN_TYPE_BF16)?;
+            gb.node("sigmoid_fwd_bf16", &p("sig"), &[x], &[sg], none.0, none.1)?;
+            gb.node(
+                "mult_fwd_bf16",
+                &p("silu"),
+                &[x, sg],
+                &[out],
+                none.0,
+                none.1,
+            )?;
+            Ok(())
+        }
+        Activation::GeluTanh => gelu_tanh_nodes(gb, p, x, sizes, out),
+    }
+}
+
+/// An RMSNorm of `x` with gain `gain` (`[hidden]`, uploaded as input
+/// `name`) into a new `[hidden, ...]` tensor of `sizes` (Gemma's post
+/// norms on a branch output before its residual add).
+fn post_norm_node(
+    gb: &mut Gb<'_>,
+    p: &dyn Fn(&str) -> String,
+    name: &str,
+    gain: &[f32],
+    x: synTensor,
+    sizes: &[u64],
+    rms: &RmsNormParams,
+) -> Result<synTensor> {
+    let t_g = gb.input(&p(&format!("g_{name}")), &[sizes[0]], gain)?;
+    let out = gb.mid(&p(&format!("{name}_out")), sizes, SYN_TYPE_BF16)?;
+    let mut inv_sizes = sizes.to_vec();
+    inv_sizes[0] = 1;
+    let inv = gb.mid(&p(&format!("{name}_inv")), &inv_sizes, SYN_TYPE_F32)?;
+    gb.node(
+        "rms_norm_fwd_bf16",
+        &p(name),
+        &[x, t_g],
+        &[out, inv],
+        (&raw const *rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    )?;
+    Ok(out)
 }
 
 pub(crate) fn make_tensor(
@@ -485,9 +687,15 @@ impl<'a> Gb<'a> {
 pub(crate) struct Shared {
     pub sin: synTensor,
     pub cos: synTensor,
+    /// The second RoPE table pair, read by the layers with `local_rope`
+    /// (Gemma-3 sliding layers); present when some layer needs it.
+    pub sin_local: Option<synTensor>,
+    pub cos_local: Option<synTensor>,
     /// Additive mask laid out like the score matrix, `[keys, queries, 1, 1]`
-    /// (broadcast over heads).
+    /// (broadcast over heads), for the layers without a window.
     pub mask: Option<synTensor>,
+    /// The same with the sliding window applied, for the layers with one.
+    pub mask_window: Option<synTensor>,
     /// KV-cache capacity in positions. When set, every layer gets cache
     /// input and output tensors (see [`cache_names`]) of `capacity + 1`
     /// positions (the last is a trash slot padded rows are written to),
@@ -598,9 +806,25 @@ pub(crate) fn build_layer<'a>(
     let head_blocks = env_on("RENG_HEAD_BLOCKS") && !wide_qk;
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
+    // The layer's RoPE table and mask: the model's second table for a
+    // local-rope layer, the windowed mask for a windowed layer.
+    let (t_sin, t_cos) = if w.local_rope {
+        (
+            sh.sin_local.expect("local RoPE table"),
+            sh.cos_local.expect("local RoPE table"),
+        )
+    } else {
+        (sh.sin, sh.cos)
+    };
+    let mask = if w.window.is_some() {
+        sh.mask_window
+    } else {
+        sh.mask
+    };
     // With a q norm the scale cannot ride on `wq` (the norm would divide
     // it out again); it goes on the norm gain instead.
-    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let scale = score_scale(w);
+    let q_scale = if w.qn.is_empty() { scale } else { 1.0 };
     let wq_scaled = scaled_wq(w);
     let (t_wq, t_wk, t_wv) = if head_blocks {
         (
@@ -664,8 +888,7 @@ pub(crate) fn build_layer<'a>(
         .transpose()?;
     let t_gate = gb.mid(&p("gate"), &[i, t], bf)?;
     let t_up = gb.mid(&p("up"), &[i, t], bf)?;
-    let t_sg = gb.mid(&p("sg"), &[i, t], bf)?;
-    let t_silu = gb.mid(&p("silu"), &[i, t], bf)?;
+    let t_act = gb.mid(&p("act"), &[i, t], bf)?;
     let t_gated = gb.mid(&p("gated"), &[i, t], bf)?;
     let t_down = gb.mid(&p("down"), &[h, t], bf)?;
     let t_out = match out {
@@ -777,7 +1000,7 @@ pub(crate) fn build_layer<'a>(
         // projections before the head reshape; the scale rides on the q
         // gain, as in the per-head form.
         let (t_qn_w, t_kn_w) = if wide_qk {
-            let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+            let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
             (
                 Some(gb.input(&p("qn"), &[qw], &qn_scaled)?),
                 Some(gb.input(&p("kn"), &[hd * groups], w.kn)?),
@@ -886,7 +1109,7 @@ pub(crate) fn build_layer<'a>(
     let (t_q, t_k) = if w.qn.is_empty() || wide_qk {
         (t_q, t_k)
     } else {
-        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
         let t_qn = gb.input(&p("qn"), &[hd], &qn_scaled)?;
         let t_kn = gb.input(&p("kn"), &[hd], w.kn)?;
         let qn = gb.mid(&p("qn_out"), &[hd, t, hpg, groups], bf)?;
@@ -918,7 +1141,7 @@ pub(crate) fn build_layer<'a>(
         gb.node(
             "rope_st2_fwd_bf16",
             &p("rope_q"),
-            &[t_q, sh.sin, sh.cos],
+            &[t_q, t_sin, t_cos],
             &[t_qr],
             pr.0,
             pr.1,
@@ -926,7 +1149,7 @@ pub(crate) fn build_layer<'a>(
         gb.node(
             "rope_st2_fwd_bf16",
             &p("rope_k"),
-            &[t_k, sh.sin, sh.cos],
+            &[t_k, t_sin, t_cos],
             &[t_kr],
             pr.0,
             pr.1,
@@ -989,7 +1212,12 @@ pub(crate) fn build_layer<'a>(
         pgt.0,
         pgt.1,
     )?;
-    let sm_in = if let Some(mask) = sh.mask {
+    // Gemma-2: softcap the scores (which carry `1 / cap`) before the mask.
+    let t_sc = match w.attn_softcap {
+        Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, t, hpg, groups], cap)?,
+        None => t_sc,
+    };
+    let sm_in = if let Some(mask) = mask {
         let masked = gb.mid(&p("masked"), &[keys, t, hpg, groups], bf)?;
         gb.node(
             "add_fwd_bf16",
@@ -1048,6 +1276,21 @@ pub(crate) fn build_layer<'a>(
     } else {
         t_o
     };
+    // Gemma: the attention branch is normalised (g_post_attn) before its
+    // residual add, on top of the pre-norm.
+    let t_res1 = if w.g_post_attn.is_empty() {
+        t_res1
+    } else {
+        post_norm_node(
+            gb,
+            &p,
+            "post_attn_norm",
+            w.g_post_attn,
+            t_res1,
+            &[h, t],
+            &rms,
+        )?
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
@@ -1081,26 +1324,11 @@ pub(crate) fn build_layer<'a>(
         pgt.1,
     )?;
     gb.node("gemm", &p("up_proj"), &[t_min, t_wu], &[t_up], pgt.0, pgt.1)?;
-    gb.node(
-        "sigmoid_fwd_bf16",
-        &p("sig"),
-        &[t_gate],
-        &[t_sg],
-        none.0,
-        none.1,
-    )?;
-    gb.node(
-        "mult_fwd_bf16",
-        &p("silu"),
-        &[t_gate, t_sg],
-        &[t_silu],
-        none.0,
-        none.1,
-    )?;
+    activation_nodes(gb, &p, w.act, t_gate, &[i, t], t_act)?;
     gb.node(
         "mult_fwd_bf16",
         &p("gate_x_up"),
-        &[t_silu, t_up],
+        &[t_act, t_up],
         &[t_gated],
         none.0,
         none.1,
@@ -1129,6 +1357,13 @@ pub(crate) fn build_layer<'a>(
     } else {
         t_down
     };
+    // Gemma: the MLP branch is normalised (g_post_mlp) before its residual
+    // add, on top of the pre-norm.
+    let t_res2 = if w.g_post_mlp.is_empty() {
+        t_res2
+    } else {
+        post_norm_node(gb, &p, "post_mlp_norm", w.g_post_mlp, t_res2, &[h, t], &rms)?
+    };
     gb.node(
         "add_fwd_bf16",
         &p("res2"),
@@ -1143,11 +1378,16 @@ pub(crate) fn build_layer<'a>(
 /// Per-graph tensors of the batched decode layer: one row per sequence,
 /// everything per-sequence carried in the outermost (fifth) dimension.
 pub(crate) struct SharedBatched {
-    /// RoPE rows per sequence, `[hd, 1, 1, 1, B]`.
+    /// RoPE rows per sequence, `[hd, 1, 1, 1, B]`, from the model's first
+    /// table, and from its second one for the layers with `local_rope`.
     pub sin: synTensor,
     pub cos: synTensor,
-    /// Additive mask per sequence, `[keys, 1, 1, 1, B]`.
-    pub mask: synTensor,
+    pub sin_local: Option<synTensor>,
+    pub cos_local: Option<synTensor>,
+    /// Additive mask per sequence, `[keys, 1, 1, 1, B]`, for the layers
+    /// without a window, and its windowed twin for the layers with one.
+    pub mask: Option<synTensor>,
+    pub mask_window: Option<synTensor>,
     /// Int32 scatter indices, `[4, groups * B]`: update `g + groups * b`
     /// goes to ONNX index `(b, g, 0, position_b)` of the
     /// `[hd, keys, 1, groups, B]` cache.
@@ -1193,11 +1433,25 @@ pub(crate) fn build_layer_batched<'a>(
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
     // See `build_layer`: the scale rides on the q norm gain when there is one.
-    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let scale = score_scale(w);
+    let q_scale = if w.qn.is_empty() { scale } else { 1.0 };
     let post_norm = w.post_norm;
     let wide_qk = wide_qk_norm(w);
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
+    let (t_sin, t_cos) = if w.local_rope {
+        (
+            sh.sin_local.expect("local RoPE rows"),
+            sh.cos_local.expect("local RoPE rows"),
+        )
+    } else {
+        (sh.sin, sh.cos)
+    };
+    let t_mask = if w.window.is_some() {
+        sh.mask_window.expect("windowed mask")
+    } else {
+        sh.mask.expect("causal mask")
+    };
     // With one row per sequence the projections are plain gemms with
     // M = B over the natural `[in, out]` weights: `[hidden, B]` is already
     // `[hd, 1, hpg, groups, B]` in memory (head-major features, sequence
@@ -1255,8 +1509,7 @@ pub(crate) fn build_layer_batched<'a>(
         .transpose()?;
     let t_gate = gb.mid(&p("gate"), &[i, b], bf)?;
     let t_up = gb.mid(&p("up"), &[i, b], bf)?;
-    let t_sg = gb.mid(&p("sg"), &[i, b], bf)?;
-    let t_silu = gb.mid(&p("silu"), &[i, b], bf)?;
+    let t_act = gb.mid(&p("act"), &[i, b], bf)?;
     let t_gated = gb.mid(&p("gated"), &[i, b], bf)?;
     let t_down = gb.mid(&p("down"), &[h, b], bf)?;
     let t_out = gb.mid(&p("out"), &[h, b], bf)?;
@@ -1319,7 +1572,7 @@ pub(crate) fn build_layer_batched<'a>(
     // Full-width q/k norms (OLMo-2) on the flat projections, as in
     // `build_layer`; the inputs carry the same names and sizes.
     let (t_q2, t_k2) = if wide_qk {
-        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
         let t_qn = gb.input(&p("qn"), &[qw], &qn_scaled)?;
         let t_kn = gb.input(&p("kn"), &[hd * groups], w.kn)?;
         let q2n = gb.mid(&p("q2n"), &[qw, b], bf)?;
@@ -1390,7 +1643,7 @@ pub(crate) fn build_layer_batched<'a>(
     let (t_q, t_k) = if w.qn.is_empty() || wide_qk {
         (t_q, t_k)
     } else {
-        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
         let t_qn = gb.input(&p("qn"), &[hd], &qn_scaled)?;
         let t_kn = gb.input(&p("kn"), &[hd], w.kn)?;
         let qn = gb.mid(&p("qn_out"), &[hd, 1, hpg, groups, b], bf)?;
@@ -1421,7 +1674,7 @@ pub(crate) fn build_layer_batched<'a>(
         gb.node(
             "rope_st2_fwd_bf16",
             &p("rope_q"),
-            &[t_q, sh.sin, sh.cos],
+            &[t_q, t_sin, t_cos],
             &[t_qr],
             pr.0,
             pr.1,
@@ -1429,7 +1682,7 @@ pub(crate) fn build_layer_batched<'a>(
         gb.node(
             "rope_st2_fwd_bf16",
             &p("rope_k"),
-            &[t_k, sh.sin, sh.cos],
+            &[t_k, t_sin, t_cos],
             &[t_kr],
             pr.0,
             pr.1,
@@ -1471,10 +1724,14 @@ pub(crate) fn build_layer_batched<'a>(
         (kco, vco)
     };
     gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
+    let t_sc = match w.attn_softcap {
+        Some(cap) => softcap_nodes(gb, &p, t_sc, &[keys, 1, hpg, groups, b], cap)?,
+        None => t_sc,
+    };
     gb.node(
         "add_fwd_bf16",
         &p("mask"),
-        &[t_sc, sh.mask],
+        &[t_sc, t_mask],
         &[t_masked],
         none.0,
         none.1,
@@ -1505,6 +1762,21 @@ pub(crate) fn build_layer_batched<'a>(
         t_on
     } else {
         t_o
+    };
+    // Gemma: the attention branch is normalised (g_post_attn) before its
+    // residual add, on top of the pre-norm.
+    let t_res1 = if w.g_post_attn.is_empty() {
+        t_res1
+    } else {
+        post_norm_node(
+            gb,
+            &p,
+            "post_attn_norm",
+            w.g_post_attn,
+            t_res1,
+            &[h, b],
+            &rms,
+        )?
     };
     gb.node(
         "add_fwd_bf16",
@@ -1537,26 +1809,11 @@ pub(crate) fn build_layer_batched<'a>(
         pgt.1,
     )?;
     gb.node("gemm", &p("up_proj"), &[t_min, t_wu], &[t_up], pgt.0, pgt.1)?;
-    gb.node(
-        "sigmoid_fwd_bf16",
-        &p("sig"),
-        &[t_gate],
-        &[t_sg],
-        none.0,
-        none.1,
-    )?;
-    gb.node(
-        "mult_fwd_bf16",
-        &p("silu"),
-        &[t_gate, t_sg],
-        &[t_silu],
-        none.0,
-        none.1,
-    )?;
+    activation_nodes(gb, &p, w.act, t_gate, &[i, b], t_act)?;
     gb.node(
         "mult_fwd_bf16",
         &p("gate_x_up"),
-        &[t_silu, t_up],
+        &[t_act, t_up],
         &[t_gated],
         none.0,
         none.1,
@@ -1583,6 +1840,13 @@ pub(crate) fn build_layer_batched<'a>(
         t_dn
     } else {
         t_down
+    };
+    // Gemma: the MLP branch is normalised (g_post_mlp) before its residual
+    // add, on top of the pre-norm.
+    let t_res2 = if w.g_post_mlp.is_empty() {
+        t_res2
+    } else {
+        post_norm_node(gb, &p, "post_mlp_norm", w.g_post_mlp, t_res2, &[h, b], &rms)?
     };
     gb.node(
         "add_fwd_bf16",
@@ -1636,6 +1900,12 @@ pub(crate) fn build_head<'a>(
     } else {
         t_logits
     };
+    // Gemma-2: the LM head gemm produces `logits / cap` (the final norm
+    // gain carries `1 / cap`); `tanh` and a multiply by `cap` follow.
+    let t_raw = match m.final_softcap {
+        Some(_) => gb.mid("logits_raw", &[v, t], bf)?,
+        None => t_lg,
+    };
     let rms = RmsNormParams::new(m.layers[0].eps);
     gb.node(
         "rms_norm_fwd_bf16",
@@ -1653,10 +1923,31 @@ pub(crate) fn build_head<'a>(
         "gemm",
         "lm_head",
         &[t_nf, t_lm],
-        &[t_lg],
+        &[t_raw],
         (&raw const gemm_bt).cast::<c_void>(),
         core::mem::size_of::<synGEMMParams>() as u32,
     )?;
+    if let Some(cap) = m.final_softcap {
+        let none = (core::ptr::null::<c_void>(), 0u32);
+        let t_cap = gb.input("FINAL_SOFTCAP", &[1, 1], &[cap])?;
+        let t_th = gb.mid("logits_tanh", &[v, t], bf)?;
+        gb.node(
+            "tanh_fwd_bf16",
+            "final_tanh",
+            &[t_raw],
+            &[t_th],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "mult_fwd_bf16",
+            "final_cap",
+            &[t_th, t_cap],
+            &[t_lg],
+            none.0,
+            none.1,
+        )?;
+    }
     if tpc_out {
         let t_zero = gb.input("ZERO", &[v, t], &vec![0.0; vocab * tokens])?;
         gb.node(
@@ -1707,22 +1998,54 @@ pub(crate) fn build_head<'a>(
     })
 }
 
-/// Whole-model weights. All layers share `layers[0]`'s head counts, `eps`, and
-/// RoPE caches (`sin`/`cos`, `[tokens, head_dim]`).
+/// RoPE tables `[positions, head_dim]` of a model for the cached and
+/// batched decoders: the pair every layer reads, and the second pair the
+/// layers with `local_rope` read (empty when no layer does).
+#[derive(Clone, Copy)]
+pub struct RopeTables<'a> {
+    pub sin: &'a [f32],
+    pub cos: &'a [f32],
+    pub sin_local: &'a [f32],
+    pub cos_local: &'a [f32],
+}
+
+impl<'a> RopeTables<'a> {
+    /// One table pair, no local one.
+    #[must_use]
+    pub fn single(sin: &'a [f32], cos: &'a [f32]) -> Self {
+        Self {
+            sin,
+            cos,
+            sin_local: &[],
+            cos_local: &[],
+        }
+    }
+}
+
+/// Whole-model weights. All layers share `layers[0]`'s head counts and
+/// `eps`; a layer's RoPE caches (`sin`/`cos`, `[tokens, head_dim]`) are
+/// one of at most two tables (the second for the `local_rope` layers), and
+/// the windowed layers share one window.
 #[derive(Clone)]
 pub struct ModelWeights<'a> {
     pub layers: Vec<LayerWeights<'a>>,
-    /// Final RMSNorm gain, length `hidden`.
+    /// Final RMSNorm gain, length `hidden`; with `final_softcap` it
+    /// already carries the `1 / cap`.
     pub final_gamma: &'a [f32],
     /// LM head, bf16 `[vocab, hidden]` (the checkpoint's layout; tied
     /// embeddings as they are).
     pub lm_head: &'a [u16],
+    /// Gemma-2 final logit softcap: the logits are `tanh(head / cap) *
+    /// cap`, with the `1 / cap` folded into `final_gamma` by the caller.
+    pub final_softcap: Option<f32>,
 }
 
-/// Build the shared inputs (activations, RoPE caches, causal mask) and the
+/// Build the shared inputs (activations, RoPE caches, causal masks) and the
 /// decoder stack up to and including layer `upto`, returning the graph and the
 /// last layer's output tensor. `probe_out` makes layer `upto` write into that
-/// persistent tensor.
+/// persistent tensor. The first RoPE table is the one of the first layer
+/// without `local_rope`, the second that of the first layer with it; the
+/// windowed layers' common window builds the second mask.
 #[allow(clippy::too_many_arguments)]
 fn build_stack<'a>(
     x: &[f32],
@@ -1731,38 +2054,61 @@ fn build_stack<'a>(
     hidden: usize,
     inter: usize,
     causal: bool,
-    window: Option<usize>,
     upto: usize,
     probe_out: Option<synTensor>,
 ) -> Result<(Gb<'a>, synTensor)> {
     let l0 = &m.layers[0];
     let hd = l0.head_dim;
-    assert_eq!(l0.sin.len(), tokens * hd);
     let (t, h, hd64) = (tokens as u64, hidden as u64, hd as u64);
     let mut gb = Gb::new()?;
     let t_x = gb.input("X", &[h, t], x)?;
-    let t_sin = gb.input("SIN", &[hd64, t], l0.sin)?;
-    let t_cos = gb.input("COS", &[hd64, t], l0.cos)?;
-    // Causal mask laid out like the score matrix: [key (FCD), query].
-    let mask_host: Vec<f32> = (0..tokens * tokens)
-        .map(|idx| {
-            let (q, k) = (idx / tokens, idx % tokens);
-            if k <= q && window.is_none_or(|w| q - k < w) {
-                0.0
-            } else {
-                MASK_NEG
-            }
-        })
-        .collect();
-    let t_mask = if causal {
-        Some(gb.input("MASK", &[t, t, 1, 1], &mask_host)?)
+    let global = m.layers.iter().find(|l| !l.local_rope).unwrap_or(l0);
+    assert_eq!(global.sin.len(), tokens * hd);
+    let t_sin = gb.input("SIN", &[hd64, t], global.sin)?;
+    let t_cos = gb.input("COS", &[hd64, t], global.cos)?;
+    let (t_sin_local, t_cos_local) = match m.layers.iter().find(|l| l.local_rope) {
+        Some(l) => {
+            assert_eq!(l.sin.len(), tokens * hd);
+            (
+                Some(gb.input("SINL", &[hd64, t], l.sin)?),
+                Some(gb.input("COSL", &[hd64, t], l.cos)?),
+            )
+        }
+        None => (None, None),
+    };
+    // Causal masks laid out like the score matrix: [key (FCD), query]; a
+    // key is visible when it is at or before the query and, for the
+    // windowed layers, within the window.
+    let mask_host = |window: Option<usize>| -> Vec<f32> {
+        (0..tokens * tokens)
+            .map(|idx| {
+                let (q, k) = (idx / tokens, idx % tokens);
+                if k <= q && window.is_none_or(|w| q - k < w) {
+                    0.0
+                } else {
+                    MASK_NEG
+                }
+            })
+            .collect()
+    };
+    let window = common_window(&m.layers);
+    let t_mask = if causal && uses_full_mask(&m.layers) {
+        Some(gb.input("MASK", &[t, t, 1, 1], &mask_host(None))?)
+    } else {
+        None
+    };
+    let t_mask_window = if causal && window.is_some() {
+        Some(gb.input("MASKW", &[t, t, 1, 1], &mask_host(window))?)
     } else {
         None
     };
     let sh = Shared {
         sin: t_sin,
         cos: t_cos,
+        sin_local: t_sin_local,
+        cos_local: t_cos_local,
         mask: t_mask,
+        mask_window: t_mask_window,
         cache: None,
         kidx: None,
         inplace: true,
@@ -1782,26 +2128,10 @@ fn build_stack<'a>(
     Ok((gb, cur))
 }
 
-/// [`model_forward_bf16_window`] without a sliding window.
-///
-/// # Errors
-///
-/// Returns an error if any SynapseAI call fails.
-pub fn model_forward_bf16(
-    x: &[f32],
-    m: &ModelWeights<'_>,
-    tokens: usize,
-    hidden: usize,
-    inter: usize,
-    vocab: usize,
-    causal: bool,
-) -> Result<Vec<f32>> {
-    model_forward_bf16_window(x, m, tokens, hidden, inter, vocab, causal, None)
-}
-
 /// Run the full forward pass on `x` (`[tokens, hidden]` embeddings, row-major)
 /// and return logits `[tokens, vocab]` as f32. With `causal`, key positions
-/// after the query are masked out in every layer. `hidden`, `inter`, and
+/// after the query are masked out in every layer (and, in the layers with a
+/// window, the positions further back than it). `hidden`, `inter`, and
 /// `vocab` should be at least 128 (per-head sizes may be smaller).
 ///
 /// # Errors
@@ -1811,8 +2141,7 @@ pub fn model_forward_bf16(
 /// # Panics
 ///
 /// Panics if `layers` is empty or any buffer length disagrees with the sizes.
-#[allow(clippy::too_many_arguments)]
-pub fn model_forward_bf16_window(
+pub fn model_forward_bf16(
     x: &[f32],
     m: &ModelWeights<'_>,
     tokens: usize,
@@ -1820,14 +2149,13 @@ pub fn model_forward_bf16_window(
     inter: usize,
     vocab: usize,
     causal: bool,
-    window: Option<usize>,
 ) -> Result<Vec<f32>> {
     assert!(!m.layers.is_empty());
     assert_eq!(x.len(), tokens * hidden);
     assert_eq!(m.final_gamma.len(), hidden);
     assert_eq!(m.lm_head.len(), hidden * vocab);
     let last = m.layers.len() - 1;
-    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, window, last, None)?;
+    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, last, None)?;
     let out = build_head(&mut gb, cur, m, tokens, hidden, vocab, false)?;
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
@@ -1856,7 +2184,7 @@ pub fn model_probe_bf16(
     let (t, h) = (tokens as u64, hidden as u64);
     // Build the stack, then expose the last layer's output through a TPC
     // identity into a dedicated persistent tensor that is read back.
-    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, None, upto, None)?;
+    let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, upto, None)?;
     let (t_probe, n_probe) = gb.output("PROBE", &[h, t], SYN_TYPE_BF16)?;
     let t_zero = gb.input("ZERO", &[h, t], &vec![0.0; hidden * tokens])?;
     gb.node(
@@ -1875,7 +2203,8 @@ pub fn model_probe_bf16(
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
 
-/// One decoder layer on the CPU (f32), with optional causal masking and GQA.
+/// One decoder layer on the CPU (f32), with optional causal masking (and
+/// the layer's sliding window, if any) and GQA.
 #[must_use]
 pub fn layer_cpu(
     x: &[f32],
@@ -1963,9 +2292,10 @@ pub fn layer_cpu(
     };
     // The scale rides on `wq` (and `bq`), or on the q norm gain when the
     // model has one (the norm would divide it out of `wq`).
-    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let scale = score_scale(w);
+    let q_scale = if w.qn.is_empty() { scale } else { 1.0 };
     let wq_scaled = scaled_wq(w);
-    let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+    let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
     let bias = |mut m: Vec<f32>, b: &[f32], scale: f32| -> Vec<f32> {
         if !b.is_empty() {
             let cols = b.len();
@@ -2000,22 +2330,35 @@ pub fn layer_cpu(
         let qoff = head * hd;
         let koff = g * hd;
         for qi in 0..tokens {
-            let limit = if causal { qi + 1 } else { tokens };
-            for (ki, s) in scores.iter_mut().enumerate().take(limit) {
+            // Keys `first..limit` are visible: up to the query (causal)
+            // and, with a window, not further back than it.
+            let (first, limit) = if causal {
+                (
+                    w.window.map_or(0, |win| (qi + 1).saturating_sub(win)),
+                    qi + 1,
+                )
+            } else {
+                (0, tokens)
+            };
+            for (ki, s) in scores.iter_mut().enumerate().take(limit).skip(first) {
                 *s = (0..hd)
                     .map(|d| qr[qi * qw + qoff + d] * kr[ki * kvd + koff + d])
                     .sum();
+                // Gemma-2 softcap; the scores already carry `1 / cap`.
+                if let Some(cap) = w.attn_softcap {
+                    *s = s.tanh() * cap;
+                }
             }
-            let mx = scores[..limit]
+            let mx = scores[first..limit]
                 .iter()
                 .copied()
                 .fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for s in &mut scores[..limit] {
+            for s in &mut scores[first..limit] {
                 *s = (*s - mx).exp();
                 sum += *s;
             }
-            for (ki, s) in scores[..limit].iter().enumerate() {
+            for (ki, s) in scores[..limit].iter().enumerate().skip(first) {
                 let pr = s / sum;
                 for d in 0..hd {
                     attn[qi * qw + qoff + d] += pr * v[ki * kvd + koff + d];
@@ -2025,6 +2368,11 @@ pub fn layer_cpu(
     }
     let o = matmul(&attn, w.wo, qw, hidden);
     let o = if w.post_norm { rmsnorm(&o, w.g1) } else { o };
+    let o = if w.g_post_attn.is_empty() {
+        o
+    } else {
+        rmsnorm(&o, w.g_post_attn)
+    };
     let hres: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
     let n2 = if w.post_norm {
         hres.clone()
@@ -2033,16 +2381,23 @@ pub fn layer_cpu(
     };
     let gate = matmul(&n2, w.wg, hidden, inter);
     let up = matmul(&n2, w.wu, hidden, inter);
-    let gated: Vec<f32> = gate
-        .iter()
-        .zip(&up)
-        .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
-        .collect();
+    let act = |g: f32| match w.act {
+        Activation::Silu => g / (1.0 + (-g).exp()),
+        Activation::GeluTanh => {
+            0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044_715 * g * g * g)).tanh())
+        }
+    };
+    let gated: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| act(*g) * u).collect();
     let down = matmul(&gated, w.wd, inter, hidden);
     let down = if w.post_norm {
         rmsnorm(&down, w.g2)
     } else {
         down
+    };
+    let down = if w.g_post_mlp.is_empty() {
+        down
+    } else {
+        rmsnorm(&down, w.g_post_mlp)
     };
     hres.iter().zip(&down).map(|(a, b)| a + b).collect()
 }
@@ -2073,6 +2428,11 @@ pub fn model_forward_cpu(
             for c in 0..vocab {
                 logits[tk * vocab + c] += nv * bf16_to_f32(m.lm_head[c * hidden + p]);
             }
+        }
+    }
+    if let Some(cap) = m.final_softcap {
+        for l in &mut logits {
+            *l = l.tanh() * cap;
         }
     }
     logits

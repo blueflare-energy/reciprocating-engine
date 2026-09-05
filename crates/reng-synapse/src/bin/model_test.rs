@@ -2,10 +2,14 @@
 //! LM head, one recipe, causal, optional GQA) against a CPU reference.
 //!
 //! `cargo run -p reng-synapse --features link-synapse --bin reng-model-test -- [tokens] [hidden] [inter] [n_heads] [vocab] [layers] [causal 0/1] [n_kv_heads]`.
+//!
+//! With `RENG_TEST_GEMMA` set the layers take Gemma's form: post norms on
+//! both branches, the GELU-tanh gate, a sliding window of 100 positions on
+//! the even layers and a second RoPE table on the odd ones.
 
 use reng_synapse::{
-    LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu, model_probe_bf16,
-    model_probe_cpu, to_bf16,
+    Activation, LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu,
+    model_probe_bf16, model_probe_cpu, to_bf16,
 };
 
 /// Dense pseudo-random values in `(-scale, scale)` with no exact zeros and no
@@ -31,6 +35,8 @@ fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> 
 struct Owned {
     g1: Vec<f32>,
     g2: Vec<f32>,
+    gpa: Vec<f32>,
+    gpm: Vec<f32>,
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
@@ -55,6 +61,7 @@ fn main() -> reng_core::Result<()> {
     );
     let (vocab, n_layers, causal) = (arg(5, 512usize), arg(6, 2usize), arg(7, 1usize) != 0);
     let n_kv_heads = arg(8, n_heads);
+    let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
     let hd = hidden / n_heads;
     let kvd = n_kv_heads * hd;
     let half = hd / 2;
@@ -62,16 +69,30 @@ fn main() -> reng_core::Result<()> {
     let fan_i = 1.0 / (inter as f32).sqrt();
 
     let x = seq(tokens * hidden, 7, 3, 23, 1.0);
-    let mut sin = vec![0.0f32; tokens * hd];
-    let mut cos = vec![0.0f32; tokens * hd];
-    for p in 0..tokens {
-        for d in 0..hd {
-            let theta = p as f32 * 10000f32.powf(-2.0 * ((d % half) as f32) / hd as f32);
-            sin[p * hd + d] = theta.sin();
-            cos[p * hd + d] = theta.cos();
+    let rope = |base: f32| {
+        let mut sin = vec![0.0f32; tokens * hd];
+        let mut cos = vec![0.0f32; tokens * hd];
+        for p in 0..tokens {
+            for d in 0..hd {
+                let theta = p as f32 * base.powf(-2.0 * ((d % half) as f32) / hd as f32);
+                sin[p * hd + d] = theta.sin();
+                cos[p * hd + d] = theta.cos();
+            }
         }
-    }
+        (sin, cos)
+    };
+    let (sin, cos) = rope(10000.0);
+    let (sin_l, cos_l) = rope(1000.0);
     // Distinct weights per layer (different generator seeds).
+    let gain = |l: usize, k: usize| -> Vec<f32> {
+        if gemma {
+            (0..hidden)
+                .map(|i| 0.7 + (((i + k * l) % 9) as f32) * 0.08)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
     let owned: Vec<Owned> = (0..n_layers)
         .map(|l| Owned {
             g1: (0..hidden)
@@ -80,6 +101,8 @@ fn main() -> reng_core::Result<()> {
             g2: (0..hidden)
                 .map(|i| 1.1 - (((i + 2 * l) % 5) as f32) * 0.04)
                 .collect(),
+            gpa: gain(l, 3),
+            gpm: gain(l, 5),
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
@@ -91,13 +114,16 @@ fn main() -> reng_core::Result<()> {
         .collect();
     let layers: Vec<LayerWeights<'_>> = owned
         .iter()
-        .map(|o| LayerWeights {
+        .enumerate()
+        .map(|(l, o)| LayerWeights {
             n_heads,
             n_kv_heads,
             head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
             post_norm: false,
+            g_post_attn: &o.gpa,
+            g_post_mlp: &o.gpm,
             wq: &o.wq,
             wk: &o.wk,
             wv: &o.wv,
@@ -110,23 +136,37 @@ fn main() -> reng_core::Result<()> {
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,
-            sin: &sin,
-            cos: &cos,
+            sin: if gemma && l % 2 == 1 { &sin_l } else { &sin },
+            cos: if gemma && l % 2 == 1 { &cos_l } else { &cos },
             scale: 1.0 / (hd as f32).sqrt(),
             use_rope: true,
+            local_rope: gemma && l % 2 == 1,
+            window: if gemma && l % 2 == 0 { Some(100) } else { None },
+            act: if gemma {
+                Activation::GeluTanh
+            } else {
+                Activation::Silu
+            },
+            attn_softcap: if gemma { Some(50.0) } else { None },
             eps: 1e-6,
         })
         .collect();
-    let final_gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 3) as f32) * 0.05).collect();
+    // With the Gemma form the head softcaps the logits at 30 (the gain
+    // carries the 1/30).
+    let final_softcap = if gemma { Some(30.0) } else { None };
+    let final_gamma: Vec<f32> = (0..hidden)
+        .map(|i| (1.0 + ((i % 3) as f32) * 0.05) / final_softcap.unwrap_or(1.0))
+        .collect();
     let lm_head = to_bf16(&seq(hidden * vocab, 29, 9, 43, fan));
     let m = ModelWeights {
         layers,
         final_gamma: &final_gamma,
         lm_head: &lm_head,
+        final_softcap,
     };
 
     println!(
-        "fused model: layers={n_layers}, tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads}, vocab={vocab}, causal={causal}"
+        "fused model: layers={n_layers}, tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads}, vocab={vocab}, causal={causal}, gemma={gemma}"
     );
     // Optional 9th arg: probe the residual stream after that layer instead of
     // the logits, and report where zeros sit in the read-back buffer.

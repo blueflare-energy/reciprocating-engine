@@ -1,9 +1,11 @@
-//! One transformer decoder layer (pre-norm or OLMo-2 post-norm, RoPE,
-//! grouped-query attention, SwiGLU MLP) as a fused SynapseAI recipe. The graph construction and the
+//! One transformer decoder layer (pre-norm, OLMo-2 post-norm or Gemma's
+//! pre-and-post norms, RoPE, grouped-query attention, gated MLP) as a fused
+//! SynapseAI recipe. The graph construction and the
 //! launch/readback protocol live in `model.rs`; this module holds the layer's
 //! weight description and a single-layer convenience entry point built on the
 //! model runner so that every device path shares one readback implementation.
 
+use crate::Activation;
 use reng_core::Result;
 
 /// Weights and inputs of one decoder layer. The projections are bf16 in
@@ -32,6 +34,14 @@ pub struct LayerWeights<'a> {
     /// true for OLMo-2 post-norm (`h = x + rms(attn(x))`), as described at
     /// `g1`.
     pub post_norm: bool,
+    /// Gemma's additional post norms: RMSNorm gains applied to the
+    /// attention branch output and to the MLP branch output, each before
+    /// its residual add, on top of the pre-norms `g1`/`g2`
+    /// (`post_attention_layernorm` and `post_feedforward_layernorm` with
+    /// `input_layernorm` and `pre_feedforward_layernorm` as `g1`/`g2`);
+    /// empty when the model has none.
+    pub g_post_attn: &'a [f32],
+    pub g_post_mlp: &'a [f32],
     /// Projections stored `[out, in]`, bf16: `wq` is `(n_heads * head_dim)
     /// x hidden` and `wo` is `hidden x (n_heads * head_dim)`; `wk`, `wv`
     /// are `(n_kv_heads * head_dim) x hidden`.
@@ -57,6 +67,20 @@ pub struct LayerWeights<'a> {
     /// Whether this layer applies RoPE to q and k (false for the NoPE
     /// layers of SmolLM3).
     pub use_rope: bool,
+    /// Whether this layer's RoPE reads the model's second ("local") table
+    /// (Gemma-3 sliding layers) instead of the first.
+    pub local_rope: bool,
+    /// Sliding window in positions: a query sees only the last `window`
+    /// positions, its own included (Gemma sliding layers, Phi-3, Mistral);
+    /// `None` is full causal attention.
+    pub window: Option<usize>,
+    /// The MLP gate activation.
+    pub act: Activation,
+    /// Gemma-2 attention softcap: the scores become `tanh(scores / cap) *
+    /// cap` before the mask (the `1 / cap` is folded into the attention
+    /// scale, then a `tanh` node and a multiply by `cap`); `None` for no
+    /// softcap.
+    pub attn_softcap: Option<f32>,
     /// MLP, bf16 `[out, in]`: `wg`, `wu` are `[inter, hidden]`; `wd` is
     /// `[hidden, inter]`.
     pub wg: &'a [u16],
@@ -95,6 +119,7 @@ pub fn decoder_layer_bf16(
         layers: vec![*w],
         final_gamma: &[],
         lm_head: &[],
+        final_softcap: None,
     };
     crate::model_probe_bf16(x, &m, tokens, hidden, inter, false, 0)
 }

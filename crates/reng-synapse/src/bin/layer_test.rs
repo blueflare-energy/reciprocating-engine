@@ -8,7 +8,7 @@
 //! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
 //! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
 
-use reng_synapse::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu, to_bf16};
+use reng_synapse::{Activation, LayerWeights, decoder_layer_bf16, decoder_layer_cpu, to_bf16};
 
 /// Dense pseudo-random values in `(-scale, scale)` (xorshift64*), the same
 /// generator as `reng-model-test`. A periodic pattern would make the
@@ -92,6 +92,8 @@ fn main() -> reng_core::Result<()> {
         g1: &g1,
         g2: &g2,
         post_norm,
+        g_post_attn: &[],
+        g_post_mlp: &[],
         wq: &wq,
         wk: &wk,
         wv: &wv,
@@ -108,6 +110,10 @@ fn main() -> reng_core::Result<()> {
         cos: &cos,
         scale: 1.0 / (hd as f32).sqrt(),
         use_rope: true,
+        local_rope: false,
+        window: None,
+        act: Activation::Silu,
+        attn_softcap: None,
         eps: 1e-6,
     };
 

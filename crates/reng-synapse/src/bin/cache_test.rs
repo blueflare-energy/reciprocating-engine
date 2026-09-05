@@ -6,8 +6,14 @@
 //!
 //! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
 //! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
+//! With `RENG_TEST_GEMMA` set the layers take Gemma's form (see
+//! `reng-model-test`): post norms on both branch outputs, GELU-tanh, a
+//! window of 100 positions on the even layers and a second RoPE table on
+//! the odd ones.
 
-use reng_synapse::{CachedModel, LayerWeights, ModelWeights, model_forward_cpu, to_bf16};
+use reng_synapse::{
+    Activation, CachedModel, LayerWeights, ModelWeights, RopeTables, model_forward_cpu, to_bf16,
+};
 use std::time::Instant;
 
 /// Dense pseudo-random values in `(-scale, scale)` (xorshift64*), the same
@@ -32,6 +38,8 @@ struct Owned {
     g2: Vec<f32>,
     qn: Vec<f32>,
     kn: Vec<f32>,
+    gpa: Vec<f32>,
+    gpm: Vec<f32>,
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
@@ -74,6 +82,7 @@ fn main() -> reng_core::Result<()> {
     let decode_rows = arg(11, 0usize);
     let post_norm = arg(12, 0usize) != 0;
     let qk_norm = arg(13, 0usize);
+    let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
     let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
         tokens <= capacity,
@@ -98,21 +107,33 @@ fn main() -> reng_core::Result<()> {
     };
 
     let x = seq(tokens * hidden, 7, 3, 23, 1.0);
-    let rope = |positions: usize| {
+    let rope = |positions: usize, base: f32| {
         let mut sin = vec![0.0f32; positions * hd];
         let mut cos = vec![0.0f32; positions * hd];
         for p in 0..positions {
             for d in 0..hd {
-                let theta = p as f32 * 10000f32.powf(-2.0 * ((d % half) as f32) / hd as f32);
+                let theta = p as f32 * base.powf(-2.0 * ((d % half) as f32) / hd as f32);
                 sin[p * hd + d] = theta.sin();
                 cos[p * hd + d] = theta.cos();
             }
         }
         (sin, cos)
     };
-    // The CPU reference wants tables for the sequence; the cache for the capacity.
-    let (sin_seq, cos_seq) = rope(tokens);
-    let (sin_cap, cos_cap) = rope(capacity);
+    // The CPU reference wants tables for the sequence; the cache for the
+    // capacity. The Gemma form adds a second table (a different base).
+    let (sin_seq, cos_seq) = rope(tokens, 10000.0);
+    let (sin_cap, cos_cap) = rope(capacity, 10000.0);
+    let (sinl_seq, cosl_seq) = rope(tokens, 1000.0);
+    let (sinl_cap, cosl_cap) = rope(capacity, 1000.0);
+    let post_gain = |l: usize, k: usize| -> Vec<f32> {
+        if gemma {
+            (0..hidden)
+                .map(|i| 0.7 + (((i + k * l) % 9) as f32) * 0.08)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
     let owned: Vec<Owned> = (0..n_layers)
         .map(|l| Owned {
             g1: (0..hidden)
@@ -123,6 +144,8 @@ fn main() -> reng_core::Result<()> {
                 .collect(),
             qn: gain(qn_len, 0.95, 0.01, l),
             kn: gain(kn_len, 1.05, -0.01, l + 1),
+            gpa: post_gain(l, 3),
+            gpm: post_gain(l, 5),
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
@@ -134,13 +157,16 @@ fn main() -> reng_core::Result<()> {
         .collect();
     let layers: Vec<LayerWeights<'_>> = owned
         .iter()
-        .map(|o| LayerWeights {
+        .enumerate()
+        .map(|(l, o)| LayerWeights {
             n_heads,
             n_kv_heads,
             head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
             post_norm,
+            g_post_attn: &o.gpa,
+            g_post_mlp: &o.gpm,
             wq: &o.wq,
             wk: &o.wk,
             wv: &o.wv,
@@ -153,25 +179,57 @@ fn main() -> reng_core::Result<()> {
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,
-            sin: &sin_seq,
-            cos: &cos_seq,
+            sin: if gemma && l % 2 == 1 {
+                &sinl_seq
+            } else {
+                &sin_seq
+            },
+            cos: if gemma && l % 2 == 1 {
+                &cosl_seq
+            } else {
+                &cos_seq
+            },
             scale: 1.0 / (hd as f32).sqrt(),
             use_rope: true,
+            local_rope: gemma && l % 2 == 1,
+            window: if gemma && l % 2 == 0 { Some(100) } else { None },
+            act: if gemma {
+                Activation::GeluTanh
+            } else {
+                Activation::Silu
+            },
+            attn_softcap: if gemma { Some(50.0) } else { None },
             eps: 1e-6,
         })
         .collect();
-    let final_gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 3) as f32) * 0.05).collect();
+    // With the Gemma form the head softcaps the logits at 30 (the gain
+    // carries the 1/30).
+    let final_softcap = if gemma { Some(30.0) } else { None };
+    let final_gamma: Vec<f32> = (0..hidden)
+        .map(|i| (1.0 + ((i % 3) as f32) * 0.05) / final_softcap.unwrap_or(1.0))
+        .collect();
     let lm_head = to_bf16(&seq(hidden * vocab, 29, 9, 43, fan));
     let m = ModelWeights {
         layers,
         final_gamma: &final_gamma,
         lm_head: &lm_head,
+        final_softcap,
     };
     println!(
-        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}"
+        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}"
     );
 
     let t0 = Instant::now();
+    let rope_cap = if gemma {
+        RopeTables {
+            sin: &sin_cap,
+            cos: &cos_cap,
+            sin_local: &sinl_cap,
+            cos_local: &cosl_cap,
+        }
+    } else {
+        RopeTables::single(&sin_cap, &cos_cap)
+    };
     let mut cm = CachedModel::new(
         &m,
         hidden,
@@ -180,8 +238,7 @@ fn main() -> reng_core::Result<()> {
         rows,
         decode_rows,
         capacity,
-        &sin_cap,
-        &cos_cap,
+        &rope_cap,
     )?;
     println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
 

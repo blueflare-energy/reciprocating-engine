@@ -31,6 +31,17 @@ pub fn bf16_to_f32(x: u16) -> f32 {
     f32::from_bits(u32::from(x) << 16)
 }
 
+/// The gate activation of a decoder layer's MLP (a model-level fact, so
+/// it lives outside the SynapseAI-linked modules).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    /// `x * sigmoid(x)` (Llama and most others).
+    Silu,
+    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`, the HF
+    /// `gelu_pytorch_tanh` of Gemma.
+    GeluTanh,
+}
+
 /// `w * scale` in bf16: one rounding of the f32 product per element, as
 /// the device would see a scalar folded into a weight. Exact for
 /// power-of-two scales.
@@ -119,8 +130,8 @@ mod model;
 
 #[cfg(feature = "link-synapse")]
 pub use model::{
-    ModelWeights, layer_cpu, model_forward_bf16, model_forward_bf16_window, model_forward_cpu,
-    model_probe_bf16, model_probe_cpu,
+    ModelWeights, RopeTables, layer_cpu, model_forward_bf16, model_forward_cpu, model_probe_bf16,
+    model_probe_cpu,
 };
 
 #[cfg(feature = "link-synapse")]
@@ -142,7 +153,7 @@ pub use batched::BatchedModel;
 mod probe;
 
 #[cfg(feature = "link-synapse")]
-pub use probe::{NodeInput, SYN_TYPE_INT32, bench_node, run_node, run_node_i32};
+pub use probe::{NodeInput, SYN_TYPE_INT32, bench_node, run_node, run_node_extra, run_node_i32};
 
 /// Vendor parameter structs, for [`run_node`] probes.
 #[cfg(feature = "link-synapse")]

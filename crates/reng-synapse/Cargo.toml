@@ -136,3 +136,8 @@ required-features = ["link-synapse"]
 name = "reng-sdpa-test"
 path = "src/bin/sdpa_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-gelu-test"
+path = "src/bin/gelu_test.rs"
+required-features = ["link-synapse"]
