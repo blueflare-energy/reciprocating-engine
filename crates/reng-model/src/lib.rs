@@ -330,6 +330,50 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             let n = p(name);
             linear(st(&n), &n, o, inp)
         };
+        // Phi-3 stores q/k/v as one [q + k + v, hidden] matrix and gate/up
+        // as one [2 * inter, hidden] matrix; in the [out, in] layout the
+        // parts are contiguous row blocks.
+        let has = |name: &str| -> bool {
+            let n = p(name);
+            shards.index.contains_key(&n)
+                || (shards.index.is_empty() && parsed[0].tensor(&n).is_ok())
+        };
+        let split = |name: &str, rows: &[usize], inp: usize| -> Result<Vec<Vec<u16>>> {
+            let n = p(name);
+            let total: usize = rows.iter().sum();
+            let v = linear(st(&n), &n, total, inp)?;
+            let mut out = Vec::with_capacity(rows.len());
+            let mut at = 0;
+            for &r in rows {
+                out.push(v[at * inp..(at + r) * inp].to_vec());
+                at += r;
+            }
+            Ok(out)
+        };
+        let (wq, wk, wv) = if has("self_attn.qkv_proj.weight") {
+            let mut parts = split("self_attn.qkv_proj.weight", &[h, kvd, kvd], h)?;
+            let wv = parts.pop().unwrap();
+            let wk = parts.pop().unwrap();
+            let wq = parts.pop().unwrap();
+            (wq, wk, wv)
+        } else {
+            (
+                lin("self_attn.q_proj.weight", h, h)?,
+                lin("self_attn.k_proj.weight", kvd, h)?,
+                lin("self_attn.v_proj.weight", kvd, h)?,
+            )
+        };
+        let (wg, wu) = if has("mlp.gate_up_proj.weight") {
+            let mut parts = split("mlp.gate_up_proj.weight", &[i, i], h)?;
+            let wu = parts.pop().unwrap();
+            let wg = parts.pop().unwrap();
+            (wg, wu)
+        } else {
+            (
+                lin("mlp.gate_proj.weight", i, h)?,
+                lin("mlp.up_proj.weight", i, h)?,
+            )
+        };
         let opt = |name: &str, len: usize| -> Result<Vec<f32>> {
             let n = p(name);
             optional_vec(st(&n), &n, len)
@@ -337,15 +381,15 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
         layers.push(LayerTensors {
             g1: g("input_layernorm.weight")?,
             g2: g("post_attention_layernorm.weight")?,
-            wq: lin("self_attn.q_proj.weight", h, h)?,
-            wk: lin("self_attn.k_proj.weight", kvd, h)?,
-            wv: lin("self_attn.v_proj.weight", kvd, h)?,
+            wq,
+            wk,
+            wv,
             wo: lin("self_attn.o_proj.weight", h, h)?,
             bq: opt("self_attn.q_proj.bias", h)?,
             bk: opt("self_attn.k_proj.bias", kvd)?,
             bv: opt("self_attn.v_proj.bias", kvd)?,
-            wg: lin("mlp.gate_proj.weight", i, h)?,
-            wu: lin("mlp.up_proj.weight", i, h)?,
+            wg,
+            wu,
             wd: lin("mlp.down_proj.weight", h, i)?,
         });
     }
