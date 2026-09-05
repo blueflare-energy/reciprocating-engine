@@ -107,6 +107,15 @@ pub use model::{
 };
 
 #[cfg(feature = "link-synapse")]
+mod runtime;
+
+#[cfg(feature = "link-synapse")]
+mod cached;
+
+#[cfg(feature = "link-synapse")]
+pub use cached::CachedModel;
+
+#[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
 
 /// Run `C[m,n] = A[m,k] @ B[k,n]` in bf16 on the Gaudi2 MME and return `C` as

@@ -1,6 +1,7 @@
 //! Load a Llama-family model from a HuggingFace directory (`config.json` +
-//! `model.safetensors`) and run prefill on Gaudi2 through the fused-graph
-//! engine in `reng-synapse`.
+//! `model.safetensors`) and run it on Gaudi2 through the fused-graph engine
+//! in `reng-synapse`: one-shot prefill, or KV-cached generation through
+//! [`Generator`].
 //!
 //! Layout conventions: HF stores every `nn.Linear` weight as `[out, in]` and
 //! computes `y = x @ W^T`; the engine wants `[in, out]`, so projections are
@@ -266,24 +267,18 @@ pub fn argmax_rows(logits: &[f32], vocab: usize) -> Vec<usize> {
 /// position (padded queries sit after all real keys and are never attended).
 pub const MIN_PREFILL_TOKENS: usize = 256;
 
-/// Run causal prefill on `ids` through the fused engine and return logits
-/// `[ids.len(), vocab]`. The prompt is right-padded to
-/// [`MIN_PREFILL_TOKENS`] internally; only the real positions are returned.
-///
-/// # Errors
-///
-/// Returns an error if the device run fails.
+/// Borrow `w` as the engine's per-layer weight views, with `sin`/`cos`
+/// RoPE tables and the attention scale folded in.
 #[cfg(feature = "link-synapse")]
-pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Result<Vec<f32>> {
-    use reng_synapse::{LayerWeights, ModelWeights, model_forward_bf16};
-    let real = ids.len();
-    let tokens = real.max(MIN_PREFILL_TOKENS);
-    let mut padded: Vec<u32> = ids.to_vec();
-    padded.resize(tokens, 0);
+fn layer_views<'a>(
+    w: &'a LlamaWeights,
+    cfg: &LlamaConfig,
+    sin: &'a [f32],
+    cos: &'a [f32],
+) -> reng_synapse::ModelWeights<'a> {
+    use reng_synapse::{LayerWeights, ModelWeights};
     let hd = cfg.head_dim();
-    let (sin, cos) = rope_caches(tokens, hd, cfg.rope_theta);
-    let x = embed_tokens(w, cfg, &padded);
-    let layers: Vec<LayerWeights<'_>> = w
+    let layers: Vec<LayerWeights<'a>> = w
         .layers
         .iter()
         .map(|l| LayerWeights {
@@ -298,18 +293,37 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
             wg: &l.wg,
             wu: &l.wu,
             wd: &l.wd,
-            sin: &sin,
-            cos: &cos,
+            sin,
+            cos,
             scale: 1.0 / (hd as f32).sqrt(),
             eps: cfg.rms_norm_eps,
         })
         .collect();
-    let m = ModelWeights {
+    ModelWeights {
         layers,
         final_gamma: &w.final_gamma,
         lm_head: &w.lm_head,
-    };
-    let mut logits = model_forward_bf16(
+    }
+}
+
+/// Run causal prefill on `ids` through the fused engine and return logits
+/// `[ids.len(), vocab]`. The prompt is right-padded to
+/// [`MIN_PREFILL_TOKENS`] internally; only the real positions are returned.
+/// Each call compiles a fresh recipe; for generation use [`Generator`].
+///
+/// # Errors
+///
+/// Returns an error if the device run fails.
+#[cfg(feature = "link-synapse")]
+pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Result<Vec<f32>> {
+    let real = ids.len();
+    let tokens = real.max(MIN_PREFILL_TOKENS);
+    let mut padded: Vec<u32> = ids.to_vec();
+    padded.resize(tokens, 0);
+    let (sin, cos) = rope_caches(tokens, cfg.head_dim(), cfg.rope_theta);
+    let x = embed_tokens(w, cfg, &padded);
+    let m = layer_views(w, cfg, &sin, &cos);
+    let mut logits = reng_synapse::model_forward_bf16(
         &x,
         &m,
         tokens,
@@ -320,6 +334,77 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     )?;
     logits.truncate(real * cfg.vocab_size);
     Ok(logits)
+}
+
+/// A model compiled once with a KV cache, fed token ids block by block.
+#[cfg(feature = "link-synapse")]
+pub struct Generator<'a> {
+    model: reng_synapse::CachedModel,
+    w: &'a LlamaWeights,
+    cfg: &'a LlamaConfig,
+}
+
+#[cfg(feature = "link-synapse")]
+impl<'a> Generator<'a> {
+    /// Compile for blocks of `rows` tokens over a cache of `capacity`
+    /// positions and upload the weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation or the upload fails.
+    pub fn new(
+        w: &'a LlamaWeights,
+        cfg: &'a LlamaConfig,
+        rows: usize,
+        capacity: usize,
+    ) -> Result<Self> {
+        let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
+        let m = layer_views(w, cfg, &sin, &cos);
+        let model = reng_synapse::CachedModel::new(
+            &m,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.vocab_size,
+            rows,
+            capacity,
+            &sin,
+            &cos,
+        )?;
+        Ok(Self { model, w, cfg })
+    }
+
+    /// Positions in the cache so far.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.model.position()
+    }
+
+    /// Forget the cached prefix.
+    pub fn reset(&mut self) {
+        self.model.reset();
+    }
+
+    /// Append `ids` to the sequence (any length that fits the cache; fed in
+    /// blocks of at most `rows`) and return the logits of the last one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty or would overflow the cache.
+    pub fn feed(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        assert!(!ids.is_empty());
+        let v = self.cfg.vocab_size;
+        let mut last = Vec::new();
+        for block in ids.chunks(self.model.rows()) {
+            let x = embed_tokens(self.w, self.cfg, block);
+            let logits = self.model.step(&x)?;
+            last = logits[(block.len() - 1) * v..].to_vec();
+        }
+        Ok(last)
+    }
 }
 
 #[cfg(test)]

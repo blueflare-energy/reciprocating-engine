@@ -41,10 +41,13 @@ what the machine can actually do rather than to an arbitrary baseline.
   driver's late-completing writes.
 - `reng-model`: loads a Hugging Face `config.json` plus `model.safetensors`
   and runs prefill (`reng-prefill`) and greedy generation (`reng-generate`)
-  on the device. SmolLM2-135M matches the f32 transformers reference on
-  per-position argmax (cosine 1.000 on the last logits at 128 tokens); greedy
-  decoding matches token for token except at f32 near-ties, which bf16 cannot
-  resolve. `tools/oracle/` holds the reference scripts.
+  on the device. Generation compiles the model once with a KV cache and
+  launches the recipe once per token; keys and values stay in HBM and only
+  the new token's logits cross the bus. SmolLM2-135M matches the f32
+  transformers reference on per-position argmax (cosine 1.000 on the last
+  logits at 128 tokens) and greedy decoding matches token for token except
+  at f32 near-ties, which bf16 cannot resolve. `tools/oracle/` holds the
+  reference scripts.
 
 ```console
 $ reng devices
@@ -54,8 +57,9 @@ INDEX  PCI              STEPPING
 ...
 ```
 
-Generation has no KV cache yet: each step re-runs prefill, so the loop is
-correct but slow. The cached decode path is next.
+The cached decode step is about 11 ms for SmolLM2-135M at batch 1, most of
+it launch overhead and the readback protocol rather than compute; the
+performance work against the roofline starts from here.
 
 ## Layout
 

@@ -10,25 +10,26 @@
 //! Grouped-query attention is supported: query head `j` uses K/V head
 //! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention.
 //!
-//! Readback: on this stack the stream and device syncs return before a deep
-//! recipe has finished writing its output, so the output is pre-filled with a
-//! NaN sentinel and copied down until no sentinel remains (exact completion,
-//! since every output element is written exactly once).
+//! With a KV cache (see `cached.rs`) each layer also reads per-head cache
+//! tensors `[head_dim, capacity]` and writes the block's new per-head keys and
+//! values to device-resident outputs; attention runs over the concatenation
+//! of cache and block with a mask that admits the filled cache prefix and the
+//! causal part of the block.
 //!
-//! Diagnostic environment switches (all off by default): `RENG_DEVSYNC`
-//! (device-wide sync after launch), `RENG_SETTLE_MS` (sleep before readback),
-//! `RENG_EVBRIDGE` (event-gated readback on a second stream), `RENG_SERIALIZE`
-//! (explicit dependency chain over all nodes), `RENG_PERSIST_LAYERS` (every
-//! layer output is a persistent tensor instead of a workspace tensor),
-//! `RENG_READBACK_TRACE` (print readback poll counts).
+//! Launch and readback (including the completion protocol) live in
+//! `runtime.rs`. Diagnostic environment switches (all off by default):
+//! `RENG_DEVSYNC` (device-wide sync after launch), `RENG_SETTLE_MS` (sleep
+//! before readback), `RENG_EVBRIDGE` (event-gated readback on a second
+//! stream), `RENG_SERIALIZE` (explicit dependency chain over all nodes),
+//! `RENG_PERSIST_LAYERS` (every layer output is a persistent tensor instead
+//! of a workspace tensor), `RENG_READBACK_TRACE` (print readback poll counts).
 
 use crate::LayerWeights;
 use crate::ffi::*;
-use crate::{bf16_to_f32, f32_to_bf16};
+use crate::runtime::{Out, Runtime};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::ffi::CString;
-use std::time::{Duration, Instant};
 
 macro_rules! syn {
     ($call:expr) => {{
@@ -63,26 +64,13 @@ struct AxisParams {
 
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
 /// to exactly zero in bf16 softmax while staying representable.
-const MASK_NEG: f32 = -30000.0;
-
-/// bf16 quiet-NaN pattern the output buffer is pre-filled with before launch.
-/// The recipe writes every output element exactly once and never produces this
-/// exact NaN, so "no sentinel left" is an exact completion test for the
-/// readback (the stream and device syncs return before deep recipes finish).
-const SENTINEL_BF16: u16 = 0x7FC1;
-const SENTINEL_D32: u32 = 0x7FC1_7FC1;
-/// Upper bound on waiting for a recipe's output to complete.
-const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
-/// Spacing between the consecutive readbacks that must agree before the
-/// output is trusted. Measured: a 5 ms settle after the stream sync was always
-/// enough for a 4-layer graph whose plain readback was wrong 4 times in 4.
-const STABILITY_WINDOW: Duration = Duration::from_millis(5);
+pub(crate) const MASK_NEG: f32 = -30000.0;
 
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
 }
 
-fn make_tensor(
+pub(crate) fn make_tensor(
     graph: synGraphHandle,
     name: &str,
     sizes: &[u64],
@@ -115,20 +103,20 @@ fn make_tensor(
 
 /// Accumulates a graph: persistent inputs (with their host data), persistent
 /// scratch tensors (device-resident, not read back), internal tensors, and
-/// nodes. Launch plumbing lives in [`run_graph`].
-struct Gb {
-    graph: synGraphHandle,
-    names: Vec<CString>,
-    sizes: Vec<Vec<u64>>,
-    data: Vec<Vec<f32>>,
-    scratch_names: Vec<CString>,
-    scratch_sizes: Vec<Vec<u64>>,
+/// nodes. Launch plumbing lives in [`Runtime`].
+pub(crate) struct Gb {
+    pub graph: synGraphHandle,
+    pub names: Vec<CString>,
+    pub sizes: Vec<Vec<u64>>,
+    pub data: Vec<Vec<f32>>,
+    pub scratch_names: Vec<CString>,
+    pub scratch_sizes: Vec<Vec<u64>>,
     /// Node ids in creation order (a valid topological order for our graphs).
     node_ids: Vec<synNodeId>,
 }
 
 impl Gb {
-    fn new() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         syn!(synInitialize());
         let mut graph: synGraphHandle = core::ptr::null_mut();
         syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
@@ -144,7 +132,7 @@ impl Gb {
     }
 
     /// A persistent bf16 input tensor whose host data is uploaded at launch.
-    fn input(&mut self, name: &str, sizes: &[u64], data: &[f32]) -> Result<synTensor> {
+    pub fn input(&mut self, name: &str, sizes: &[u64], data: &[f32]) -> Result<synTensor> {
         debug_assert_eq!(sizes.iter().product::<u64>() as usize, data.len());
         let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
         self.names.push(cname);
@@ -155,7 +143,7 @@ impl Gb {
 
     /// A persistent bf16 tensor that gets its own device buffer at launch but
     /// is neither uploaded nor read back (device-resident intermediate).
-    fn scratch(&mut self, name: &str, sizes: &[u64]) -> Result<synTensor> {
+    pub fn scratch(&mut self, name: &str, sizes: &[u64]) -> Result<synTensor> {
         let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
@@ -163,11 +151,11 @@ impl Gb {
     }
 
     /// A graph-internal tensor.
-    fn mid(&self, name: &str, sizes: &[u64], dtype: core::ffi::c_int) -> Result<synTensor> {
+    pub fn mid(&self, name: &str, sizes: &[u64], dtype: core::ffi::c_int) -> Result<synTensor> {
         Ok(make_tensor(self.graph, name, sizes, dtype, false)?.0)
     }
 
-    fn node(
+    pub fn node(
         &mut self,
         guid: &str,
         name: &str,
@@ -199,7 +187,7 @@ impl Gb {
 
     /// Diagnostic (`RENG_SERIALIZE`): an explicit control dependency from every
     /// node to the next one in creation order, forcing sequential execution.
-    fn serialize_if_requested(&self) -> Result<()> {
+    pub fn serialize_if_requested(&self) -> Result<()> {
         if !env_on("RENG_SERIALIZE") {
             return Ok(());
         }
@@ -211,17 +199,35 @@ impl Gb {
 }
 
 /// Shared per-graph tensors a layer needs besides its own weights.
-struct Shared {
-    sin: synTensor,
-    cos: synTensor,
-    mask: Option<synTensor>,
+pub(crate) struct Shared {
+    pub sin: synTensor,
+    pub cos: synTensor,
+    /// Additive mask laid out like the score matrix, `[keys, queries]`.
+    pub mask: Option<synTensor>,
+    /// KV-cache capacity in positions. When set, every layer gets per-head
+    /// cache inputs and per-head new-K/V outputs (see [`cache_names`]), and
+    /// the key axis of the scores is `capacity + tokens`.
+    pub cache: Option<usize>,
+}
+
+/// Persistent tensor names of layer `li`'s cache state for KV head `g`:
+/// `(k_cache, v_cache, k_new, v_new)`. The caches are `[head_dim, capacity]`,
+/// the new tensors `[head_dim, tokens]` (keys after RoPE).
+#[must_use]
+pub fn cache_names(li: usize, g: usize) -> (String, String, String, String) {
+    (
+        format!("l{li}_kc{g}"),
+        format!("l{li}_vc{g}"),
+        format!("l{li}_kn{g}"),
+        format!("l{li}_vn{g}"),
+    )
 }
 
 /// Append one decoder layer reading `x` and return its output tensor. When
 /// `out` is given (a persistent tensor) the layer writes into it instead of a
 /// graph-internal tensor.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn build_layer(
+pub(crate) fn build_layer(
     gb: &mut Gb,
     li: usize,
     x: synTensor,
@@ -278,6 +284,8 @@ fn build_layer(
         None => gb.mid(&p("out"), &[h, t], bf)?,
     };
 
+    // Key axis of the score matrices: the cache prefix (if any) plus the block.
+    let keys = sh.cache.map_or(t, |c| c as u64 + t);
     let rms = RmsNormParams {
         epsilon: w.eps,
         fused_gamma_beta: false,
@@ -286,6 +294,7 @@ fn build_layer(
     };
     let rope = RopeParams { offset: 0, mode: 0 };
     let axis0 = AxisParams { axis: 0 };
+    let axis1 = AxisParams { axis: 1 };
     let gemm = synGEMMParams {
         transpose_a: false,
         transpose_b: false,
@@ -305,6 +314,10 @@ fn build_layer(
     );
     let pax = (
         (&raw const axis0).cast::<c_void>(),
+        core::mem::size_of::<AxisParams>() as u32,
+    );
+    let pax1 = (
+        (&raw const axis1).cast::<c_void>(),
         core::mem::size_of::<AxisParams>() as u32,
     );
     let pg = (
@@ -333,7 +346,9 @@ fn build_layer(
     gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
     gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
 
-    // Per-head slices (split only when there is more than one slice).
+    // Per-head slices (split only when there is more than one slice). With a
+    // cache, the per-head values and rotated keys of this block are
+    // device-resident outputs the caller copies into the cache after launch.
     let heads = |gb: &Gb, pre: &str, count: usize| -> Result<Vec<synTensor>> {
         (0..count)
             .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
@@ -346,17 +361,41 @@ fn build_layer(
     } else {
         vec![t_q]
     };
-    let (ks, vs) = if nkv > 1 {
-        let (k_h, v_h) = (heads(gb, "k", nkv)?, heads(gb, "v", nkv)?);
+    let ks = if nkv > 1 {
+        let k_h = heads(gb, "k", nkv)?;
         gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
-        gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
-        (k_h, v_h)
+        k_h
     } else {
-        (vec![t_k], vec![t_v])
+        vec![t_k]
     };
-    let mut kr_h: Vec<synTensor> = Vec::with_capacity(nkv);
+    let vs = if sh.cache.is_some() {
+        let mut v_h = Vec::with_capacity(nkv);
+        for g in 0..nkv {
+            v_h.push(gb.scratch(&cache_names(li, g).3, &[hd, t])?);
+        }
+        if nkv > 1 {
+            gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
+        } else {
+            gb.node("memcpy", &p("v_new"), &[t_v], &v_h, none.0, none.1)?;
+        }
+        v_h
+    } else if nkv > 1 {
+        let v_h = heads(gb, "v", nkv)?;
+        gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
+        v_h
+    } else {
+        vec![t_v]
+    };
+    // Rotated keys per KV head, then the full key/value ranges attention
+    // runs over: the block alone, or cache prefix ++ block.
+    let mut k_full: Vec<synTensor> = Vec::with_capacity(nkv);
+    let mut v_full: Vec<synTensor> = Vec::with_capacity(nkv);
     for (g, &kg) in ks.iter().enumerate() {
-        let kr = gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?;
+        let (n_kc, n_vc, n_kn, _) = cache_names(li, g);
+        let kr = match sh.cache {
+            Some(_) => gb.scratch(&n_kn, &[hd, t])?,
+            None => gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?,
+        };
         gb.node(
             "rope_st2_fwd_bf16",
             &p(&format!("rope_k{g}")),
@@ -365,14 +404,41 @@ fn build_layer(
             pr.0,
             pr.1,
         )?;
-        kr_h.push(kr);
+        if let Some(cap) = sh.cache {
+            let c = cap as u64;
+            let kc = gb.scratch(&n_kc, &[hd, c])?;
+            let vc = gb.scratch(&n_vc, &[hd, c])?;
+            let kf = gb.mid(&p(&format!("kf{g}")), &[hd, keys], bf)?;
+            let vf = gb.mid(&p(&format!("vf{g}")), &[hd, keys], bf)?;
+            gb.node(
+                "concat",
+                &p(&format!("kcat{g}")),
+                &[kc, kr],
+                &[kf],
+                pax1.0,
+                pax1.1,
+            )?;
+            gb.node(
+                "concat",
+                &p(&format!("vcat{g}")),
+                &[vc, vs[g]],
+                &[vf],
+                pax1.0,
+                pax1.1,
+            )?;
+            k_full.push(kf);
+            v_full.push(vf);
+        } else {
+            k_full.push(kr);
+            v_full.push(vs[g]);
+        }
     }
     let mut at_h: Vec<synTensor> = Vec::with_capacity(nh);
     for (j, &qj) in qs.iter().enumerate() {
         let g = j / n_rep;
         let qr = gb.mid(&p(&format!("qr{j}")), &[hd, t], bf)?;
-        let sc = gb.mid(&p(&format!("scores{j}")), &[t, t], bf)?;
-        let pr_t = gb.mid(&p(&format!("probs{j}")), &[t, t], bf)?;
+        let sc = gb.mid(&p(&format!("scores{j}")), &[keys, t], bf)?;
+        let pr_t = gb.mid(&p(&format!("probs{j}")), &[keys, t], bf)?;
         let at = gb.mid(&p(&format!("attn{j}")), &[hd, t], bf)?;
         gb.node(
             "rope_st2_fwd_bf16",
@@ -382,17 +448,17 @@ fn build_layer(
             pr.0,
             pr.1,
         )?;
-        // scores[query, key] = qr @ kr^T with K in its natural [seq, head_dim] layout.
+        // scores[query, key] = qr @ k^T with K in its natural [seq, head_dim] layout.
         gb.node(
             "gemm",
             &p(&format!("qk{j}")),
-            &[qr, kr_h[g]],
+            &[qr, k_full[g]],
             &[sc],
             pgt.0,
             pgt.1,
         )?;
         let sm_in = if let Some(mask) = sh.mask {
-            let masked = gb.mid(&p(&format!("masked{j}")), &[t, t], bf)?;
+            let masked = gb.mid(&p(&format!("masked{j}")), &[keys, t], bf)?;
             gb.node(
                 "add_fwd_bf16",
                 &p(&format!("mask{j}")),
@@ -416,7 +482,7 @@ fn build_layer(
         gb.node(
             "gemm",
             &p(&format!("av{j}")),
-            &[pr_t, vs[g]],
+            &[pr_t, v_full[g]],
             &[at],
             pg.0,
             pg.1,
@@ -498,253 +564,53 @@ fn build_layer(
     Ok(t_out)
 }
 
-/// The single persistent tensor a graph run reads back.
-struct Out {
-    tensor: synTensor,
-    name: CString,
-    sizes: Vec<u64>,
-    elems: usize,
-}
-
-fn launch_info(name: &CString, addr: u64, id: u64, sizes: &[u64]) -> synLaunchTensorInfo {
-    let mut ti = synLaunchTensorInfo {
-        tensor_name: name.as_ptr(),
-        tensor_address: addr,
-        tensor_type: SYN_TENSOR_DATA,
-        tensor_size: [0; HABANA_DIM_MAX],
-        tensor_id: id,
+/// Append the final RMSNorm and LM head reading `cur` and return the logits
+/// output `[vocab, tokens]` as the graph's read-back tensor.
+pub(crate) fn build_head(
+    gb: &mut Gb,
+    cur: synTensor,
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    vocab: usize,
+) -> Result<Out> {
+    let (t, h, v) = (tokens as u64, hidden as u64, vocab as u64);
+    let bf = SYN_TYPE_BF16;
+    let t_gf = gb.input("GF", &[h], m.final_gamma)?;
+    let t_lm = gb.input("LM", &[v, h], m.lm_head)?;
+    let t_nf = gb.mid("nf", &[h, t], bf)?;
+    let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
+    let (t_logits, n_logits) = make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?;
+    let rms = RmsNormParams {
+        epsilon: m.layers[0].eps,
+        fused_gamma_beta: false,
+        use_stages: false,
+        bwd_mode: 0,
     };
-    ti.tensor_size[..sizes.len()].copy_from_slice(sizes);
-    // A 1-D tensor (RMSNorm gain) is launched as [n, 1], never [n, 0].
-    for d in sizes.len()..2 {
-        ti.tensor_size[d] = 1;
-    }
-    ti
-}
-
-/// Compile the graph, upload inputs, launch once, and read `out` back as f32.
-#[allow(clippy::too_many_lines)]
-fn run_graph(gb: &Gb, out: &Out) -> Result<Vec<f32>> {
-    let _ = out.tensor;
-    gb.serialize_if_requested()?;
-    let graph = gb.graph;
-    let mut recipe: synRecipeHandle = core::ptr::null_mut();
-    syn!(synGraphCompile(
-        &mut recipe,
-        graph,
-        CString::new("model").unwrap().as_ptr(),
-        core::ptr::null()
-    ));
-
-    // Tensor ids: inputs, then scratch, then the output.
-    let mut name_ptrs: Vec<*const core::ffi::c_char> =
-        gb.names.iter().map(|n| n.as_ptr()).collect();
-    name_ptrs.extend(gb.scratch_names.iter().map(|n| n.as_ptr()));
-    name_ptrs.push(out.name.as_ptr());
-    let mut ids = vec![0u64; name_ptrs.len()];
-    syn!(synTensorRetrieveIds(
-        recipe,
-        name_ptrs.as_ptr(),
-        ids.as_mut_ptr(),
-        name_ptrs.len() as u32
-    ));
-
-    let mut dev: synDeviceId = 0;
-    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
-    let mut stream: synStreamHandle = core::ptr::null_mut();
-    syn!(synStreamCreateGeneric(&mut stream, dev, 0));
-
-    let n_in = gb.names.len();
-    let n_scratch = gb.scratch_names.len();
-    let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + n_scratch + 1);
-    let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in);
-    let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + n_scratch + 1);
-    for (idx, data) in gb.data.iter().enumerate() {
-        let bytes = (data.len() * 2) as u64;
-        let mut d = 0u64;
-        syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
-        let mut hb: *mut c_void = core::ptr::null_mut();
-        syn!(synHostMalloc(dev, bytes, 0, &mut hb));
-        // SAFETY: hb holds data.len() bf16 elements.
-        unsafe {
-            let pb = hb.cast::<u16>();
-            for (j, &val) in data.iter().enumerate() {
-                *pb.add(j) = f32_to_bf16(val);
-            }
-        }
-        syn!(synMemCopyAsync(
-            stream,
-            hb as u64,
-            bytes,
-            d,
-            SYN_HOST_TO_DRAM
-        ));
-        infos.push(launch_info(&gb.names[idx], d, ids[idx], &gb.sizes[idx]));
-        dev_bufs.push(d);
-        host_bufs.push(hb);
-    }
-    for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
-        let bytes = sizes.iter().product::<u64>() * 2;
-        let mut d = 0u64;
-        syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
-        infos.push(launch_info(&gb.scratch_names[k], d, ids[n_in + k], sizes));
-        dev_bufs.push(d);
-    }
-    let out_bytes = (out.elems * 2) as u64;
-    let mut d_out = 0u64;
-    syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
-    let mut h_out: *mut c_void = core::ptr::null_mut();
-    syn!(synHostMalloc(dev, out_bytes, 0, &mut h_out));
-    infos.push(launch_info(
-        &out.name,
-        d_out,
-        ids[n_in + n_scratch],
-        &out.sizes,
-    ));
-
-    let mut ws = 0u64;
-    syn!(synWorkspaceGetSize(&mut ws, recipe));
-    let mut dws = 0u64;
-    if ws > 0 {
-        syn!(synDeviceMalloc(dev, ws, 0, 0, &mut dws));
-    }
-    // Pre-fill the output with the completion sentinel (see SENTINEL_BF16).
-    syn!(synMemsetD32Async(
-        d_out,
-        SENTINEL_D32,
-        (out_bytes / 4) as usize,
-        stream
-    ));
-    syn!(synStreamSynchronize(stream));
-
-    syn!(synLaunch(
-        stream,
-        infos.as_ptr(),
-        infos.len() as u32,
-        dws,
-        recipe,
-        0
-    ));
-    syn!(synStreamSynchronize(stream));
-    if env_on("RENG_DEVSYNC") {
-        syn!(synDeviceSynchronize(dev));
-    }
-    if let Some(ms) = std::env::var("RENG_SETTLE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        std::thread::sleep(Duration::from_millis(ms));
-    }
-
-    // Readback with completion polling.
-    let read_once = |s: synStreamHandle| -> Result<()> {
-        syn!(synMemCopyAsync(
-            s,
-            d_out,
-            out_bytes,
-            h_out as u64,
-            SYN_DRAM_TO_HOST
-        ));
-        syn!(synStreamSynchronize(s));
-        Ok(())
+    let gemm = synGEMMParams {
+        transpose_a: false,
+        transpose_b: false,
     };
-    let n_out = out.elems;
-    // SAFETY (closure body): h_out holds n_out bf16 elements for the whole call.
-    let incomplete = || -> usize {
-        let p = h_out.cast::<u16>();
-        (0..n_out)
-            .filter(|&j| unsafe { *p.add(j) } == SENTINEL_BF16)
-            .count()
-    };
-    if env_on("RENG_EVBRIDGE") {
-        let mut ev: synEventHandle = core::ptr::null_mut();
-        syn!(synEventCreate(&mut ev, dev, 0));
-        syn!(synEventRecord(ev, stream));
-        let mut d2h: synStreamHandle = core::ptr::null_mut();
-        syn!(synStreamCreateGeneric(&mut d2h, dev, 0));
-        syn!(synStreamWaitEvent(d2h, ev, 0));
-        read_once(d2h)?;
-        unsafe {
-            synStreamDestroy(d2h);
-            synEventDestroy(ev);
-        }
-    } else {
-        read_once(stream)?;
-    }
-    let started = Instant::now();
-    let mut polls = 0u32;
-    let mut left = incomplete();
-    while left > 0 {
-        if started.elapsed() > READBACK_TIMEOUT {
-            return Err(Error::Other(format!(
-                "recipe output incomplete after {READBACK_TIMEOUT:?}: {left} of {n_out} elements unwritten"
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(2));
-        read_once(stream)?;
-        polls += 1;
-        left = incomplete();
-    }
-    // Stability: the recipe's final writes keep landing for a few
-    // milliseconds after the sync returns, and an intermediate write can have
-    // already replaced the sentinel, so also require two consecutive reads
-    // spaced by the measured window to be byte-identical.
-    let snapshot = |buf: *mut c_void, n: usize| -> Vec<u16> {
-        // SAFETY: buf holds n bf16 elements.
-        unsafe { std::slice::from_raw_parts(buf.cast::<u16>(), n).to_vec() }
-    };
-    let mut prev = snapshot(h_out, n_out);
-    let mut stable_polls = 0u32;
-    loop {
-        if started.elapsed() > READBACK_TIMEOUT {
-            return Err(Error::Other(format!(
-                "recipe output did not stabilise within {READBACK_TIMEOUT:?}"
-            )));
-        }
-        std::thread::sleep(STABILITY_WINDOW);
-        read_once(stream)?;
-        let cur = snapshot(h_out, n_out);
-        stable_polls += 1;
-        if cur == prev {
-            break;
-        }
-        prev = cur;
-    }
-    if (polls > 0 || stable_polls > 1) && env_on("RENG_READBACK_TRACE") {
-        eprintln!(
-            "readback: {polls} sentinel polls, {stable_polls} stability reads ({:?})",
-            started.elapsed()
-        );
-    }
-
-    let mut result = vec![0.0f32; n_out];
-    // SAFETY: h_out holds n_out bf16 elements just copied back.
-    unsafe {
-        let po = h_out.cast::<u16>();
-        for (j, o) in result.iter_mut().enumerate() {
-            *o = bf16_to_f32(*po.add(j));
-        }
-    }
-
-    unsafe {
-        for hb in host_bufs {
-            synHostFree(dev, hb, 0);
-        }
-        synHostFree(dev, h_out, 0);
-        for d in dev_bufs {
-            synDeviceFree(dev, d, 0);
-        }
-        synDeviceFree(dev, d_out, 0);
-        if dws != 0 {
-            synDeviceFree(dev, dws, 0);
-        }
-        synStreamDestroy(stream);
-        synRecipeDestroy(recipe);
-        synGraphDestroy(graph);
-        synDeviceRelease(dev);
-        synDestroy();
-    }
-    Ok(result)
+    gb.node(
+        "rms_norm_fwd_bf16",
+        "final_norm",
+        &[cur, t_gf],
+        &[t_nf, t_invf],
+        (&raw const rms).cast::<c_void>(),
+        core::mem::size_of::<RmsNormParams>() as u32,
+    )?;
+    gb.node(
+        "gemm",
+        "lm_head",
+        &[t_nf, t_lm],
+        &[t_logits],
+        (&raw const gemm).cast::<c_void>(),
+        core::mem::size_of::<synGEMMParams>() as u32,
+    )?;
+    Ok(Out {
+        name: n_logits,
+        sizes: vec![v, t],
+    })
 }
 
 /// Whole-model weights. All layers share `layers[0]`'s head counts, `eps`, and
@@ -796,6 +662,7 @@ fn build_stack(
         sin: t_sin,
         cos: t_cos,
         mask: t_mask,
+        cache: None,
     };
     let persist = env_on("RENG_PERSIST_LAYERS");
     let mut cur = t_x;
@@ -837,50 +704,10 @@ pub fn model_forward_bf16(
     assert_eq!(x.len(), tokens * hidden);
     assert_eq!(m.final_gamma.len(), hidden);
     assert_eq!(m.lm_head.len(), hidden * vocab);
-    let (t, h, v) = (tokens as u64, hidden as u64, vocab as u64);
-    let bf = SYN_TYPE_BF16;
     let last = m.layers.len() - 1;
     let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, last, None)?;
-
-    // Final norm + LM head -> logits (the only persistent output).
-    let t_gf = gb.input("GF", &[h], m.final_gamma)?;
-    let t_lm = gb.input("LM", &[v, h], m.lm_head)?;
-    let t_nf = gb.mid("nf", &[h, t], bf)?;
-    let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
-    let (t_logits, n_logits) = make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?;
-    let rms = RmsNormParams {
-        epsilon: m.layers[0].eps,
-        fused_gamma_beta: false,
-        use_stages: false,
-        bwd_mode: 0,
-    };
-    let gemm = synGEMMParams {
-        transpose_a: false,
-        transpose_b: false,
-    };
-    gb.node(
-        "rms_norm_fwd_bf16",
-        "final_norm",
-        &[cur, t_gf],
-        &[t_nf, t_invf],
-        (&raw const rms).cast::<c_void>(),
-        core::mem::size_of::<RmsNormParams>() as u32,
-    )?;
-    gb.node(
-        "gemm",
-        "lm_head",
-        &[t_nf, t_lm],
-        &[t_logits],
-        (&raw const gemm).cast::<c_void>(),
-        core::mem::size_of::<synGEMMParams>() as u32,
-    )?;
-    let out = Out {
-        tensor: t_logits,
-        name: n_logits,
-        sizes: vec![v, t],
-        elems: tokens * vocab,
-    };
-    run_graph(&gb, &out)
+    let out = build_head(&mut gb, cur, m, tokens, hidden, vocab)?;
+    Runtime::new(gb, out)?.launch_and_read(tokens)
 }
 
 /// Diagnostic: build layers `0..=upto` and read back the residual stream after
@@ -918,12 +745,10 @@ pub fn model_probe_bf16(
         0,
     )?;
     let out = Out {
-        tensor: t_probe,
         name: n_probe,
         sizes: vec![h, t],
-        elems: tokens * hidden,
     };
-    run_graph(&gb, &out)
+    Runtime::new(gb, out)?.launch_and_read(tokens)
 }
 
 /// One decoder layer on the CPU (f32), with optional causal masking and GQA.

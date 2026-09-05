@@ -1,7 +1,9 @@
-//! Greedy generation on Gaudi2 through the fused engine, the simplest correct
-//! form: every step re-runs prefill over the whole sequence and takes the
-//! argmax of the last position (no KV cache yet, so each step recompiles and
-//! reruns the full recipe).
+//! Greedy generation on Gaudi2 through the fused engine. By default the
+//! model is compiled once with a KV cache ([`Generator`]): the prompt goes in
+//! as one block per `--rows` tokens and every generated token as a block of
+//! one. `--recompute` instead re-runs prefill over the whole sequence at
+//! every step (no cache; each step compiles a fresh recipe), the slow
+//! cross-check the cached path was validated against.
 //!
 //! Without `--ref` the loop is free-running and the ids it produces are
 //! written to `out.json`. With `--ref <ref.json>` (from `generate.py`) the
@@ -12,13 +14,15 @@
 //! within bf16 rounding of each other and the mismatch is reported as a
 //! near-tie instead.
 //!
-//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] <id> [<id> ...]`
+//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]`
 
-use reng_model::{LlamaConfig, argmax_rows, load_weights, prefill_logits};
+use reng_model::{Generator, LlamaConfig, argmax_rows, load_weights, prefill_logits};
 use std::path::Path;
 use std::time::Instant;
 
 const DEFAULT_MARGIN: f32 = 0.5;
+const DEFAULT_ROWS: usize = 256;
+const DEFAULT_CAPACITY: usize = 1024;
 
 #[derive(serde::Deserialize)]
 struct RefStep {
@@ -40,11 +44,14 @@ struct Args {
     n_new: usize,
     ref_path: Option<String>,
     margin: f32,
+    rows: usize,
+    capacity: usize,
+    recompute: bool,
     ids: Vec<u32>,
 }
 
 fn parse_args() -> reng_core::Result<Args> {
-    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] <id> [<id> ...]";
+    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]";
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 4 {
         return Err(reng_core::Error::Other(usage.into()));
@@ -54,11 +61,23 @@ fn parse_args() -> reng_core::Result<Args> {
         .map_err(|e| reng_core::Error::Other(format!("n_new: {e}")))?;
     let mut ref_path = None;
     let mut margin = DEFAULT_MARGIN;
+    let mut rows = DEFAULT_ROWS;
+    let mut capacity = DEFAULT_CAPACITY;
+    let mut recompute = false;
     let mut i = 3;
     while i < args.len() && args[i].starts_with("--") {
+        if args[i] == "--recompute" {
+            recompute = true;
+            i += 1;
+            continue;
+        }
         let val = args
             .get(i + 1)
             .ok_or_else(|| reng_core::Error::Other(usage.into()))?;
+        let num = |what: &str| {
+            val.parse::<usize>()
+                .map_err(|e| reng_core::Error::Other(format!("{what}: {e}")))
+        };
         match args[i].as_str() {
             "--ref" => ref_path = Some(val.clone()),
             "--margin" => {
@@ -66,6 +85,8 @@ fn parse_args() -> reng_core::Result<Args> {
                     .parse()
                     .map_err(|e| reng_core::Error::Other(format!("margin: {e}")))?;
             }
+            "--rows" => rows = num("rows")?,
+            "--capacity" => capacity = num("capacity")?,
             other => {
                 return Err(reng_core::Error::Other(format!("unknown flag {other}")));
             }
@@ -86,6 +107,9 @@ fn parse_args() -> reng_core::Result<Args> {
         n_new,
         ref_path,
         margin,
+        rows,
+        capacity,
+        recompute,
         ids,
     })
 }
@@ -113,15 +137,46 @@ fn main() -> reng_core::Result<()> {
     let mut step_secs: Vec<f32> = Vec::with_capacity(n_new);
     let mut near_ties = 0usize;
     let mut failures: Vec<String> = Vec::new();
+    let mut cached = if a.recompute {
+        None
+    } else {
+        assert!(
+            prompt_len + n_new <= a.capacity,
+            "prompt {prompt_len} + {n_new} new tokens exceed the cache capacity {}",
+            a.capacity
+        );
+        let t0 = Instant::now();
+        let g = Generator::new(&w, &cfg, a.rows, a.capacity)?;
+        println!(
+            "compiled cached model (rows {}, capacity {}): {:.2}s",
+            a.rows,
+            a.capacity,
+            t0.elapsed().as_secs_f32()
+        );
+        Some(g)
+    };
+    // What the cached model has not seen yet: the whole prompt, then the
+    // token appended at the previous step.
+    let mut pending = 0;
     for step in 0..n_new {
         let t0 = Instant::now();
-        let logits = prefill_logits(&w, &cfg, &ids)?;
-        let last = argmax_rows(&logits[(ids.len() - 1) * vocab..], vocab)[0] as u32;
+        let last_logits = match cached.as_mut() {
+            Some(g) => g.feed(&ids[pending..])?,
+            None => {
+                let logits = prefill_logits(&w, &cfg, &ids)?;
+                logits[(ids.len() - 1) * vocab..].to_vec()
+            }
+        };
+        pending = ids.len();
+        let last = argmax_rows(&last_logits, vocab)[0] as u32;
         step_secs.push(t0.elapsed().as_secs_f32());
         generated.push(last);
         match &reference {
             None => {
-                println!("step {step}: next id {last}  ({:.2}s)", step_secs[step]);
+                println!(
+                    "step {step}: next id {last}  ({:.1} ms)",
+                    step_secs[step] * 1000.0
+                );
                 ids.push(last);
             }
             Some(r) => {
@@ -146,8 +201,8 @@ fn main() -> reng_core::Result<()> {
                 };
                 let margin = r.steps.get(step).map_or(f32::NAN, |s| s.margin);
                 println!(
-                    "step {step}: engine {last}  ref {want}  margin {margin:.3}  {verdict}  ({:.2}s)",
-                    step_secs[step]
+                    "step {step}: engine {last}  ref {want}  margin {margin:.3}  {verdict}  ({:.1} ms)",
+                    step_secs[step] * 1000.0
                 );
                 ids.push(want);
             }
@@ -157,6 +212,7 @@ fn main() -> reng_core::Result<()> {
         "prompt": &ids[..prompt_len],
         "generated": generated,
         "teacher_forced": reference.is_some(),
+        "kv_cache": !a.recompute,
         "step_seconds": step_secs,
     });
     std::fs::write(&a.out_path, out.to_string())
