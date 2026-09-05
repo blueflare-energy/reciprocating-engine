@@ -47,10 +47,22 @@ pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32
 pub(crate) mod ffi;
 
 #[cfg(feature = "link-synapse")]
+mod device;
+
+#[cfg(feature = "link-synapse")]
+pub use device::Device;
+
+#[cfg(feature = "link-synapse")]
 mod chain;
 
 #[cfg(feature = "link-synapse")]
 pub use chain::{matmul_chain_bf16, matmul_chain_cpu};
+
+#[cfg(feature = "link-synapse")]
+mod mm;
+
+#[cfg(feature = "link-synapse")]
+pub use mm::{gemm_bf16, gemm_cpu};
 
 #[cfg(feature = "link-synapse")]
 mod ops;

@@ -82,6 +82,7 @@ unsafe extern "C" {
     ) -> synStatus;
     pub fn synStreamDestroy(streamHandle: synStreamHandle) -> synStatus;
     pub fn synStreamSynchronize(streamHandle: synStreamHandle) -> synStatus;
+    pub fn synDeviceSynchronize(deviceId: synDeviceId) -> synStatus;
     pub fn synMemCopyAsync(
         streamHandle: synStreamHandle,
         src: u64,
@@ -91,6 +92,8 @@ unsafe extern "C" {
     ) -> synStatus;
     pub fn synGraphCreate(pGraphHandle: *mut synGraphHandle, deviceType: c_int) -> synStatus;
     pub fn synGraphDestroy(graphHandle: synGraphHandle) -> synStatus;
+    pub fn synRecipeDestroy(recipeHandle: synRecipeHandle) -> synStatus;
+    pub fn synSectionDestroy(sectionHandle: synSectionHandle) -> synStatus;
     pub fn synGraphCompile(
         pRecipeHandle: *mut synRecipeHandle,
         graphHandle: synGraphHandle,

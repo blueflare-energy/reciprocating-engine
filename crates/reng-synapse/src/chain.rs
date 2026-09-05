@@ -206,7 +206,6 @@ pub fn matmul_chain_bf16(a: &[f32], w: &[f32], d: usize, depth: usize) -> Result
     ];
     syn!(synLaunch(stream, infos.as_ptr(), 3, ws_addr, recipe, 0));
     syn!(synStreamSynchronize(stream));
-
     syn!(synMemCopyAsync(
         stream,
         dev_out,

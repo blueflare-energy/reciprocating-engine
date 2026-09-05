@@ -7,8 +7,14 @@
 use reng_synapse::{matmul_chain_bf16, matmul_chain_cpu};
 
 fn main() -> reng_core::Result<()> {
-    let d = 512usize;
-    let depth = 12usize;
+    let depth = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(12usize);
+    let d = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(512usize);
     let s = 1.0 / (d as f32).sqrt(); // keep the chain O(1) in magnitude
 
     let a: Vec<f32> = (0..d * d)

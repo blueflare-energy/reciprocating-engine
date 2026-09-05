@@ -41,3 +41,8 @@ required-features = ["link-synapse"]
 name = "reng-attn-test"
 path = "src/bin/attn_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-gemm-test"
+path = "src/bin/gemm_test.rs"
+required-features = ["link-synapse"]

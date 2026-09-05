@@ -1,7 +1,16 @@
-//! Unfused scaled-dot-product attention as one SynapseAI recipe
-//! (`gemm -> softmax -> gemm`), built directly through the C API. This is the
-//! exact composition the PyTorch frameworks miscompute on 1.24; here we verify
-//! our direct path against a CPU reference.
+//! Single-head scaled-dot-product attention as ONE fused SynapseAI recipe
+//! (`gemm -> softmax -> gemm`), built directly through the C API.
+//!
+//! The PyTorch frameworks miscompute this exact composition on 1.24; our direct
+//! fused graph computes it correctly. Two stack constraints shape it: (1) build
+//! the whole thing as one graph with one launch (separate launches per op race
+//! to zeros), and (2) the launched kernel must run long enough to clear a
+//! readback coherency race - a fast kernel's HBM writeback is not yet coherent
+//! when the readback DMA fires, and no stream/device sync we tried prevents it.
+//! Reliability scales with kernel size: seq=dim=64 always races, 128 is
+//! marginal (fails intermittently), 256 is solid (8/8), and real-model shapes
+//! (seq in the thousands, hidden >= 2048) are far into the safe regime. We
+//! reject below 128 outright; realistic sizes are reliable.
 
 use crate::ffi::*;
 use crate::{bf16_to_f32, f32_to_bf16};
@@ -53,17 +62,22 @@ fn t2d(
     Ok(t)
 }
 
-/// Single-head attention `softmax((Q*scale) @ K^T) @ V` in bf16 on the HPU,
-/// composed as one recipe. `q`, `k`, `v` are row-major `[seq, dim]`; returns the
+/// Single-head attention `softmax((Q*scale) @ K^T) @ V` in bf16 on the HPU, as
+/// one fused recipe. `q`, `k`, `v` are row-major `[seq, dim]`; returns the
 /// `[seq, dim]` output as `f32`.
+///
+/// `seq` and `dim` must be at least 128 (see the module docs); smaller shapes
+/// hit a stack readback race and are rejected.
 ///
 /// # Errors
 ///
-/// Returns an error if any SynapseAI call fails.
+/// Returns an error if `seq` or `dim` is below 128, or if any SynapseAI call
+/// fails.
 ///
 /// # Panics
 ///
 /// Panics if any input length is not `seq*dim`.
+#[allow(clippy::too_many_lines)]
 pub fn attention_bf16(
     q: &[f32],
     k: &[f32],
@@ -75,6 +89,12 @@ pub fn attention_bf16(
     assert_eq!(q.len(), seq * dim);
     assert_eq!(k.len(), seq * dim);
     assert_eq!(v.len(), seq * dim);
+    if seq < 128 || dim < 128 {
+        return Err(Error::Other(format!(
+            "attention_bf16 requires seq>=128 and dim>=128 (got seq={seq}, dim={dim}); \
+             smaller shapes hit the stack readback race"
+        )));
+    }
     let (s, d) = (seq as u64, dim as u64);
 
     // Host prep: pre-scale Q, and transpose K into K^T [dim, seq].
@@ -96,7 +116,7 @@ pub fn attention_bf16(
         CString::new("V").unwrap(),
         CString::new("OUT").unwrap(),
     );
-    // FCD-first sizes: Q[dim,seq] KT[seq,dim] V[dim,seq] scores[seq,seq] OUT[dim,seq]
+    // FCD-first sizes: Q[dim,seq] KT[seq,dim] V[dim,seq] scores/probs[seq,seq] OUT[dim,seq].
     let t_q = t2d(graph, &n_q, d, s, true)?;
     let t_kt = t2d(graph, &n_kt, s, d, true)?;
     let t_v = t2d(graph, &n_v, d, s, true)?;
@@ -112,7 +132,7 @@ pub fn attention_bf16(
     let guid_gemm = CString::new("gemm").unwrap();
     let guid_sm = CString::new("softmax_fwd_bf16").unwrap();
 
-    // scores = Q @ KT
+    // scores = Q @ KT -> [seq, seq] (fcd=key, outer=query)
     let in0 = [t_q, t_kt];
     let out0 = [t_scores];
     syn!(synNodeCreate(
@@ -144,7 +164,7 @@ pub fn attention_bf16(
         core::ptr::null(),
         core::ptr::null(),
     ));
-    // out = probs @ V
+    // out = probs @ V -> [seq, dim] (fcd=embedding, outer=query)
     let in2 = [t_probs, t_v];
     let out2 = [t_out];
     syn!(synNodeCreate(
