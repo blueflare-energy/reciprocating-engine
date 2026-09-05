@@ -28,7 +28,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one token per launch over a B-slot KV cache; the cache is updated in place
   by a ScatterND node and the greedy token is an argmax on the device.
 - Qwen2-style attention biases; sharded safetensors checkpoints; verified
-  models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B/7B.
+  models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B/7B,
+  TinyLlama-1.1B.
 - `RENG_MODULE_ID` picks the card by its SynapseAI module id
   (`synDeviceAcquireByModuleId`); without it the runtime takes any free
   card. `HABANA_VISIBLE_DEVICES` never steered the acquire, so the bench
