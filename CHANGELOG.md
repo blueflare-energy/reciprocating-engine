@@ -33,6 +33,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DeepSeek-R1-Distill-Llama-8B and Phi-3-mini-4k-instruct (its fused
   qkv_proj and gate_up_proj weights are split into row blocks by the
   loader).
+- SmolLM3: NoPE layers (`no_rope_layers` in the config; those layers skip
+  the rotary nodes); SmolLM3-3B verified.
 - Qwen3: per-head q/k RMSNorm (`q_norm`/`k_norm` gains, applied after the
   projection and before RoPE; the attention scale folds into the q gain)
   and an explicit `head_dim` whose `num_attention_heads * head_dim` may

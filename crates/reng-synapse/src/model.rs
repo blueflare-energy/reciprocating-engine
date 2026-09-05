@@ -580,9 +580,7 @@ pub(crate) fn build_layer<'a>(
     let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
     let t_n1_4 = gb.mid(&p("n1_4"), &[h, t, 1, 1], bf)?;
     let t_q = gb.mid(&p("q"), &[hd, t, hpg, groups], bf)?;
-    let t_qr = gb.mid(&p("qr"), &[hd, t, hpg, groups], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, t, 1, groups], bf)?;
-    let t_kr = gb.mid(&p("kr"), &[hd, t, 1, groups], bf)?;
     let t_v = gb.mid(&p("v"), &[hd, t, 1, groups], bf)?;
     let t_sc = gb.mid(&p("scores"), &[keys, t, hpg, groups], bf)?;
     let t_pr = gb.mid(&p("probs"), &[keys, t, hpg, groups], bf)?;
@@ -813,22 +811,30 @@ pub(crate) fn build_layer<'a>(
         )?;
         (qn, kn)
     };
-    gb.node(
-        "rope_st2_fwd_bf16",
-        &p("rope_q"),
-        &[t_q, sh.sin, sh.cos],
-        &[t_qr],
-        pr.0,
-        pr.1,
-    )?;
-    gb.node(
-        "rope_st2_fwd_bf16",
-        &p("rope_k"),
-        &[t_k, sh.sin, sh.cos],
-        &[t_kr],
-        pr.0,
-        pr.1,
-    )?;
+    // RoPE on q and k, or neither for a NoPE layer.
+    let (t_qr, t_kr) = if w.use_rope {
+        let t_qr = gb.mid(&p("qr"), &[hd, t, hpg, groups], bf)?;
+        let t_kr = gb.mid(&p("kr"), &[hd, t, 1, groups], bf)?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p("rope_q"),
+            &[t_q, sh.sin, sh.cos],
+            &[t_qr],
+            pr.0,
+            pr.1,
+        )?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p("rope_k"),
+            &[t_k, sh.sin, sh.cos],
+            &[t_kr],
+            pr.0,
+            pr.1,
+        )?;
+        (t_qr, t_kr)
+    } else {
+        (t_q, t_k)
+    };
 
     // Keys and values attention reads: the block's own, or the cache updated
     // in place with the block: an ONNX ScatterND update writes each real row
@@ -1077,9 +1083,7 @@ pub(crate) fn build_layer_batched<'a>(
     let t_k2 = gb.mid(&p("k2"), &[hd * groups, b], bf)?;
     let t_v2 = gb.mid(&p("v2"), &[hd * groups, b], bf)?;
     let t_q = gb.mid(&p("q"), &[hd, 1, hpg, groups, b], bf)?;
-    let t_qr = gb.mid(&p("qr"), &[hd, 1, hpg, groups, b], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, 1, 1, groups, b], bf)?;
-    let t_kr = gb.mid(&p("kr"), &[hd, 1, 1, groups, b], bf)?;
     let t_v = gb.mid(&p("v"), &[hd, 1, 1, groups, b], bf)?;
     let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
     let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups, b])?;
@@ -1229,22 +1233,29 @@ pub(crate) fn build_layer_batched<'a>(
         )?;
         (qn, kn)
     };
-    gb.node(
-        "rope_st2_fwd_bf16",
-        &p("rope_q"),
-        &[t_q, sh.sin, sh.cos],
-        &[t_qr],
-        pr.0,
-        pr.1,
-    )?;
-    gb.node(
-        "rope_st2_fwd_bf16",
-        &p("rope_k"),
-        &[t_k, sh.sin, sh.cos],
-        &[t_kr],
-        pr.0,
-        pr.1,
-    )?;
+    let (t_qr, t_kr) = if w.use_rope {
+        let t_qr = gb.mid(&p("qr"), &[hd, 1, hpg, groups, b], bf)?;
+        let t_kr = gb.mid(&p("kr"), &[hd, 1, 1, groups, b], bf)?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p("rope_q"),
+            &[t_q, sh.sin, sh.cos],
+            &[t_qr],
+            pr.0,
+            pr.1,
+        )?;
+        gb.node(
+            "rope_st2_fwd_bf16",
+            &p("rope_k"),
+            &[t_k, sh.sin, sh.cos],
+            &[t_kr],
+            pr.0,
+            pr.1,
+        )?;
+        (t_qr, t_kr)
+    } else {
+        (t_q, t_k)
+    };
     gb.node(
         "reshape",
         &p("kr_updates"),
@@ -1713,11 +1724,16 @@ pub fn layer_cpu(
     head_norm(&mut k, kvd, w.kn);
     let mut qr = vec![0.0f32; tokens * qw];
     let mut kr = vec![0.0f32; tokens * kvd];
-    for head in 0..nh {
-        rope_head(&q, qw, head, &mut qr);
-    }
-    for g in 0..nkv {
-        rope_head(&k, kvd, g, &mut kr);
+    if w.use_rope {
+        for head in 0..nh {
+            rope_head(&q, qw, head, &mut qr);
+        }
+        for g in 0..nkv {
+            rope_head(&k, kvd, g, &mut kr);
+        }
+    } else {
+        qr.copy_from_slice(&q);
+        kr.copy_from_slice(&k);
     }
     let mut attn = vec![0.0f32; tokens * qw];
     let mut scores = vec![0.0f32; tokens];

@@ -41,6 +41,9 @@ pub struct LayerWeights<'a> {
     /// `qn` present the attention scale is folded into it, not into `wq`.
     pub qn: &'a [f32],
     pub kn: &'a [f32],
+    /// Whether this layer applies RoPE to q and k (false for the NoPE
+    /// layers of SmolLM3).
+    pub use_rope: bool,
     /// MLP, bf16 `[out, in]`: `wg`, `wu` are `[inter, hidden]`; `wd` is
     /// `[hidden, inter]`.
     pub wg: &'a [u16],

@@ -44,6 +44,10 @@ pub struct LlamaConfig {
     pub vocab_size: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// SmolLM3: one entry per layer, 1 where the layer uses RoPE and 0 for
+    /// a NoPE layer; absent means every layer uses RoPE.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<u8>>,
 }
 
 /// The `rope_scaling` object of a HF config. Llama 3.1 style scaling
@@ -552,7 +556,8 @@ fn layer_views<'a>(
     let layers: Vec<LayerWeights<'a>> = w
         .layers
         .iter()
-        .map(|l| LayerWeights {
+        .enumerate()
+        .map(|(li, l)| LayerWeights {
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.n_kv_heads(),
             head_dim: hd,
@@ -573,6 +578,10 @@ fn layer_views<'a>(
             sin,
             cos,
             scale: 1.0 / (hd as f32).sqrt(),
+            use_rope: cfg
+                .no_rope_layers
+                .as_ref()
+                .is_none_or(|v| v.get(li).copied().unwrap_or(1) != 0),
             eps: cfg.rms_norm_eps,
         })
         .collect();

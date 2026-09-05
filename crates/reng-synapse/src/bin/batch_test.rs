@@ -132,6 +132,7 @@ fn main() -> reng_core::Result<()> {
             sin: &sin_seq,
             cos: &cos_seq,
             scale: 1.0 / (hd as f32).sqrt(),
+            use_rope: true,
             eps: 1e-6,
         })
         .collect();
