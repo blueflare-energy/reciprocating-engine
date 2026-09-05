@@ -51,16 +51,19 @@ impl Device {
         fcd: u64,
         outer: u64,
     ) -> Result<synTensor> {
-        self.tensor_nd(graph, name, &[fcd, outer], SYN_TYPE_BF16)
+        self.tensor_nd(graph, name, &[fcd, outer], SYN_TYPE_BF16, true)
     }
 
-    /// Create a persistent tensor with FCD-first `sizes` and the given dtype.
+    /// Create a tensor with FCD-first `sizes` and the given dtype. Persistent
+    /// tensors are graph I/O (bound to an address at launch); non-persistent
+    /// tensors are graph-internal intermediates managed by the compiler.
     fn tensor_nd(
         &self,
         graph: synGraphHandle,
         name: &CString,
         sizes: &[u64],
         dtype: core::ffi::c_int,
+        persistent: bool,
     ) -> Result<synTensor> {
         let mut t: synTensor = core::ptr::null_mut();
         syn!(synTensorHandleCreate(
@@ -69,10 +72,12 @@ impl Device {
             SYN_TENSOR_DATA,
             name.as_ptr()
         ));
-        let mut sec: synSectionHandle = core::ptr::null_mut();
-        syn!(synSectionCreate(&mut sec, 0, graph));
-        syn!(synSectionSetPersistent(sec, true));
-        syn!(synTensorAssignToSection(t, sec, 0));
+        if persistent {
+            let mut sec: synSectionHandle = core::ptr::null_mut();
+            syn!(synSectionCreate(&mut sec, 0, graph));
+            syn!(synSectionSetPersistent(sec, true));
+            syn!(synTensorAssignToSection(t, sec, 0));
+        }
         let mut geo = synTensorGeometry {
             sizes: [0; HABANA_DIM_MAX],
             dims: sizes.len() as u32,
@@ -409,12 +414,12 @@ impl Device {
             CString::new("INVRMS").unwrap(),
         );
         // x, y: [features, tokens]. gamma: [features, 1]. inv_rms: [1, tokens].
-        let t_x = self.tensor_nd(graph, &n_x, &[f, t], SYN_TYPE_BF16)?;
+        let t_x = self.tensor_nd(graph, &n_x, &[f, t], SYN_TYPE_BF16, true)?;
         // gamma is 1D [features].
-        let t_g = self.tensor_nd(graph, &n_g, &[f], SYN_TYPE_BF16)?;
-        let t_y = self.tensor_nd(graph, &n_y, &[f, t], SYN_TYPE_BF16)?;
+        let t_g = self.tensor_nd(graph, &n_g, &[f], SYN_TYPE_BF16, true)?;
+        let t_y = self.tensor_nd(graph, &n_y, &[f, t], SYN_TYPE_BF16, true)?;
         // The kernel requires the inverse-RMS output in f32, shape [1, tokens].
-        let t_inv = self.tensor_nd(graph, &n_inv, &[1, t], SYN_TYPE_F32)?;
+        let t_inv = self.tensor_nd(graph, &n_inv, &[1, t], SYN_TYPE_F32, true)?;
 
         #[repr(C)]
         struct RmsNormParams {
@@ -550,6 +555,163 @@ impl Device {
             for d in [dx, dg, dy, dinv] {
                 synDeviceFree(self.id, d, 0);
             }
+            if dws != 0 {
+                synDeviceFree(self.id, dws, 0);
+            }
+            synStreamDestroy(stream);
+            synRecipeDestroy(recipe);
+            synGraphDestroy(graph);
+        }
+        Ok(out)
+    }
+
+    /// Elementwise SiLU (swish): `y = x * sigmoid(x)`, the SwiGLU activation.
+    /// `x` is treated as a `[cols, rows]` bf16 tensor (`rows*cols` elements);
+    /// shape only affects tiling, the op is elementwise. Built as one fused
+    /// recipe (`sigmoid -> mult`). Returns f32. Use a total size well above the
+    /// per-dim 128 floor (see the [`Device`] docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `x.len() != rows*cols`.
+    pub fn silu(&self, x: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>> {
+        assert_eq!(x.len(), rows * cols);
+        let (c, r) = (cols as u64, rows as u64);
+        let mut graph: synGraphHandle = core::ptr::null_mut();
+        syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
+
+        let (n_x, n_y) = (CString::new("X").unwrap(), CString::new("Y").unwrap());
+        let t_x = self.tensor(graph, &n_x, c, r)?;
+        // sigmoid output is a graph-internal intermediate (non-persistent).
+        let t_sig = self.tensor_nd(
+            graph,
+            &CString::new("sig").unwrap(),
+            &[c, r],
+            SYN_TYPE_BF16,
+            false,
+        )?;
+        let t_y = self.tensor(graph, &n_y, c, r)?;
+
+        let guid_sig = CString::new("sigmoid_fwd_bf16").unwrap();
+        let guid_mul = CString::new("mult_fwd_bf16").unwrap();
+        // sigmoid(x) -> sig
+        let in0 = [t_x];
+        let out0 = [t_sig];
+        syn!(synNodeCreate(
+            graph,
+            in0.as_ptr(),
+            out0.as_ptr(),
+            1,
+            1,
+            core::ptr::null(),
+            0,
+            guid_sig.as_ptr(),
+            CString::new("sig").unwrap().as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+        // x * sig -> y
+        let in1 = [t_x, t_sig];
+        let out1 = [t_y];
+        syn!(synNodeCreate(
+            graph,
+            in1.as_ptr(),
+            out1.as_ptr(),
+            2,
+            1,
+            core::ptr::null(),
+            0,
+            guid_mul.as_ptr(),
+            CString::new("mul").unwrap().as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+
+        let mut recipe: synRecipeHandle = core::ptr::null_mut();
+        syn!(synGraphCompile(
+            &mut recipe,
+            graph,
+            CString::new("silu").unwrap().as_ptr(),
+            core::ptr::null()
+        ));
+
+        let names = [n_x.as_ptr(), n_y.as_ptr()];
+        let mut ids: [u64; 2] = [0; 2];
+        syn!(synTensorRetrieveIds(
+            recipe,
+            names.as_ptr(),
+            ids.as_mut_ptr(),
+            2
+        ));
+
+        let bytes = (rows * cols * 2) as u64;
+        let (mut dx, mut dy) = (0u64, 0u64);
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dx));
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dy));
+        let mut ws = 0u64;
+        syn!(synWorkspaceGetSize(&mut ws, recipe));
+        let mut dws = 0u64;
+        if ws > 0 {
+            syn!(synDeviceMalloc(self.id, ws, 0, 0, &mut dws));
+        }
+
+        let (mut hx, mut hy): (*mut c_void, *mut c_void) =
+            (core::ptr::null_mut(), core::ptr::null_mut());
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hx));
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hy));
+
+        // SAFETY: hx holds rows*cols bf16 elements.
+        unsafe {
+            let px = hx.cast::<u16>();
+            for (i, &v) in x.iter().enumerate() {
+                *px.add(i) = f32_to_bf16(v);
+            }
+        }
+
+        let mut stream: synStreamHandle = core::ptr::null_mut();
+        syn!(synStreamCreateGeneric(&mut stream, self.id, 0));
+        syn!(synMemCopyAsync(
+            stream,
+            hx as u64,
+            bytes,
+            dx,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let infos = [
+            launch_info(&n_x, dx, ids[0], c, r),
+            launch_info(&n_y, dy, ids[1], c, r),
+        ];
+        syn!(synLaunch(stream, infos.as_ptr(), 2, dws, recipe, 0));
+        syn!(synStreamSynchronize(stream));
+        syn!(synMemCopyAsync(
+            stream,
+            dy,
+            bytes,
+            hy as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let mut out = vec![0.0f32; rows * cols];
+        // SAFETY: hy holds rows*cols bf16 elements just copied back.
+        unsafe {
+            let py = hy.cast::<u16>();
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = bf16_to_f32(*py.add(i));
+            }
+        }
+
+        unsafe {
+            synHostFree(self.id, hx, 0);
+            synHostFree(self.id, hy, 0);
+            synDeviceFree(self.id, dx, 0);
+            synDeviceFree(self.id, dy, 0);
             if dws != 0 {
                 synDeviceFree(self.id, dws, 0);
             }

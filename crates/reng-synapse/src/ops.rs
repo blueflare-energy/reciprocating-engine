@@ -70,6 +70,26 @@ pub fn rms_norm_cpu(
     out
 }
 
+/// Elementwise SiLU (swish) `y = x * sigmoid(x)` in bf16 on the HPU. `x` has
+/// `rows*cols` elements. Acquires and releases a device for the single call.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+///
+/// # Panics
+///
+/// Panics if `x.len() != rows*cols`.
+pub fn silu_bf16(x: &[f32], rows: usize, cols: usize) -> Result<Vec<f32>> {
+    Device::acquire()?.silu(x, rows, cols)
+}
+
+/// CPU reference elementwise SiLU `y = x * sigmoid(x)`, f32.
+#[must_use]
+pub fn silu_cpu(x: &[f32]) -> Vec<f32> {
+    x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
+}
+
 /// CPU reference row-wise softmax over `cols`, f32.
 #[must_use]
 pub fn softmax_cpu(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {

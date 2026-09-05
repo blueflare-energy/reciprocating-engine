@@ -51,3 +51,8 @@ required-features = ["link-synapse"]
 name = "reng-norm-test"
 path = "src/bin/norm_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-silu-test"
+path = "src/bin/silu_test.rs"
+required-features = ["link-synapse"]
