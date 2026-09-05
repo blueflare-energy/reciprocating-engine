@@ -146,8 +146,8 @@ mod model;
 
 #[cfg(feature = "link-synapse")]
 pub use model::{
-    ModelWeights, RopeTables, layer_cpu, model_forward_bf16, model_forward_cpu, model_probe_bf16,
-    model_probe_cpu,
+    EmbedTable, ModelWeights, RopeTables, layer_cpu, model_forward_bf16, model_forward_cpu,
+    model_probe_bf16, model_probe_cpu,
 };
 
 #[cfg(feature = "link-synapse")]

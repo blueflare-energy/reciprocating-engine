@@ -171,6 +171,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   regrown on demand (`RENG_MIN_CAP` sets the floor), since attention reads
   the whole cache every step. SmolLM2-1.7B batch 64 goes from 22% to 46% of
   the HBM ceiling with 160-token sequences.
+- Device-resident decode loop for single-sequence generation
+  (`RENG_DEVICE_LOOP`, on by default; `0` keeps the per-step path). The
+  one-row recipe's only per-launch inputs are an int32 token id and an
+  int32 position: the embedding row is a `gather_fwd_bf16` over the bf16
+  table (the LM head's device copy when tied; Gemma's `sqrt(hidden)` is
+  applied in f32 on the device and rounds like the host), the RoPE rows
+  are gathers over the full tables, each mask row is a gather over a
+  static pattern at an index the position shifts (the windowed masks and
+  Gemma's per-layer masks included), and the ScatterND triples are two
+  int32 nodes. The id, position and `IDS` tensors are rebound per launch
+  into a position table and an id ring (one cache line per position), so
+  `Generator::generate(seed, n)` enqueues `n` launches back to back and
+  reads `n` ids once; `feed_id` for one token is the same with `n = 1`,
+  and the seed is uploaded only when the last launch did not leave that
+  id in place. `reng-gather-test` pins the kernels down; `reng-cache-test`
+  feeds its one-row tail as ids through the loop and checks a run of loop
+  steps against the CPU reference and against one launch at a time.
+  Teacher-forced verdicts are unchanged on SmolLM2-135M, Qwen3-0.6B,
+  Phi-3-mini (300-token prompt), Gemma-3-270m, OLMo-2-1B and Llama-3.2-3B,
+  and free-running ids over 32 tokens are identical with and without the
+  switch on Qwen2.5-1.5B and Phi-3-mini. Decode at batch 1 (64 new
+  tokens, 128-token prompt, then 1024-token prompt): SmolLM2-135M 754 to
+  855 tok/s (772 to 847), Qwen2.5-1.5B 377 to 418 (383 to 414),
+  Llama-3.2-3B 259 to 273 (258 to 272), Qwen2.5-7B 133 to 139 (134 to
+  139); the decode step's device window is unchanged (2.37 ms on
+  Qwen2.5-1.5B either way) and the saving is the 0.15 to 0.2 ms per step
+  of launch and readback round trip.
 
 - Workspace scaffold with five crates: `reng-core`, `reng-hal`, `reng-ceiling`,
   `reng-cli`, `reng-synapse`.

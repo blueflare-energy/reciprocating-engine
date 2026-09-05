@@ -1964,7 +1964,10 @@ struct ReductionParams {
 /// the logits stay device-resident (the persistent scratch tensor
 /// `LOGITS`, readable on demand) and an argmax over the vocabulary produces
 /// the read-back tensor `IDS`, int32 `[1, tokens]`, so a decode step moves
-/// four bytes per token over the bus.
+/// four bytes per token over the bus. `lm` is the head's weight tensor
+/// when the caller created it already (the device decode loop gathers
+/// tied embeddings from it); else it is created here as input `LM`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_head<'a>(
     gb: &mut Gb<'a>,
     cur: synTensor,
@@ -1973,11 +1976,15 @@ pub(crate) fn build_head<'a>(
     hidden: usize,
     vocab: usize,
     ids_out: bool,
+    lm: Option<synTensor>,
 ) -> Result<Out> {
     let (t, h, v) = (tokens as u64, hidden as u64, vocab as u64);
     let bf = SYN_TYPE_BF16;
     let t_gf = gb.input("GF", &[h], m.final_gamma)?;
-    let t_lm = gb.input_bf16("LM", &[h, v], std::borrow::Cow::Borrowed(m.lm_head))?;
+    let t_lm = match lm {
+        Some(t) => t,
+        None => lm_head_input(gb, m, hidden, vocab)?,
+    };
     let t_nf = gb.mid("nf", &[h, t], bf)?;
     let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
     let (t_logits, n_logits) = if ids_out {
@@ -2090,6 +2097,33 @@ pub(crate) fn build_head<'a>(
         sizes: vec![1, t],
         kind: OutKind::I32,
     })
+}
+
+/// The LM head weights as the graph input `LM`, bf16 `[hidden, vocab]`
+/// (the checkpoint's `[vocab, hidden]` rows, borrowed).
+pub(crate) fn lm_head_input<'a>(
+    gb: &mut Gb<'a>,
+    m: &ModelWeights<'a>,
+    hidden: usize,
+    vocab: usize,
+) -> Result<synTensor> {
+    gb.input_bf16(
+        "LM",
+        &[hidden as u64, vocab as u64],
+        std::borrow::Cow::Borrowed(m.lm_head),
+    )
+}
+
+/// The token embedding table for the device decode loop: bf16
+/// `[vocab, hidden]` rows as the checkpoint stores them (the same slice as
+/// [`ModelWeights::lm_head`] when the embeddings are tied, in which case
+/// the loop gathers from the head's device copy), and the factor the
+/// gathered row is multiplied by in f32 before its bf16 rounding (Gemma's
+/// `sqrt(hidden)`, Granite's `embedding_multiplier`; 1 for the rest).
+#[derive(Clone, Copy)]
+pub struct EmbedTable<'a> {
+    pub rows: &'a [u16],
+    pub scale: f32,
 }
 
 /// RoPE tables `[positions, head_dim]` of a model for the cached and
@@ -2251,7 +2285,7 @@ pub fn model_forward_bf16(
     assert_eq!(m.lm_head.len(), hidden * vocab);
     let last = m.layers.len() - 1;
     let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, last, None)?;
-    let out = build_head(&mut gb, cur, m, tokens, hidden, vocab, false)?;
+    let out = build_head(&mut gb, cur, m, tokens, hidden, vocab, false, None)?;
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
 

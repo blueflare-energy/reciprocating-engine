@@ -2,17 +2,28 @@
 //! compiled recipe (a full block, a partial block, then single rows) must
 //! produce the same logits as the CPU reference over the whole sequence.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size] [decode_rows] [post_norm] [qk_norm]`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-cache-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [tail_blocks] [tail_size] [decode_rows] [post_norm] [qk_norm] [loop_steps]`.
 //!
 //! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
 //! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
 //! With `RENG_TEST_GEMMA` set the layers take Gemma's form (see
 //! `reng-model-test`): post norms on both branch outputs, GELU-tanh, a
 //! window of 100 positions on the even layers and a second RoPE table on
-//! the odd ones.
+//! the odd ones, and the embeddings are scaled by 2 on the device.
+//!
+//! The model gets a synthetic embedding table whose row `t` is the input
+//! row of position `t`, so when the device decode loop is built
+//! (`RENG_DEVICE_LOOP` not off, `decode_rows` at most 1) the one-row tail
+//! blocks are fed as token ids through it and checked like the others.
+//! Then `loop_steps` (default 4) greedy steps run as one device run from
+//! the argmax of the last tail step: the last step's logits are checked
+//! against the CPU reference over the sequence the loop produced, and a
+//! second pass over the same prompt feeds the same ids one launch at a
+//! time, which must reproduce the run's ids and last logits exactly.
 
 use reng_synapse::{
-    Activation, CachedModel, LayerWeights, ModelWeights, RopeTables, model_forward_cpu, to_bf16,
+    Activation, CachedModel, EmbedTable, LayerWeights, ModelWeights, RopeTables, bf16_to_f32,
+    model_forward_cpu, to_bf16,
 };
 use std::time::Instant;
 
@@ -82,11 +93,16 @@ fn main() -> reng_core::Result<()> {
     let decode_rows = arg(11, 0usize);
     let post_norm = arg(12, 0usize) != 0;
     let qk_norm = arg(13, 0usize);
+    let loop_steps = arg(14, 4usize);
     let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
     let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
-        tokens <= capacity,
-        "sequence {tokens} exceeds capacity {capacity}"
+        tokens + loop_steps <= capacity,
+        "sequence {tokens} + {loop_steps} loop steps exceeds capacity {capacity}"
+    );
+    assert!(
+        tokens <= vocab,
+        "the tail positions are fed as their own ids: tokens {tokens} must fit vocab {vocab}"
     );
     let hd = hidden / n_heads;
     let kvd = n_kv_heads * hd;
@@ -119,11 +135,12 @@ fn main() -> reng_core::Result<()> {
         }
         (sin, cos)
     };
-    // The CPU reference wants tables for the sequence; the cache for the
-    // capacity. The Gemma form adds a second table (a different base).
-    let (sin_seq, cos_seq) = rope(tokens, 10000.0);
+    // The CPU reference wants tables for the sequence (the loop steps
+    // included); the cache for the capacity. The Gemma form adds a second
+    // table (a different base).
+    let (sin_seq, cos_seq) = rope(tokens + loop_steps, 10000.0);
     let (sin_cap, cos_cap) = rope(capacity, 10000.0);
-    let (sinl_seq, cosl_seq) = rope(tokens, 1000.0);
+    let (sinl_seq, cosl_seq) = rope(tokens + loop_steps, 1000.0);
     let (sinl_cap, cosl_cap) = rope(capacity, 1000.0);
     let post_gain = |l: usize, k: usize| -> Vec<f32> {
         if gemma {
@@ -215,6 +232,35 @@ fn main() -> reng_core::Result<()> {
         lm_head: &lm_head,
         final_softcap,
     };
+    // The embedding table: row t of the first `tokens` rows is the input
+    // row of position t (halved when the device scales by 2, an exact
+    // operation in bf16), the rest dense random rows for the ids the loop
+    // produces.
+    let embed_scale = if gemma { 2.0 } else { 1.0 };
+    let mut embed = to_bf16(&seq(vocab * hidden, 31, 11, 47, 1.0 / embed_scale));
+    embed[..tokens * hidden].copy_from_slice(&to_bf16(
+        &x.iter().map(|v| v / embed_scale).collect::<Vec<f32>>(),
+    ));
+    let table = EmbedTable {
+        rows: &embed,
+        scale: embed_scale,
+    };
+    // The row of the table for `id`, as the device feeds it.
+    let embed_row = |id: u32| -> Vec<f32> {
+        let id = id as usize;
+        embed[id * hidden..(id + 1) * hidden]
+            .iter()
+            .map(|&b| bf16_to_f32(b) * embed_scale)
+            .collect()
+    };
+    let argmax = |row: &[f32]| -> u32 {
+        row.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 { (i, v) } else { b }
+            })
+            .0 as u32
+    };
     println!(
         "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}"
     );
@@ -239,32 +285,87 @@ fn main() -> reng_core::Result<()> {
         decode_rows,
         capacity,
         &rope_cap,
+        Some(&table),
     )?;
-    println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
+    println!(
+        "compile + upload: {:.2}s{}",
+        t0.elapsed().as_secs_f32(),
+        if cm.has_loop() {
+            " (device decode loop)"
+        } else {
+            ""
+        }
+    );
 
     let mut blocks: Vec<usize> = vec![rows, 8];
     blocks.extend(std::iter::repeat_n(tail_size, tail_rows));
-    let mut hpu: Vec<f32> = Vec::with_capacity(tokens * vocab);
-    let mut start = 0;
-    for (bi, &n) in blocks.iter().enumerate() {
+    // Feed the prompt blocks and return the logits of every position; a
+    // one-row block goes through the device loop as its position's id.
+    let feed_blocks = |cm: &mut CachedModel<'_>| -> reng_core::Result<Vec<f32>> {
+        let mut hpu: Vec<f32> = Vec::with_capacity(tokens * vocab);
+        let mut start = 0;
+        for (bi, &n) in blocks.iter().enumerate() {
+            let t1 = Instant::now();
+            let by_id = n == 1 && cm.has_loop();
+            let logits = if by_id {
+                cm.step_id_logits(start as u32)?
+            } else {
+                cm.step(&x[start * hidden..(start + n) * hidden])?
+            };
+            println!(
+                "block {bi}: {n} rows at position {start}: {:.1} ms{}",
+                t1.elapsed().as_secs_f32() * 1000.0,
+                if by_id { " (device loop, by id)" } else { "" }
+            );
+            assert_eq!(logits.len(), n * vocab);
+            hpu.extend_from_slice(&logits);
+            start += n;
+        }
+        assert_eq!(cm.position(), tokens);
+        Ok(hpu)
+    };
+    let hpu = feed_blocks(&mut cm)?;
+
+    // The device loop: `loop_steps` greedy steps as one run, then the
+    // same ids one launch at a time over a fresh pass of the prompt.
+    let loop_check = if cm.has_loop() && loop_steps > 0 {
+        let seed = argmax(&hpu[(tokens - 1) * vocab..]);
         let t1 = Instant::now();
-        let logits = cm.step(&x[start * hidden..(start + n) * hidden])?;
+        let (ids, last) = cm.step_ids_logits(seed, loop_steps)?;
         println!(
-            "block {bi}: {n} rows at position {start}: {:.1} ms",
+            "loop: {loop_steps} steps from seed {seed} at position {tokens}: {:.1} ms, ids {ids:?}",
             t1.elapsed().as_secs_f32() * 1000.0
         );
-        assert_eq!(logits.len(), n * vocab);
-        hpu.extend_from_slice(&logits);
-        start += n;
-    }
-    assert_eq!(cm.position(), tokens);
+        assert_eq!(ids.len(), loop_steps);
+        assert_eq!(cm.position(), tokens + loop_steps);
+        cm.reset();
+        let hpu2 = feed_blocks(&mut cm)?;
+        assert!(hpu2 == hpu, "second pass of the prompt differs");
+        let mut single: Vec<u32> = Vec::with_capacity(loop_steps);
+        let mut next = seed;
+        let mut single_last = Vec::new();
+        for _ in 0..loop_steps {
+            let (out, logits) = cm.step_ids_logits(next, 1)?;
+            next = out[0];
+            single.push(next);
+            single_last = logits;
+        }
+        let same = single == ids && single_last == last;
+        println!(
+            "loop: one launch at a time gives ids {single:?}: {}",
+            if same { "identical" } else { "DIFFERENT" }
+        );
+        Some((seed, ids, last, same))
+    } else {
+        None
+    };
 
     let cpu = model_forward_cpu(&x, &m, tokens, hidden, inter, vocab, true);
     let nan = hpu.iter().any(|v| !v.is_finite());
     let rel = rel_l2(&hpu, &cpu);
     let mut agree = 0usize;
     let mut worst_block = 0.0f32;
-    start = 0;
+    let mut start = 0;
     let mut per_block: Vec<String> = Vec::new();
     for &n in &blocks {
         let (lo, hi) = (start * vocab, (start + n) * vocab);
@@ -291,12 +392,35 @@ fn main() -> reng_core::Result<()> {
     println!(
         "nan={nan}  rel_L2={rel:.4}  worst_block_rel_L2={worst_block:.4}  top1_agree={agree}/{tokens}"
     );
-    if !nan && rel < 0.05 && worst_block < 0.05 {
+    // The loop's last step against the CPU reference over the sequence it
+    // produced (the seed and all but its last id appended to the prompt).
+    let mut loop_ok = true;
+    if let Some((seed, ids, last, same)) = loop_check {
+        let mut x_ext = x.clone();
+        x_ext.extend(embed_row(seed));
+        for &id in &ids[..loop_steps - 1] {
+            x_ext.extend(embed_row(id));
+        }
+        let total = tokens + loop_steps;
+        let cpu_ext = model_forward_cpu(&x_ext, &m, total, hidden, inter, vocab, true);
+        let cpu_last = &cpu_ext[(total - 1) * vocab..];
+        let rel_last = rel_l2(&last, cpu_last);
+        let cpu_ids: Vec<u32> = (0..loop_steps)
+            .map(|k| argmax(&cpu_ext[(tokens + k) * vocab..(tokens + k + 1) * vocab]))
+            .collect();
+        let agree_loop = ids.iter().zip(&cpu_ids).filter(|(a, b)| a == b).count();
+        let self_consistent = ids[loop_steps - 1] == argmax(&last);
+        println!(
+            "loop: last-step rel_L2={rel_last:.4}  top1_agree={agree_loop}/{loop_steps} (cpu ids {cpu_ids:?})  last id is its logits' argmax: {self_consistent}"
+        );
+        loop_ok = same && self_consistent && last.iter().all(|v| v.is_finite()) && rel_last < 0.05;
+    }
+    if !nan && rel < 0.05 && worst_block < 0.05 && loop_ok {
         println!("PASS");
         Ok(())
     } else {
         Err(reng_core::Error::Other(format!(
-            "cached decode diverges: nan={nan} rel_L2={rel} worst_block={worst_block}"
+            "cached decode diverges: nan={nan} rel_L2={rel} worst_block={worst_block} loop_ok={loop_ok}"
         )))
     }
 }

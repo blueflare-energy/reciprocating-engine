@@ -6,7 +6,9 @@
 //! cross-check the cached path was validated against.
 //!
 //! Without `--ref` the loop is free-running and the ids it produces are
-//! written to `out.json`. With `--ref <ref.json>` (from `generate.py`) the
+//! written to `out.json`; with the device decode loop (`RENG_DEVICE_LOOP`,
+//! the default) every token after the first comes out of one device run
+//! and one readback. With `--ref <ref.json>` (from `generate.py`) the
 //! loop is teacher-forced: step `i` scores `prompt ++ ref[..i]` and the
 //! engine's top-1 is compared with `ref[i]`. A mismatch counts as a failure
 //! unless the engine's token is within `--margin` logits (default 0.5) of
@@ -137,6 +139,42 @@ fn parse_args() -> reng_core::Result<Args> {
     })
 }
 
+/// Compare the engine's `last` at `step` with the reference and print the
+/// verdict; a divergence is recorded in `failures`, a near-tie counted.
+fn verdict(
+    r: &Reference,
+    step: usize,
+    last: u32,
+    margin: f32,
+    secs: f32,
+    near_ties: &mut usize,
+    failures: &mut Vec<String>,
+) {
+    let want = r.generated[step];
+    let verdict = if last == want {
+        "match"
+    } else if let Some(s) = r.steps.get(step) {
+        if s.near_tie(last, margin) {
+            *near_ties += 1;
+            "near-tie"
+        } else {
+            failures.push(format!(
+                "step {step}: got {last}, want {want} (ref margin {:.3})",
+                s.margin
+            ));
+            "DIVERGE"
+        }
+    } else {
+        failures.push(format!("step {step}: got {last}, want {want}"));
+        "DIVERGE"
+    };
+    let ref_margin = r.steps.get(step).map_or(f32::NAN, |s| s.margin);
+    println!(
+        "step {step}: engine {last}  ref {want}  margin {ref_margin:.3}  {verdict}  ({:.1} ms)",
+        secs * 1000.0
+    );
+}
+
 fn load_reference(path: &str) -> reng_core::Result<Reference> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| reng_core::Error::Other(format!("{path}: {e}")))?;
@@ -190,58 +228,63 @@ fn main() -> reng_core::Result<()> {
     // What the cached model has not seen yet: the whole prompt, then the
     // token appended at the previous step.
     let mut pending = 0;
-    for step in 0..n_new {
+    let mut step = 0;
+    while step < n_new {
         let t0 = Instant::now();
-        let last = match cached.as_mut() {
-            Some(g) => g.feed_id(&ids[pending..])?,
-            None => {
-                let logits = prefill_logits(&w, &cfg, &ids)?;
-                argmax_rows(&logits[(ids.len() - 1) * vocab..], vocab)[0] as u32
-            }
+        // Free-running with the device loop: after the first token, the
+        // rest come out of one run.
+        let whole_run =
+            reference.is_none() && step > 0 && cached.as_ref().is_some_and(Generator::device_loop);
+        let run = if whole_run {
+            let g = cached.as_mut().expect("checked above");
+            let last = ids[ids.len() - 1];
+            let out = g.generate(last, n_new - step)?;
+            pending = ids.len() + out.len() - 1;
+            out
+        } else {
+            let last = match cached.as_mut() {
+                Some(g) => g.feed_id(&ids[pending..])?,
+                None => {
+                    let logits = prefill_logits(&w, &cfg, &ids)?;
+                    argmax_rows(&logits[(ids.len() - 1) * vocab..], vocab)[0] as u32
+                }
+            };
+            pending = ids.len();
+            vec![last]
         };
-        pending = ids.len();
-        step_secs.push(t0.elapsed().as_secs_f32());
+        let per_step = t0.elapsed().as_secs_f32() / run.len() as f32;
         if step == 0 {
             println!(
                 "first token {:.2}s after start",
                 t_start.elapsed().as_secs_f32()
             );
         }
-        generated.push(last);
-        match &reference {
-            None => {
-                println!(
-                    "step {step}: next id {last}  ({:.1} ms)",
-                    step_secs[step] * 1000.0
-                );
-                ids.push(last);
+        for &last in &run {
+            step_secs.push(per_step);
+            generated.push(last);
+            match &reference {
+                None => {
+                    println!(
+                        "step {step}: next id {last}  ({:.1} ms{})",
+                        per_step * 1000.0,
+                        if run.len() > 1 { ", device loop" } else { "" }
+                    );
+                    ids.push(last);
+                }
+                Some(r) => {
+                    verdict(
+                        r,
+                        step,
+                        last,
+                        a.margin,
+                        per_step,
+                        &mut near_ties,
+                        &mut failures,
+                    );
+                    ids.push(r.generated[step]);
+                }
             }
-            Some(r) => {
-                let want = r.generated[step];
-                let verdict = if last == want {
-                    "match"
-                } else if let Some(s) = r.steps.get(step) {
-                    if s.near_tie(last, a.margin) {
-                        near_ties += 1;
-                        "near-tie"
-                    } else {
-                        failures.push(format!(
-                            "step {step}: got {last}, want {want} (ref margin {:.3})",
-                            s.margin
-                        ));
-                        "DIVERGE"
-                    }
-                } else {
-                    failures.push(format!("step {step}: got {last}, want {want}"));
-                    "DIVERGE"
-                };
-                let margin = r.steps.get(step).map_or(f32::NAN, |s| s.margin);
-                println!(
-                    "step {step}: engine {last}  ref {want}  margin {margin:.3}  {verdict}  ({:.1} ms)",
-                    step_secs[step] * 1000.0
-                );
-                ids.push(want);
-            }
+            step += 1;
         }
     }
     let out = serde_json::json!({

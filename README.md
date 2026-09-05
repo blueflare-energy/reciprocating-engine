@@ -121,7 +121,13 @@ mask add and the softmax) in the prefill and batched decode recipes and
 the fused `sdpa_recomp_fwd_bf16` kernel over the same tensors in the
 single-sequence decode recipe, where it is never slower and up to 2%
 faster; `RENG_SDPA=1` fuses every recipe and `RENG_SDPA=0` none.
-Attention reads the whole cache every step, so the batched
+Single-sequence decode goes further: the one-row recipe takes only a
+token id and a position, gathers the embedding row, the RoPE rows and
+the mask row on the device and builds its own cache-write indices, and
+its argmax lands in an id ring that the next launch reads from, so
+`Generator::generate` enqueues every step back to back and reads all the
+ids once (`RENG_DEVICE_LOOP=0` restores the per-step uploads and
+readback). Attention reads the whole cache every step, so the batched
 decoder compiles its recipes for the smallest bucket of positions (256,
 doubling) that holds the longest live sequence and grows on demand,
 recompiling and copying the used rows across. Single-sequence decode is

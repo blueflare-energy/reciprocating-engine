@@ -442,6 +442,12 @@ pub(crate) struct Runtime<'a> {
     /// Pinned buffer for [`Runtime::read_bf16_range`], grown on demand.
     h_aux: *mut c_void,
     aux_bytes: u64,
+    /// Pinned buffers for [`Runtime::upload_at`] and
+    /// [`Runtime::read_i32_strided`], grown on demand.
+    h_up: *mut c_void,
+    up_bytes: u64,
+    h_ring: *mut c_void,
+    ring_bytes: u64,
     out: Out,
     dws: u64,
 }
@@ -659,6 +665,10 @@ impl<'a> Runtime<'a> {
             fence,
             h_aux: core::ptr::null_mut(),
             aux_bytes: 0,
+            h_up: core::ptr::null_mut(),
+            up_bytes: 0,
+            h_ring: core::ptr::null_mut(),
+            ring_bytes: 0,
             out,
             dws,
         })
@@ -1084,6 +1094,154 @@ impl<'a> Runtime<'a> {
         let words = unsafe { std::slice::from_raw_parts(self.h_aux.cast::<u16>(), n) };
         Ok(words.iter().map(|&w| bf16_to_f32(w)).collect())
     }
+
+    /// A zeroed device buffer of `bytes` bytes owned by this runtime (freed
+    /// on drop), for state the recipe's tensors are bound into per launch
+    /// (see [`Runtime::rebind`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the allocation or the clearing fails.
+    pub fn alloc(&mut self, bytes: u64) -> Result<u64> {
+        let mut d = 0u64;
+        syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut d));
+        self.owned.push(d);
+        syn!(synMemsetD32Async(d, 0, (bytes / 4) as usize, self.stream));
+        syn!(synStreamSynchronize(self.stream));
+        Ok(d)
+    }
+
+    /// Grow a pinned buffer to at least `bytes`.
+    fn grow_pinned(
+        dev: synDeviceId,
+        buf: &mut *mut c_void,
+        have: &mut u64,
+        bytes: u64,
+    ) -> Result<()> {
+        if *have < bytes {
+            if !buf.is_null() {
+                // SAFETY: allocated below on an earlier call, no copy in flight.
+                unsafe { synHostFree(dev, *buf, 0) };
+            }
+            let mut hb: *mut c_void = core::ptr::null_mut();
+            syn!(synHostMalloc(dev, bytes, 0, &mut hb));
+            *buf = hb;
+            *have = bytes;
+        }
+        Ok(())
+    }
+
+    /// Enqueue a copy of `bytes` to device address `addr` (through a pinned
+    /// buffer of this runtime); [`Runtime::fence`] waits until it is
+    /// visible. One copy at a time: the next call reuses the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy cannot be enqueued.
+    pub fn upload_at(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
+        let n = bytes.len() as u64;
+        Self::grow_pinned(self.dev, &mut self.h_up, &mut self.up_bytes, n)?;
+        // SAFETY: h_up holds at least n bytes and no copy reads it (the
+        // caller fenced the previous one).
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.h_up.cast::<u8>(), bytes.len())
+        };
+        syn!(synMemCopyAsync(
+            self.stream,
+            self.h_up as u64,
+            n,
+            addr,
+            SYN_HOST_TO_DRAM
+        ));
+        Ok(())
+    }
+
+    /// Pre-fill `words` 32-bit words at `addr` with the recipe-completion
+    /// sentinel, ahead of launches that will overwrite them (see
+    /// [`Runtime::read_i32_strided`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fill cannot be enqueued.
+    pub fn fill_sentinel_d32(&mut self, addr: u64, words: usize) -> Result<()> {
+        syn!(synMemsetD32Async(addr, SENTINEL_D32, words, self.stream));
+        syn!(synStreamSynchronize(self.stream));
+        Ok(())
+    }
+
+    /// Read `n` int32 values `stride` bytes apart starting at device
+    /// address `addr`: the first word of each of `n` slots that were
+    /// pre-filled by [`Runtime::fill_sentinel_d32`] and are each written
+    /// once by a launch enqueued since. The two-sentinel protocol of the
+    /// module docs applies to those words: the copy is repeated until none
+    /// shows the device sentinel (every launch has written its slot) and
+    /// the host waits until none shows the host sentinel (the copy has
+    /// landed). The slots' padding words are copied too but never checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a copy fails or the slots never complete.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stride` is not a positive multiple of 4 or `n` is 0.
+    pub fn read_i32_strided(&mut self, addr: u64, stride: usize, n: usize) -> Result<Vec<i32>> {
+        assert!(stride >= 4 && stride % 4 == 0 && n >= 1);
+        let bytes = (stride * n) as u64;
+        Self::grow_pinned(self.dev, &mut self.h_ring, &mut self.ring_bytes, bytes)?;
+        let (stream, h) = (self.stream, self.h_ring.cast::<u32>());
+        let step = stride / 4;
+        // SAFETY (all blocks below): h_ring holds `bytes` bytes, so word
+        // `j * step` is inside it for every j < n; the DMA writes each word
+        // exactly once per copy.
+        let picked = |pattern: u32| -> bool {
+            (0..n).any(|j| unsafe { core::ptr::read_volatile(h.add(j * step)) } == pattern)
+        };
+        let started = Instant::now();
+        let mut polls = 0u32;
+        loop {
+            unsafe {
+                for j in 0..n {
+                    *h.add(j * step) = HOST_SENTINEL_D32;
+                }
+            }
+            syn!(synMemCopyAsync(
+                stream,
+                addr,
+                bytes,
+                self.h_ring as u64,
+                SYN_DRAM_TO_HOST
+            ));
+            syn!(synStreamSynchronize(stream));
+            while picked(HOST_SENTINEL_D32) {
+                if started.elapsed() > READBACK_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "device-to-host copy did not complete within {READBACK_TIMEOUT:?}"
+                    )));
+                }
+                std::hint::spin_loop();
+            }
+            if !picked(SENTINEL_D32) {
+                break;
+            }
+            if started.elapsed() > READBACK_TIMEOUT {
+                return Err(Error::Other(format!(
+                    "{n} launches did not complete within {READBACK_TIMEOUT:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_micros(200));
+            polls += 1;
+        }
+        if env_on("RENG_STEP_TRACE") {
+            eprintln!(
+                "loop trace: readback of {n} ids {:.2} ms ({polls} polls)",
+                started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok((0..n)
+            .map(|j| unsafe { core::ptr::read_volatile(h.add(j * step)) } as i32)
+            .collect())
+    }
 }
 
 impl<'a> Runtime<'a> {
@@ -1266,8 +1424,10 @@ impl Drop for Runtime<'_> {
             }
             synHostFree(self.dev, self.h_out, 0);
             self.fence.free(self.dev);
-            if !self.h_aux.is_null() {
-                synHostFree(self.dev, self.h_aux, 0);
+            for hb in [self.h_aux, self.h_up, self.h_ring] {
+                if !hb.is_null() {
+                    synHostFree(self.dev, hb, 0);
+                }
             }
             mark("host frees", &mut since);
             for &d in &self.owned {

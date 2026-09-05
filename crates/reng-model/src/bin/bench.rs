@@ -119,17 +119,25 @@ fn main() -> reng_core::Result<()> {
     };
 
     let t0 = Instant::now();
+    // The reported step time: the median over the per-step launches, or
+    // the mean over one device-loop run (its steps are not timed singly).
+    let mut step_kind = "median";
     let (prefill_s, decode_s, step_ms) = if batch == 1 {
         let mut g = Generator::new(&w, &cfg, a.rows, a.decode_rows, a.capacity)?;
         println!(
-            "{model_name}: {} layers, hidden {}, vocab {}; compiled rows {} / decode rows {} / capacity {} in {:.2}s",
+            "{model_name}: {} layers, hidden {}, vocab {}; compiled rows {} / decode rows {} / capacity {} in {:.2}s{}",
             cfg.num_hidden_layers,
             cfg.hidden_size,
             cfg.vocab_size,
             a.rows,
             a.decode_rows,
             a.capacity,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            if g.device_loop() {
+                " (device decode loop)"
+            } else {
+                ""
+            }
         );
         // Warm both recipes (the first launches of a recipe are slower), then
         // measure prefill as one fresh sequence.
@@ -144,19 +152,28 @@ fn main() -> reng_core::Result<()> {
         let prefill_s = t1.elapsed().as_secs_f64();
         note_first(&mut first_token_s);
         // Decode: one token per step, greedy on the engine's own output
-        // (argmax on the device).
-        let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
-        let t2 = Instant::now();
-        for _ in 0..a.n_new {
-            let t = Instant::now();
-            next = g.feed_id(&[next])?;
-            step_s.push(t.elapsed().as_secs_f64());
+        // (argmax on the device); with the device loop all steps run from
+        // one call and one readback.
+        if g.device_loop() {
+            step_kind = "mean";
+            let t2 = Instant::now();
+            g.generate(next, a.n_new)?;
+            let s = t2.elapsed().as_secs_f64();
+            (prefill_s, s, s / a.n_new as f64 * 1e3)
+        } else {
+            let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
+            let t2 = Instant::now();
+            for _ in 0..a.n_new {
+                let t = Instant::now();
+                next = g.feed_id(&[next])?;
+                step_s.push(t.elapsed().as_secs_f64());
+            }
+            (
+                prefill_s,
+                t2.elapsed().as_secs_f64(),
+                median(&mut step_s) * 1e3,
+            )
         }
-        (
-            prefill_s,
-            t2.elapsed().as_secs_f64(),
-            median(&mut step_s) * 1e3,
-        )
     } else {
         let mut g = BatchedGenerator::new(&w, &cfg, batch, a.rows, a.capacity)?;
         println!(
@@ -229,7 +246,7 @@ fn main() -> reng_core::Result<()> {
         a.prompt, c_pre.tokens_per_s, c_pre.bottleneck
     );
     println!(
-        "decode {} tokens x batch {batch} at ctx ~{ctx}: {decode_tps:.1} tok/s, median step {step_ms:.2} ms  (ceiling {:.0} tok/s, {:?}) = {dec_pct:.2}%",
+        "decode {} tokens x batch {batch} at ctx ~{ctx}: {decode_tps:.1} tok/s, {step_kind} step {step_ms:.2} ms  (ceiling {:.0} tok/s, {:?}) = {dec_pct:.2}%",
         a.n_new, c_dec.tokens_per_s, c_dec.bottleneck
     );
 
@@ -262,7 +279,7 @@ fn main() -> reng_core::Result<()> {
             "tok/s",
             decode_tps,
             format!(
-                "ctx ~{ctx}; median step {step_ms:.2} ms; ceiling {:.0} tok/s",
+                "ctx ~{ctx}; {step_kind} step {step_ms:.2} ms; ceiling {:.0} tok/s",
                 c_dec.tokens_per_s
             )
         ),

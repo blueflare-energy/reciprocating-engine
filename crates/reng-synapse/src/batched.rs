@@ -255,7 +255,7 @@ impl<'a> BatchedModel<'a> {
         for (li, lw) in m.layers.iter().enumerate() {
             cur = build_layer_batched(&mut gb, li, cur, lw, &sh, hidden, inter)?;
         }
-        let out = build_head(&mut gb, cur, m, batch, hidden, vocab, true)?;
+        let out = build_head(&mut gb, cur, m, batch, hidden, vocab, true, None)?;
         Ok((gb, out))
     }
 
@@ -315,7 +315,7 @@ impl<'a> BatchedModel<'a> {
         for (li, lw) in m.layers.iter().enumerate() {
             cur = build_layer(&mut gb, li, cur, lw, &sh, rows, hidden, inter, None)?;
         }
-        let out = build_head(&mut gb, cur, m, rows, hidden, vocab, true)?;
+        let out = build_head(&mut gb, cur, m, rows, hidden, vocab, true, None)?;
         Ok((gb, out))
     }
 

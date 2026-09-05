@@ -1199,6 +1199,10 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
 }
 
 /// A model compiled once with a KV cache, fed token ids block by block.
+/// Prompts go through the wide recipe from host-gathered embeddings; single
+/// tokens go through the device decode loop when it was built (see
+/// `reng_synapse::CachedModel`), which gathers the embedding on the device
+/// and can run many greedy steps per readback ([`Generator::generate`]).
 #[cfg(feature = "link-synapse")]
 pub struct Generator<'a> {
     model: reng_synapse::CachedModel<'a>,
@@ -1226,6 +1230,10 @@ impl<'a> Generator<'a> {
         // The cached recipes take RoPE rows as per-step inputs, so the layer
         // views carry no tables (they would have to outlive `rope`).
         let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let embed = reng_synapse::EmbedTable {
+            rows: &w.embed,
+            scale: cfg.embed_scale(),
+        };
         let model = reng_synapse::CachedModel::new(
             &m,
             cfg.hidden_size,
@@ -1235,6 +1243,7 @@ impl<'a> Generator<'a> {
             decode_rows,
             capacity,
             &rope.tables(),
+            Some(&embed),
         )?;
         Ok(Self { model, w, cfg })
     }
@@ -1243,6 +1252,12 @@ impl<'a> Generator<'a> {
     #[must_use]
     pub fn position(&self) -> usize {
         self.model.position()
+    }
+
+    /// Whether single tokens run through the device decode loop.
+    #[must_use]
+    pub fn device_loop(&self) -> bool {
+        self.model.has_loop()
     }
 
     /// Forget the cached prefix.
@@ -1264,8 +1279,12 @@ impl<'a> Generator<'a> {
         assert!(!ids.is_empty());
         let mut last = Vec::new();
         for block in ids.chunks(self.model.rows()) {
-            let x = embed_tokens(self.w, self.cfg, block);
-            last = self.model.step_last(&x)?;
+            last = if block.len() == 1 && self.model.has_loop() {
+                self.model.step_id_logits(block[0])?
+            } else {
+                let x = embed_tokens(self.w, self.cfg, block);
+                self.model.step_last(&x)?
+            };
         }
         Ok(last)
     }
@@ -1287,10 +1306,41 @@ impl<'a> Generator<'a> {
         }
         let mut last = 0;
         for block in ids.chunks(self.model.rows()) {
-            let x = embed_tokens(self.w, self.cfg, block);
-            last = self.model.step_last_id(&x)?;
+            last = if block.len() == 1 && self.model.has_loop() {
+                self.model.step_ids(block[0], 1)?[0]
+            } else {
+                let x = embed_tokens(self.w, self.cfg, block);
+                self.model.step_last_id(&x)?
+            };
         }
         Ok(last)
+    }
+
+    /// Append `seed` and continue greedily for `n` tokens in all: the
+    /// returned `n` ids are the argmax after `seed` and after each of the
+    /// first `n - 1` of them (the last one is not appended). With the
+    /// device decode loop this is `n` launches and one readback; without
+    /// it, `n` calls of [`Generator::feed_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is 0 or the run would overflow the cache.
+    pub fn generate(&mut self, seed: u32, n: usize) -> Result<Vec<u32>> {
+        assert!(n >= 1);
+        if self.model.has_loop() {
+            return self.model.step_ids(seed, n);
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut next = seed;
+        for _ in 0..n {
+            next = self.feed_id(&[next])?;
+            out.push(next);
+        }
+        Ok(out)
     }
 }
 
