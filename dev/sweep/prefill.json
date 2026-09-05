@@ -11,209 +11,207 @@
     "SmolLM2-135M": {
       "128": {
         "ok": true,
-        "tok_s": 54775.0,
+        "tok_s": 55775.0,
         "step_ms": 2.3,
-        "pct": 4.75
+        "pct": 4.84
       },
       "512": {
         "ok": true,
-        "tok_s": 109281.0,
-        "step_ms": 4.7,
-        "pct": 7.7
+        "tok_s": 104223.0,
+        "step_ms": 4.8999999999999995,
+        "pct": 7.34
       },
       "1024": {
         "ok": true,
-        "tok_s": 115131.0,
-        "step_ms": 8.9,
-        "pct": 9.05
+        "tok_s": 113205.0,
+        "step_ms": 9.0,
+        "pct": 8.9
       },
       "2048": {
         "ok": true,
-        "tok_s": 79838.0,
-        "step_ms": 25.7,
-        "pct": 7.59
+        "tok_s": 91515.0,
+        "step_ms": 22.4,
+        "pct": 8.7
       }
     },
     "SmolLM2-360M": {
       "128": {
         "ok": true,
-        "tok_s": 38591.0,
-        "step_ms": 3.3,
-        "pct": 8.97
+        "tok_s": 37425.0,
+        "step_ms": 3.4,
+        "pct": 8.7
       },
       "512": {
         "ok": true,
-        "tok_s": 62764.0,
-        "step_ms": 8.200000000000001,
-        "pct": 11.43
+        "tok_s": 67511.0,
+        "step_ms": 7.6,
+        "pct": 12.29
       },
       "1024": {
         "ok": true,
-        "tok_s": 83786.0,
-        "step_ms": 12.200000000000001,
-        "pct": 16.47
+        "tok_s": 83222.0,
+        "step_ms": 12.3,
+        "pct": 16.36
       },
       "2048": {
         "ok": true,
-        "tok_s": 44854.0,
-        "step_ms": 45.699999999999996,
-        "pct": 10.13
+        "tok_s": 56632.0,
+        "step_ms": 36.2,
+        "pct": 12.78
       }
     },
     "Qwen2.5-0.5B": {
       "128": {
         "ok": true,
-        "tok_s": 50735.0,
+        "tok_s": 50474.0,
         "step_ms": 2.5,
-        "pct": 16.01
+        "pct": 15.93
       },
       "512": {
         "ok": true,
-        "tok_s": 78304.0,
-        "step_ms": 6.5,
-        "pct": 18.71
+        "tok_s": 77536.0,
+        "step_ms": 6.6,
+        "pct": 18.52
       },
       "1024": {
         "ok": true,
-        "tok_s": 85068.0,
-        "step_ms": 12.0,
-        "pct": 21.19
+        "tok_s": 90788.0,
+        "step_ms": 11.299999999999999,
+        "pct": 22.61
       },
       "2048": {
         "ok": true,
-        "tok_s": 70492.0,
-        "step_ms": 29.1,
-        "pct": 19.0
+        "tok_s": 60820.0,
+        "step_ms": 33.7,
+        "pct": 16.39
       }
     },
     "Qwen2.5-1.5B": {
       "128": {
         "ok": true,
-        "tok_s": 30160.0,
-        "step_ms": 4.2,
-        "pct": 29.73
+        "tok_s": 29348.0,
+        "step_ms": 4.4,
+        "pct": 28.93
       },
       "512": {
         "ok": true,
-        "tok_s": 44095.0,
-        "step_ms": 11.6,
-        "pct": 32.41
+        "tok_s": 47235.0,
+        "step_ms": 10.8,
+        "pct": 34.72
       },
       "1024": {
         "ok": true,
-        "tok_s": 44701.0,
-        "step_ms": 22.9,
-        "pct": 33.77
+        "tok_s": 40644.0,
+        "step_ms": 25.2,
+        "pct": 30.7
       },
       "2048": {
         "ok": true,
-        "tok_s": 41199.0,
-        "step_ms": 49.7,
-        "pct": 32.8
+        "tok_s": 47349.0,
+        "step_ms": 43.3,
+        "pct": 37.7
       }
     },
     "TinyLlama-1.1B": {
       "128": {
         "ok": true,
-        "tok_s": 36025.0,
-        "step_ms": 3.6,
-        "pct": 23.8
+        "tok_s": 31990.0,
+        "step_ms": 4.0,
+        "pct": 21.13
       },
       "512": {
         "ok": true,
-        "tok_s": 45803.0,
-        "step_ms": 11.2,
-        "pct": 22.91
+        "tok_s": 52675.0,
+        "step_ms": 9.700000000000001,
+        "pct": 26.35
       },
       "1024": {
         "ok": true,
-        "tok_s": 58105.0,
-        "step_ms": 17.6,
-        "pct": 30.31
+        "tok_s": 53610.0,
+        "step_ms": 19.099999999999998,
+        "pct": 27.96
       },
       "2048": {
         "ok": true,
-        "tok_s": 39196.0,
-        "step_ms": 52.3,
-        "pct": 22.12
+        "tok_s": 34386.0,
+        "step_ms": 59.6,
+        "pct": 19.41
       }
     },
     "SmolLM2-1.7B": {
       "128": {
         "ok": true,
-        "tok_s": 23747.0,
-        "step_ms": 5.4,
-        "pct": 26.11
+        "tok_s": 21428.0,
+        "step_ms": 6.0,
+        "pct": 23.56
       },
       "512": {
         "ok": true,
-        "tok_s": 33289.0,
-        "step_ms": 15.4,
-        "pct": 27.15
+        "tok_s": 32208.0,
+        "step_ms": 15.9,
+        "pct": 26.27
       },
       "1024": {
         "ok": true,
-        "tok_s": 33937.0,
-        "step_ms": 30.200000000000003,
-        "pct": 28.47
+        "tok_s": 32558.0,
+        "step_ms": 31.5,
+        "pct": 27.31
       },
       "2048": {
         "ok": true,
-        "tok_s": 24979.0,
-        "step_ms": 82.0,
-        "pct": 22.12
+        "tok_s": 26297.0,
+        "step_ms": 77.89999999999999,
+        "pct": 23.29
       }
     },
     "Qwen2.5-3B": {
       "128": {
         "ok": true,
-        "tok_s": 21103.0,
-        "step_ms": 6.1000000000000005,
-        "pct": 41.56
+        "tok_s": 19753.0,
+        "step_ms": 6.5,
+        "pct": 38.9
       },
       "512": {
         "ok": true,
-        "tok_s": 33921.0,
-        "step_ms": 15.100000000000001,
-        "pct": 49.64
+        "tok_s": 29365.0,
+        "step_ms": 17.4,
+        "pct": 42.98
       },
       "1024": {
         "ok": true,
-        "tok_s": 33236.0,
-        "step_ms": 30.8,
-        "pct": 49.8
+        "tok_s": 31328.0,
+        "step_ms": 32.7,
+        "pct": 46.94
       },
       "2048": {
         "ok": true,
-        "tok_s": 26533.0,
-        "step_ms": 77.2,
-        "pct": 41.61
+        "tok_s": 26279.0,
+        "step_ms": 77.89999999999999,
+        "pct": 41.22
       }
     },
     "Qwen2.5-7B": {
       "128": {
         "ok": true,
-        "tok_s": 12479.0,
-        "step_ms": 10.3,
-        "pct": 56.3
+        "tok_s": 12313.0,
+        "step_ms": 10.4,
+        "pct": 55.55
       },
       "512": {
-        "ok": true,
-        "tok_s": 18502.0,
-        "step_ms": 27.7,
-        "pct": 61.44
+        "ok": false,
+        "log": "loaded weights in 0.72s (mapped 15.23 GB, owned 0.00 GB)\nSynapse detected a device critical error that requires a restart. Killing process in 5 seconds (hl: 6, rankID: ---) 23:39:41 [please check log files for dfa cause]\nError: Other(\"synHostMalloc(dev, slot_bytes as u64, 0, &mut hb) -> synStatus 31\")\nterminate called without an active exception\n"
       },
       "1024": {
         "ok": true,
-        "tok_s": 17002.0,
-        "step_ms": 60.199999999999996,
-        "pct": 57.27
+        "tok_s": 17053.0,
+        "step_ms": 60.0,
+        "pct": 57.44
       },
       "2048": {
         "ok": true,
-        "tok_s": 14966.0,
-        "step_ms": 136.8,
-        "pct": 51.84
+        "tok_s": 15768.0,
+        "step_ms": 129.89999999999998,
+        "pct": 54.61
       }
     }
   }
