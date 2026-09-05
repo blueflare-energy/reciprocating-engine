@@ -3,7 +3,10 @@
 //!
 //! `cargo run -p reng-synapse --features link-synapse --bin reng-model-test -- [tokens] [hidden] [inter] [n_heads] [vocab] [layers] [causal 0/1] [n_kv_heads]`.
 
-use reng_synapse::{LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu};
+use reng_synapse::{
+    LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu, model_probe_bf16,
+    model_probe_cpu,
+};
 
 fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> {
     let half = (modulo as f32 - 1.0) / 2.0;
@@ -104,6 +107,33 @@ fn main() -> reng_core::Result<()> {
     println!(
         "fused model: layers={n_layers}, tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads}, vocab={vocab}, causal={causal}"
     );
+    // Optional 9th arg: probe the residual stream after that layer instead of
+    // the logits, and report where zeros sit in the read-back buffer.
+    if let Some(upto) = std::env::args()
+        .nth(9)
+        .and_then(|a| a.parse::<usize>().ok())
+    {
+        let hpu = model_probe_bf16(&x, &m, tokens, hidden, inter, causal, upto)?;
+        let cpu = model_probe_cpu(&x, &m, tokens, hidden, inter, causal, upto);
+        let num: f64 = hpu
+            .iter()
+            .zip(&cpu)
+            .map(|(a, b)| f64::from(*a - *b).powi(2))
+            .sum();
+        let den: f64 = cpu.iter().map(|b| f64::from(*b).powi(2)).sum();
+        let rel = (num.sqrt() / den.sqrt().max(1e-12)) as f32;
+        let zero_rows: Vec<usize> = (0..tokens)
+            .filter(|&r| hpu[r * hidden..(r + 1) * hidden].iter().all(|v| *v == 0.0))
+            .collect();
+        let first_nonzero = hpu.iter().position(|v| *v != 0.0);
+        println!(
+            "probe after layer {upto}: rel_L2={rel:.4} zero_rows={} {:?} first_nonzero_elem={first_nonzero:?} (= {} bytes)",
+            zero_rows.len(),
+            zero_rows.iter().take(12).collect::<Vec<_>>(),
+            first_nonzero.map_or(0, |p| p * 2)
+        );
+        return Ok(());
+    }
     let hpu = model_forward_bf16(&x, &m, tokens, hidden, inter, vocab, causal)?;
     let cpu = model_forward_cpu(&x, &m, tokens, hidden, inter, vocab, causal);
 

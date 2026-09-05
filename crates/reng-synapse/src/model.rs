@@ -16,6 +16,7 @@ use crate::{bf16_to_f32, f32_to_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::ffi::CString;
+use std::time::{Duration, Instant};
 
 macro_rules! syn {
     ($call:expr) => {{
@@ -51,6 +52,15 @@ struct AxisParams {
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
 /// to exactly zero in bf16 softmax while staying representable.
 const MASK_NEG: f32 = -30000.0;
+
+/// bf16 quiet-NaN pattern the output buffer is pre-filled with before launch.
+/// The recipe writes every output element exactly once and never produces this
+/// exact NaN, so "no sentinel left" is an exact completion test for the
+/// readback (the stream and device syncs return before deep recipes finish).
+const SENTINEL_BF16: u16 = 0x7FC1;
+const SENTINEL_D32: u32 = 0x7FC1_7FC1;
+/// Upper bound on waiting for a recipe's output to complete.
+const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn make_tensor(
     graph: synGraphHandle,
@@ -155,7 +165,10 @@ struct Shared {
     mask: Option<synTensor>,
 }
 
-/// Append one decoder layer reading `x` and return its output tensor.
+/// Append one decoder layer reading `x` and return its output tensor. When
+/// `out` is given (a persistent tensor) the layer writes into it instead of a
+/// graph-internal tensor, which lets a caller read that layer's residual
+/// stream back for diagnostics.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_layer(
     gb: &mut Gb,
@@ -166,6 +179,7 @@ fn build_layer(
     tokens: usize,
     hidden: usize,
     inter: usize,
+    out: Option<synTensor>,
 ) -> Result<synTensor> {
     let (nh, nkv) = (w.n_heads, w.n_kv_heads);
     assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
@@ -208,7 +222,10 @@ fn build_layer(
     let t_silu = gb.mid(&p("silu"), &[i, t], bf)?;
     let t_gated = gb.mid(&p("gated"), &[i, t], bf)?;
     let t_down = gb.mid(&p("down"), &[h, t], bf)?;
-    let t_out = gb.mid(&p("out"), &[h, t], bf)?;
+    let t_out = match out {
+        Some(o) => o,
+        None => gb.mid(&p("out"), &[h, t], bf)?,
+    };
 
     let rms = RmsNormParams {
         epsilon: w.eps,
@@ -496,7 +513,7 @@ pub fn model_forward_bf16(
 
     let mut cur = t_x;
     for (li, lw) in m.layers.iter().enumerate() {
-        cur = build_layer(&mut gb, li, cur, lw, &sh, tokens, hidden, inter)?;
+        cur = build_layer(&mut gb, li, cur, lw, &sh, tokens, hidden, inter, None)?;
     }
 
     // Final norm + LM head -> logits (the only persistent output).
@@ -590,6 +607,11 @@ pub fn model_forward_bf16(
         };
         let sz = &gb.sizes[idx];
         ti.tensor_size[..sz.len()].copy_from_slice(sz);
+        // A 1-D tensor (RMSNorm gain) is launched as [n, 1], never [n, 0]:
+        // the verified single-op path always populates both leading dims.
+        for d in sz.len()..2 {
+            ti.tensor_size[d] = 1;
+        }
         infos.push(ti);
         dev_bufs.push(d);
         host_bufs.push(hb);
@@ -616,6 +638,13 @@ pub fn model_forward_bf16(
     if ws > 0 {
         syn!(synDeviceMalloc(dev, ws, 0, 0, &mut dws));
     }
+    // Pre-fill the output with the completion sentinel (see SENTINEL_BF16).
+    syn!(synMemsetD32Async(
+        d_out,
+        SENTINEL_D32,
+        (out_bytes / 4) as usize,
+        stream
+    ));
     syn!(synStreamSynchronize(stream));
 
     syn!(synLaunch(
@@ -627,16 +656,78 @@ pub fn model_forward_bf16(
         0
     ));
     syn!(synStreamSynchronize(stream));
-    syn!(synMemCopyAsync(
-        stream,
-        d_out,
-        out_bytes,
-        h_out as u64,
-        SYN_DRAM_TO_HOST
-    ));
-    syn!(synStreamSynchronize(stream));
+    // A/B switches for the multi-layer readback race: does a device-wide wait
+    // or a settle before the readback make deep recipes read back complete?
+    if std::env::var("RENG_DEVSYNC").is_ok() {
+        syn!(synDeviceSynchronize(dev));
+    }
+    if let Some(ms) = std::env::var("RENG_SETTLE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    // Readback with completion polling: copy the output down and, while any
+    // sentinel element remains, wait briefly and copy again. RENG_EVBRIDGE=1
+    // instead gates one copy on a device-side event recorded on the stream
+    // (the canonical cross-stream pattern), for A/B comparison.
+    let n_out = tokens * vocab;
+    let read_once = |s: synStreamHandle| -> Result<()> {
+        syn!(synMemCopyAsync(
+            s,
+            d_out,
+            out_bytes,
+            h_out as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(s));
+        Ok(())
+    };
+    // SAFETY (closure body): h_out holds n_out bf16 elements for the whole call.
+    let incomplete = || -> usize {
+        let p = h_out.cast::<u16>();
+        (0..n_out)
+            .filter(|&j| unsafe { *p.add(j) } == SENTINEL_BF16)
+            .count()
+    };
+    if std::env::var("RENG_EVBRIDGE").is_ok() {
+        let mut ev: synEventHandle = core::ptr::null_mut();
+        syn!(synEventCreate(&mut ev, dev, 0));
+        syn!(synEventRecord(ev, stream));
+        let mut d2h: synStreamHandle = core::ptr::null_mut();
+        syn!(synStreamCreateGeneric(&mut d2h, dev, 0));
+        syn!(synStreamWaitEvent(d2h, ev, 0));
+        read_once(d2h)?;
+        unsafe {
+            synStreamDestroy(d2h);
+            synEventDestroy(ev);
+        }
+    } else {
+        read_once(stream)?;
+    }
+    let started = Instant::now();
+    let mut polls = 0u32;
+    let mut left = incomplete();
+    while left > 0 {
+        if started.elapsed() > READBACK_TIMEOUT {
+            return Err(Error::Other(format!(
+                "recipe output incomplete after {:?}: {left} of {n_out} elements unwritten",
+                READBACK_TIMEOUT
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        read_once(stream)?;
+        polls += 1;
+        left = incomplete();
+    }
+    if polls > 0 && std::env::var("RENG_READBACK_TRACE").is_ok() {
+        eprintln!(
+            "readback: output completed after {polls} extra polls ({:?})",
+            started.elapsed()
+        );
+    }
 
-    let mut out = vec![0.0f32; tokens * vocab];
+    let mut out = vec![0.0f32; n_out];
     // SAFETY: h_out holds tokens*vocab bf16 elements just copied back.
     unsafe {
         let po = h_out.cast::<u16>();
@@ -664,6 +755,222 @@ pub fn model_forward_bf16(
         synDestroy();
     }
     Ok(out)
+}
+
+/// Diagnostic: build layers `0..=upto` and read back the residual stream after
+/// layer `upto` (`[tokens, hidden]`, f32). Same graph construction as
+/// [`model_forward_bf16`], with that layer's output made persistent.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+///
+/// # Panics
+///
+/// Panics if `upto >= layers.len()` or a buffer length disagrees with the sizes.
+#[allow(clippy::too_many_lines)]
+pub fn model_probe_bf16(
+    x: &[f32],
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    causal: bool,
+    upto: usize,
+) -> Result<Vec<f32>> {
+    assert!(upto < m.layers.len());
+    assert_eq!(x.len(), tokens * hidden);
+    let l0 = &m.layers[0];
+    let hd = hidden / l0.n_heads;
+    let (t, h, hd64) = (tokens as u64, hidden as u64, hd as u64);
+    let bf = SYN_TYPE_BF16;
+
+    let mut gb = Gb::new()?;
+    let t_x = gb.input("X", &[h, t], x)?;
+    let t_sin = gb.input("SIN", &[hd64, t], l0.sin)?;
+    let t_cos = gb.input("COS", &[hd64, t], l0.cos)?;
+    let mask_host: Vec<f32> = (0..tokens * tokens)
+        .map(|idx| {
+            let (q, k) = (idx / tokens, idx % tokens);
+            if k <= q { 0.0 } else { MASK_NEG }
+        })
+        .collect();
+    let t_mask = if causal {
+        Some(gb.input("MASK", &[t, t], &mask_host)?)
+    } else {
+        None
+    };
+    let sh = Shared {
+        sin: t_sin,
+        cos: t_cos,
+        mask: t_mask,
+    };
+    let (t_probe, n_probe) = make_tensor(gb.graph, "PROBE", &[h, t], bf, true)?;
+    let mut cur = t_x;
+    for (li, lw) in m.layers.iter().enumerate().take(upto + 1) {
+        let out = if li == upto { Some(t_probe) } else { None };
+        cur = build_layer(&mut gb, li, cur, lw, &sh, tokens, hidden, inter, out)?;
+    }
+    let _ = cur;
+
+    let graph = gb.graph;
+    let mut recipe: synRecipeHandle = core::ptr::null_mut();
+    syn!(synGraphCompile(
+        &mut recipe,
+        graph,
+        CString::new("probe").unwrap().as_ptr(),
+        core::ptr::null()
+    ));
+    let mut name_ptrs: Vec<*const core::ffi::c_char> =
+        gb.names.iter().map(|n| n.as_ptr()).collect();
+    name_ptrs.push(n_probe.as_ptr());
+    let mut ids = vec![0u64; name_ptrs.len()];
+    syn!(synTensorRetrieveIds(
+        recipe,
+        name_ptrs.as_ptr(),
+        ids.as_mut_ptr(),
+        name_ptrs.len() as u32
+    ));
+
+    let mut dev: synDeviceId = 0;
+    syn!(synDeviceAcquireByDeviceType(&mut dev, SYN_DEVICE_GAUDI2));
+    let mut stream: synStreamHandle = core::ptr::null_mut();
+    syn!(synStreamCreateGeneric(&mut stream, dev, 0));
+    let n_in = gb.names.len();
+    let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + 1);
+    let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in + 1);
+    let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + 1);
+    for (idx, data) in gb.data.iter().enumerate() {
+        let bytes = (data.len() * 2) as u64;
+        let mut d = 0u64;
+        syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
+        let mut hb: *mut c_void = core::ptr::null_mut();
+        syn!(synHostMalloc(dev, bytes, 0, &mut hb));
+        // SAFETY: hb holds data.len() bf16 elements.
+        unsafe {
+            let pb = hb.cast::<u16>();
+            for (j, &val) in data.iter().enumerate() {
+                *pb.add(j) = f32_to_bf16(val);
+            }
+        }
+        syn!(synMemCopyAsync(
+            stream,
+            hb as u64,
+            bytes,
+            d,
+            SYN_HOST_TO_DRAM
+        ));
+        let mut ti = synLaunchTensorInfo {
+            tensor_name: gb.names[idx].as_ptr(),
+            tensor_address: d,
+            tensor_type: SYN_TENSOR_DATA,
+            tensor_size: [0; HABANA_DIM_MAX],
+            tensor_id: ids[idx],
+        };
+        let sz = &gb.sizes[idx];
+        ti.tensor_size[..sz.len()].copy_from_slice(sz);
+        for d2 in sz.len()..2 {
+            ti.tensor_size[d2] = 1;
+        }
+        infos.push(ti);
+        dev_bufs.push(d);
+        host_bufs.push(hb);
+    }
+    let out_bytes = (tokens * hidden * 2) as u64;
+    let mut d_out = 0u64;
+    syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
+    let mut h_out: *mut c_void = core::ptr::null_mut();
+    syn!(synHostMalloc(dev, out_bytes, 0, &mut h_out));
+    let mut ti = synLaunchTensorInfo {
+        tensor_name: n_probe.as_ptr(),
+        tensor_address: d_out,
+        tensor_type: SYN_TENSOR_DATA,
+        tensor_size: [0; HABANA_DIM_MAX],
+        tensor_id: ids[n_in],
+    };
+    ti.tensor_size[0] = h;
+    ti.tensor_size[1] = t;
+    infos.push(ti);
+    let mut ws = 0u64;
+    syn!(synWorkspaceGetSize(&mut ws, recipe));
+    let mut dws = 0u64;
+    if ws > 0 {
+        syn!(synDeviceMalloc(dev, ws, 0, 0, &mut dws));
+    }
+    syn!(synStreamSynchronize(stream));
+    syn!(synLaunch(
+        stream,
+        infos.as_ptr(),
+        infos.len() as u32,
+        dws,
+        recipe,
+        0
+    ));
+    syn!(synStreamSynchronize(stream));
+    // A/B switches for the multi-layer readback race: does a device-wide wait
+    // or a settle before the readback make deep recipes read back complete?
+    if std::env::var("RENG_DEVSYNC").is_ok() {
+        syn!(synDeviceSynchronize(dev));
+    }
+    if let Some(ms) = std::env::var("RENG_SETTLE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    syn!(synMemCopyAsync(
+        stream,
+        d_out,
+        out_bytes,
+        h_out as u64,
+        SYN_DRAM_TO_HOST
+    ));
+    syn!(synStreamSynchronize(stream));
+    let mut out = vec![0.0f32; tokens * hidden];
+    // SAFETY: h_out holds tokens*hidden bf16 elements just copied back.
+    unsafe {
+        let po = h_out.cast::<u16>();
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = bf16_to_f32(*po.add(j));
+        }
+    }
+    unsafe {
+        for hb in host_bufs {
+            synHostFree(dev, hb, 0);
+        }
+        synHostFree(dev, h_out, 0);
+        for d in dev_bufs {
+            synDeviceFree(dev, d, 0);
+        }
+        synDeviceFree(dev, d_out, 0);
+        if dws != 0 {
+            synDeviceFree(dev, dws, 0);
+        }
+        synStreamDestroy(stream);
+        synRecipeDestroy(recipe);
+        synGraphDestroy(graph);
+        synDeviceRelease(dev);
+        synDestroy();
+    }
+    Ok(out)
+}
+
+/// CPU reference for [`model_probe_bf16`]: residual stream after layer `upto`.
+#[must_use]
+pub fn model_probe_cpu(
+    x: &[f32],
+    m: &ModelWeights<'_>,
+    tokens: usize,
+    hidden: usize,
+    inter: usize,
+    causal: bool,
+    upto: usize,
+) -> Vec<f32> {
+    let mut cur = x.to_vec();
+    for lw in m.layers.iter().take(upto + 1) {
+        cur = layer_cpu(&cur, lw, tokens, hidden, inter, causal);
+    }
+    cur
 }
 
 /// One decoder layer on the CPU (f32), with optional causal masking and GQA.

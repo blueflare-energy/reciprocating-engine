@@ -1,0 +1,24 @@
+[package]
+name = "reng-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model loading (HF config + safetensors) and prefill on Gaudi2 for the Reciprocating Engine."
+
+[features]
+# Forwarded to reng-synapse; off by default so hosted CI builds without libSynapse.
+link-synapse = ["reng-synapse/link-synapse"]
+
+[dependencies]
+reng-core = { path = "../reng-core", version = "0.0.1" }
+reng-synapse = { path = "../reng-synapse", version = "0.0.1" }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "reng-prefill"
+path = "src/bin/prefill.rs"
+required-features = ["link-synapse"]

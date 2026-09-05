@@ -544,6 +544,10 @@ pub fn decoder_layer_bf16(
             tensor_id: ids[idx],
         };
         ti.tensor_size[..sizes.len()].copy_from_slice(sizes);
+        // A 1-D tensor (RMSNorm gain) is launched as [n, 1], never [n, 0].
+        for d in sizes.len()..2 {
+            ti.tensor_size[d] = 1;
+        }
         infos.push(ti);
         dev_bufs.push(d);
         host_bufs.push(hb);

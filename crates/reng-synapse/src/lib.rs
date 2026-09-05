@@ -101,7 +101,10 @@ pub use heads::{AxisParams, split_rotate_concat_bf16, split_rotate_concat_cpu};
 mod model;
 
 #[cfg(feature = "link-synapse")]
-pub use model::{ModelWeights, layer_cpu, model_forward_bf16, model_forward_cpu};
+pub use model::{
+    ModelWeights, layer_cpu, model_forward_bf16, model_forward_cpu, model_probe_bf16,
+    model_probe_cpu,
+};
 
 #[cfg(feature = "link-synapse")]
 pub use hpu::MatmulHpu;
