@@ -90,6 +90,48 @@ pub fn silu_cpu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|&v| v / (1.0 + (-v).exp())).collect()
 }
 
+/// Rotary position embedding (blockwise / rotate-half) via `rope_st2_fwd_bf16`.
+/// `x`, `sin`, `cos` are row-major `[seq, head_dim]` (head_dim contiguous).
+/// Acquires and releases a device for the single call.
+///
+/// # Errors
+///
+/// Returns an error if any SynapseAI call fails.
+///
+/// # Panics
+///
+/// Panics if any input length is not `seq*head_dim`.
+pub fn rope_bf16(
+    x: &[f32],
+    sin: &[f32],
+    cos: &[f32],
+    head_dim: usize,
+    seq: usize,
+) -> Result<Vec<f32>> {
+    Device::acquire()?.rope(x, sin, cos, head_dim, seq)
+}
+
+/// CPU reference rotary embedding, blockwise / rotate-half (Llama/Qwen). `x`,
+/// `sin`, `cos` row-major `[seq, head_dim]`; for `d < head_dim/2` the partner is
+/// `d + head_dim/2`. Returns `[seq, head_dim]`.
+#[must_use]
+pub fn rope_cpu(x: &[f32], sin: &[f32], cos: &[f32], head_dim: usize, seq: usize) -> Vec<f32> {
+    let half = head_dim / 2;
+    let mut out = vec![0.0f32; seq * head_dim];
+    for p in 0..seq {
+        let b = p * head_dim;
+        for d in 0..head_dim {
+            let rot = if d < half {
+                -x[b + d + half]
+            } else {
+                x[b + d - half]
+            };
+            out[b + d] = x[b + d] * cos[b + d] + rot * sin[b + d];
+        }
+    }
+    out
+}
+
 /// CPU reference row-wise softmax over `cols`, f32.
 #[must_use]
 pub fn softmax_cpu(input: &[f32], rows: usize, cols: usize) -> Vec<f32> {

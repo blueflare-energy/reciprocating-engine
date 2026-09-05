@@ -61,3 +61,8 @@ required-features = ["link-synapse"]
 name = "reng-mlp-test"
 path = "src/bin/mlp_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-rope-test"
+path = "src/bin/rope_test.rs"
+required-features = ["link-synapse"]

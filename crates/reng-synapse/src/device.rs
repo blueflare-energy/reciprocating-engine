@@ -721,6 +721,183 @@ impl Device {
         }
         Ok(out)
     }
+
+    /// Rotary position embedding (blockwise / rotate-half, the Llama/Qwen
+    /// convention) via `rope_st2_fwd_bf16`. `x`, `sin`, `cos` are each row-major
+    /// with `head_dim` as the FCD (contiguous) and `seq` as the outer dim, i.e.
+    /// `[seq, head_dim]` (`x[p*head_dim + d]`). Returns the rotated `[seq,
+    /// head_dim]` as f32. `head_dim` should be at least 128.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any input length is not `seq*head_dim`.
+    pub fn rope(
+        &self,
+        x: &[f32],
+        sin: &[f32],
+        cos: &[f32],
+        head_dim: usize,
+        seq: usize,
+    ) -> Result<Vec<f32>> {
+        assert_eq!(x.len(), seq * head_dim);
+        assert_eq!(sin.len(), seq * head_dim);
+        assert_eq!(cos.len(), seq * head_dim);
+        let (d, s) = (head_dim as u64, seq as u64);
+        let mut graph: synGraphHandle = core::ptr::null_mut();
+        syn!(synGraphCreate(&mut graph, SYN_DEVICE_GAUDI2));
+
+        let (n_x, n_sin, n_cos, n_y) = (
+            CString::new("X").unwrap(),
+            CString::new("SIN").unwrap(),
+            CString::new("COS").unwrap(),
+            CString::new("Y").unwrap(),
+        );
+        let t_x = self.tensor(graph, &n_x, d, s)?;
+        let t_sin = self.tensor(graph, &n_sin, d, s)?;
+        let t_cos = self.tensor(graph, &n_cos, d, s)?;
+        let t_y = self.tensor(graph, &n_y, d, s)?;
+
+        #[repr(C)]
+        struct RoPeParams {
+            offset: u32,
+            mode: i32, // 0 = blockwise (rotate-half)
+        }
+        let params = RoPeParams { offset: 0, mode: 0 };
+        let inputs = [t_x, t_sin, t_cos];
+        let outputs = [t_y];
+        let guid = CString::new("rope_st2_fwd_bf16").unwrap();
+        syn!(synNodeCreate(
+            graph,
+            inputs.as_ptr(),
+            outputs.as_ptr(),
+            3,
+            1,
+            (&raw const params).cast::<c_void>(),
+            core::mem::size_of::<RoPeParams>() as u32,
+            guid.as_ptr(),
+            CString::new("rope").unwrap().as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+        ));
+
+        let mut recipe: synRecipeHandle = core::ptr::null_mut();
+        syn!(synGraphCompile(
+            &mut recipe,
+            graph,
+            CString::new("rope").unwrap().as_ptr(),
+            core::ptr::null()
+        ));
+
+        let names = [n_x.as_ptr(), n_sin.as_ptr(), n_cos.as_ptr(), n_y.as_ptr()];
+        let mut ids: [u64; 4] = [0; 4];
+        syn!(synTensorRetrieveIds(
+            recipe,
+            names.as_ptr(),
+            ids.as_mut_ptr(),
+            4
+        ));
+
+        let bytes = (seq * head_dim * 2) as u64;
+        let (mut dx, mut dsin, mut dcos, mut dy) = (0u64, 0u64, 0u64, 0u64);
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dx));
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dsin));
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dcos));
+        syn!(synDeviceMalloc(self.id, bytes, 0, 0, &mut dy));
+        let mut ws = 0u64;
+        syn!(synWorkspaceGetSize(&mut ws, recipe));
+        let mut dws = 0u64;
+        if ws > 0 {
+            syn!(synDeviceMalloc(self.id, ws, 0, 0, &mut dws));
+        }
+
+        let (mut hx, mut hsin, mut hcos, mut hy): (
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+            *mut c_void,
+        ) = (
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hx));
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hsin));
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hcos));
+        syn!(synHostMalloc(self.id, bytes, 0, &mut hy));
+
+        // SAFETY: each host buffer holds seq*head_dim bf16 elements.
+        unsafe {
+            let fill = |dst: *mut c_void, src: &[f32]| {
+                let p = dst.cast::<u16>();
+                for (j, &v) in src.iter().enumerate() {
+                    *p.add(j) = f32_to_bf16(v);
+                }
+            };
+            fill(hx, x);
+            fill(hsin, sin);
+            fill(hcos, cos);
+        }
+
+        let mut stream: synStreamHandle = core::ptr::null_mut();
+        syn!(synStreamCreateGeneric(&mut stream, self.id, 0));
+        for (hh, dptr) in [(hx, dx), (hsin, dsin), (hcos, dcos)] {
+            syn!(synMemCopyAsync(
+                stream,
+                hh as u64,
+                bytes,
+                dptr,
+                SYN_HOST_TO_DRAM
+            ));
+        }
+        syn!(synStreamSynchronize(stream));
+
+        let infos = [
+            launch_info(&n_x, dx, ids[0], d, s),
+            launch_info(&n_sin, dsin, ids[1], d, s),
+            launch_info(&n_cos, dcos, ids[2], d, s),
+            launch_info(&n_y, dy, ids[3], d, s),
+        ];
+        syn!(synLaunch(stream, infos.as_ptr(), 4, dws, recipe, 0));
+        syn!(synStreamSynchronize(stream));
+        syn!(synMemCopyAsync(
+            stream,
+            dy,
+            bytes,
+            hy as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(stream));
+
+        let mut out = vec![0.0f32; seq * head_dim];
+        // SAFETY: hy holds seq*head_dim bf16 elements just copied back.
+        unsafe {
+            let py = hy.cast::<u16>();
+            for (j, o) in out.iter_mut().enumerate() {
+                *o = bf16_to_f32(*py.add(j));
+            }
+        }
+
+        unsafe {
+            for hh in [hx, hsin, hcos, hy] {
+                synHostFree(self.id, hh, 0);
+            }
+            for dptr in [dx, dsin, dcos, dy] {
+                synDeviceFree(self.id, dptr, 0);
+            }
+            if dws != 0 {
+                synDeviceFree(self.id, dws, 0);
+            }
+            synStreamDestroy(stream);
+            synRecipeDestroy(recipe);
+            synGraphDestroy(graph);
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for Device {
