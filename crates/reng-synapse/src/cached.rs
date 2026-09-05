@@ -3,7 +3,7 @@
 //!
 //! Each launch processes a block of `rows` positions (the real tokens first,
 //! zero rows after them) starting at the current position. Every layer keeps
-//! per-head key and value caches `[head_dim, capacity]` on the device
+//! key and value caches `[head_dim, capacity, 1, n_kv_heads]` on the device
 //! as two buffers: the recipe reads one and writes the other as
 //! `cache_out = cache_in + place @ block`, where `place` is a 0/1 matrix
 //! uploaded per step that sends block row r to position pos + r; the buffers
@@ -51,7 +51,7 @@ pub struct CachedModel {
     /// RoPE tables `[capacity, head_dim]`.
     sin: Vec<f32>,
     cos: Vec<f32>,
-    /// Per layer and KV head: the two K buffers and the two V buffers.
+    /// Per layer: the two K buffers and the two V buffers.
     slots: Vec<([u64; 2], [u64; 2])>,
     /// Which buffer of each pair the next launch reads (the other is written).
     parity: usize,
@@ -103,15 +103,13 @@ impl CachedModel {
         } else {
             None
         };
-        let mut slots = Vec::with_capacity(m.layers.len() * l0.n_kv_heads);
+        let mut slots = Vec::with_capacity(m.layers.len());
         for li in 0..m.layers.len() {
-            for g in 0..l0.n_kv_heads {
-                let (kci, vci, kco, vco) = cache_names(li, g);
-                slots.push((
-                    [rt.addr(&kci), rt.addr(&kco)],
-                    [rt.addr(&vci), rt.addr(&vco)],
-                ));
-            }
+            let (kci, vci, kco, vco) = cache_names(li);
+            slots.push((
+                [rt.addr(&kci), rt.addr(&kco)],
+                [rt.addr(&vci), rt.addr(&vco)],
+            ));
         }
         Ok(Self {
             dec,
@@ -147,8 +145,8 @@ impl CachedModel {
         let t_x = gb.input("X", &[h, t], &vec![0.0; rows * hidden])?;
         let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
         let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
-        let t_mask = gb.input("MASK", &[keys, t], &vec![0.0; rows * capacity])?;
-        let t_place = gb.input("PLACE", &[t, keys], &vec![0.0; rows * capacity])?;
+        let t_mask = gb.input("MASK", &[keys, t, 1, 1], &vec![0.0; rows * capacity])?;
+        let t_place = gb.input("PLACE", &[t, keys, 1, 1], &vec![0.0; rows * capacity])?;
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
@@ -205,7 +203,7 @@ impl CachedModel {
     ///
     /// Returns an error if the device memset fails.
     pub fn reset(&mut self) -> Result<()> {
-        let bytes = (self.head_dim * self.capacity * 2) as u64;
+        let bytes = (self.head_dim * self.capacity * self.n_kv * 2) as u64;
         for (k, v) in &self.slots {
             for &a in k.iter().chain(v.iter()) {
                 self.rt.zero(a, bytes)?;
@@ -284,8 +282,8 @@ impl CachedModel {
         let t0 = Instant::now();
         // Read the cache buffer written by the previous launch, write the other.
         let (rd, wr) = (self.parity, 1 - self.parity);
-        for (li_g, (k, v)) in self.slots.iter().enumerate() {
-            let (kci, vci, kco, vco) = cache_names(li_g / self.n_kv, li_g % self.n_kv);
+        for (li, (k, v)) in self.slots.iter().enumerate() {
+            let (kci, vci, kco, vco) = cache_names(li);
             rt.rebind(&kci, k[rd]);
             rt.rebind(&kco, k[wr]);
             rt.rebind(&vci, v[rd]);

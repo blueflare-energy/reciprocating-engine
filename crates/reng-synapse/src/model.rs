@@ -8,7 +8,9 @@
 //! embedding gather is done on the host (a row copy per token; trivially exact
 //! and cheap), so the graph starts from `[tokens, hidden]` activations.
 //! Grouped-query attention is supported: query head `j` uses K/V head
-//! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention.
+//! `j / (n_heads / n_kv_heads)`, the HF `repeat_kv` convention. Attention
+//! is batched over heads in 4-D tensors (`[.., heads-per-group, groups]`)
+//! so each step of it is one node for all heads.
 //!
 //! With a KV cache (see `cached.rs`) each layer reads per-head cache tensors
 //! `[head_dim, capacity]` and writes updated ones: the block's keys
@@ -57,11 +59,6 @@ struct RmsNormParams {
 struct RopeParams {
     offset: u32,
     mode: i32,
-}
-
-#[repr(C)]
-struct AxisParams {
-    axis: u32,
 }
 
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
@@ -227,33 +224,51 @@ impl Gb {
 pub(crate) struct Shared {
     pub sin: synTensor,
     pub cos: synTensor,
-    /// Additive mask laid out like the score matrix, `[keys, queries]`.
+    /// Additive mask laid out like the score matrix, `[keys, queries, 1, 1]`
+    /// (broadcast over heads).
     pub mask: Option<synTensor>,
-    /// KV-cache capacity in positions. When set, every layer gets per-head
-    /// cache input and output tensors (see [`cache_names`]) of `capacity`
+    /// KV-cache capacity in positions. When set, every layer gets cache
+    /// input and output tensors (see [`cache_names`]) of `capacity`
     /// positions, which is also the key axis of the scores.
     pub cache: Option<usize>,
-    /// The placement matrix input (`[tokens, capacity]` device sizes: row r
-    /// of the block goes to the position whose entry is 1).
+    /// The placement matrix input (`[tokens, capacity, 1, 1]` device sizes:
+    /// row r of the block goes to the position whose entry is 1).
     pub place: Option<synTensor>,
 }
 
-/// Persistent tensor names of layer `li`'s cache state for KV head `g`:
+/// Persistent tensor names of layer `li`'s cache state:
 /// `(k_cache_in, v_cache_in, k_cache_out, v_cache_out)`, each
-/// `[head_dim, capacity]` (keys after RoPE).
+/// `[head_dim, capacity, 1, n_kv_heads]` (keys after RoPE).
 #[must_use]
-pub fn cache_names(li: usize, g: usize) -> (String, String, String, String) {
+pub fn cache_names(li: usize) -> (String, String, String, String) {
     (
-        format!("l{li}_kci{g}"),
-        format!("l{li}_vci{g}"),
-        format!("l{li}_kco{g}"),
-        format!("l{li}_vco{g}"),
+        format!("l{li}_kci"),
+        format!("l{li}_vci"),
+        format!("l{li}_kco"),
+        format!("l{li}_vco"),
     )
+}
+
+/// `synTransposeParams`: `permutation[i]` is the source dim of output dim
+/// `i` (five entries), then the tensor's dim count.
+#[repr(C)]
+struct TransposeParams {
+    permutation: [u32; 5],
+    tensor_dim: u32,
 }
 
 /// Append one decoder layer reading `x` and return its output tensor. When
 /// `out` is given (a persistent tensor) the layer writes into it instead of a
 /// graph-internal tensor.
+///
+/// Attention is batched over heads: with `hpg = n_heads / n_kv_heads` query
+/// heads per KV group, queries live in `[hd, tokens, hpg, groups]` and keys
+/// and values in `[hd, keys, 1, groups]`, so one `batch_gemm` per step
+/// serves every head (the size-1 dim broadcasts a KV head over its group).
+/// Projections are `batch_gemm`s of the normalised input (broadcast) against
+/// per-head weight blocks, RoPE runs on the batched tensors with one 2-D
+/// table, and the per-head outputs go through one transpose back to
+/// `[hidden, tokens]` for the output projection.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn build_layer(
     gb: &mut Gb,
@@ -269,21 +284,44 @@ pub(crate) fn build_layer(
     let (nh, nkv) = (w.n_heads, w.n_kv_heads);
     assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
     let hd_us = hidden / nh;
-    let n_rep = nh / nkv;
-    let (t, h, i, hd, kvd) = (
+    let hpg_us = nh / nkv;
+    let (t, h, i, hd, hpg, groups) = (
         tokens as u64,
         hidden as u64,
         inter as u64,
         hd_us as u64,
-        (nkv * hd_us) as u64,
+        hpg_us as u64,
+        nkv as u64,
     );
+    // Key axis of the score matrices: the block alone, or the whole cache.
+    let keys = sh.cache.map_or(t, |c| c as u64);
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
 
+    // Per-head weight blocks, `[hd, hidden, heads-in-group, groups]` on the
+    // device: block (j, g) is the columns of head `g * hpg + j`.
+    let blocks = |m: &[f32], cols: usize, per_group: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(hidden * cols);
+        for g in 0..nkv {
+            for j in 0..per_group {
+                let head = g * per_group + j;
+                for r in 0..hidden {
+                    v.extend_from_slice(&m[r * cols + head * hd_us..r * cols + (head + 1) * hd_us]);
+                }
+            }
+        }
+        v
+    };
     let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    let t_wq = gb.input(&p("wq"), &[h, h], &wq_scaled)?;
+    let t_wq = gb.input(
+        &p("wq"),
+        &[hd, h, hpg, groups],
+        &blocks(&wq_scaled, hidden, hpg_us),
+    )?;
+    let t_wk = gb.input(&p("wk"), &[hd, h, 1, groups], &blocks(w.wk, nkv * hd_us, 1))?;
+    let t_wv = gb.input(&p("wv"), &[hd, h, 1, groups], &blocks(w.wv, nkv * hd_us, 1))?;
     let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
     let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
     let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
@@ -291,7 +329,17 @@ pub(crate) fn build_layer(
 
     let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
-    let t_q = gb.mid(&p("q"), &[h, t], bf)?;
+    let t_n1_4 = gb.mid(&p("n1_4"), &[h, t, 1, 1], bf)?;
+    let t_q = gb.mid(&p("q"), &[hd, t, hpg, groups], bf)?;
+    let t_qr = gb.mid(&p("qr"), &[hd, t, hpg, groups], bf)?;
+    let t_k = gb.mid(&p("k"), &[hd, t, 1, groups], bf)?;
+    let t_kr = gb.mid(&p("kr"), &[hd, t, 1, groups], bf)?;
+    let t_v = gb.mid(&p("v"), &[hd, t, 1, groups], bf)?;
+    let t_sc = gb.mid(&p("scores"), &[keys, t, hpg, groups], bf)?;
+    let t_pr = gb.mid(&p("probs"), &[keys, t, hpg, groups], bf)?;
+    let t_at = gb.mid(&p("at"), &[hd, t, hpg, groups], bf)?;
+    let t_at3 = gb.mid(&p("at3"), &[hd, t, hpg * groups], bf)?;
+    let t_att = gb.mid(&p("att"), &[hd, hpg * groups, t], bf)?;
     let t_attn = gb.mid(&p("attn"), &[h, t], bf)?;
     let t_o = gb.mid(&p("o"), &[h, t], bf)?;
     let t_h = gb.mid(&p("h"), &[h, t], bf)?;
@@ -308,8 +356,6 @@ pub(crate) fn build_layer(
         None => gb.mid(&p("out"), &[h, t], bf)?,
     };
 
-    // Key axis of the score matrices: the block alone, or the whole cache.
-    let keys = sh.cache.map_or(t, |c| c as u64);
     let rms = RmsNormParams {
         epsilon: w.eps,
         fused_gamma_beta: false,
@@ -317,7 +363,6 @@ pub(crate) fn build_layer(
         bwd_mode: 0,
     };
     let rope = RopeParams { offset: 0, mode: 0 };
-    let axis0 = AxisParams { axis: 0 };
     let gemm = synGEMMParams {
         transpose_a: false,
         transpose_b: false,
@@ -327,6 +372,10 @@ pub(crate) fn build_layer(
         transpose_b: true,
     };
     let sm = synSoftmaxParams { dim: 0 };
+    let tr = TransposeParams {
+        permutation: [0, 2, 1, 0, 0],
+        tensor_dim: 3,
+    };
     let prm = (
         (&raw const rms).cast::<c_void>(),
         core::mem::size_of::<RmsNormParams>() as u32,
@@ -334,10 +383,6 @@ pub(crate) fn build_layer(
     let pr = (
         (&raw const rope).cast::<c_void>(),
         core::mem::size_of::<RopeParams>() as u32,
-    );
-    let pax = (
-        (&raw const axis0).cast::<c_void>(),
-        core::mem::size_of::<AxisParams>() as u32,
     );
     let pg = (
         (&raw const gemm).cast::<c_void>(),
@@ -351,6 +396,10 @@ pub(crate) fn build_layer(
         (&raw const sm).cast::<c_void>(),
         core::mem::size_of::<synSoftmaxParams>() as u32,
     );
+    let ptr_ = (
+        (&raw const tr).cast::<c_void>(),
+        core::mem::size_of::<TransposeParams>() as u32,
+    );
     let none = (core::ptr::null::<c_void>(), 0u32);
 
     gb.node(
@@ -361,208 +410,145 @@ pub(crate) fn build_layer(
         prm.0,
         prm.1,
     )?;
-    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q], pg.0, pg.1)?;
-    // Per-head query slices (split only when there is more than one slice).
-    let heads = |gb: &mut Gb, pre: &str, count: usize| -> Result<Vec<synTensor>> {
-        (0..count)
-            .map(|j| gb.mid(&p(&format!("{pre}{j}")), &[hd, t], bf))
-            .collect()
-    };
-    let qs = if nh > 1 {
-        let q_h = heads(gb, "q", nh)?;
-        gb.node("split", &p("split_q"), &[t_q], &q_h, pax.0, pax.1)?;
-        q_h
-    } else {
-        vec![t_q]
-    };
-    // Keys and values per KV head. Without a cache they come from one K and
-    // one V projection split per head; the rotated keys and the values of the
-    // block are graph-internal. With a cache each KV head has its own K and V
-    // projection, and the block's rotated keys and values are placed into the
-    // cache by compute engines only: `cache_out = cache_in + place(block)`,
-    // where `place` is a gemm with the caller's 0/1 placement matrix (block
-    // row r goes to position pos + r). The caller binds `cache_in` and
-    // `cache_out` to two buffers and swaps them every launch. Attention then
-    // reads the whole updated cache. No DMA touches cache data: on this stack
-    // a DMA reading freshly compute-written memory can return stale bytes.
-    let mut k_full: Vec<synTensor> = Vec::with_capacity(nkv);
-    let mut v_full: Vec<synTensor> = Vec::with_capacity(nkv);
-    if let Some(place) = sh.place {
-        for g in 0..nkv {
-            // Column block g of the [hidden, kvd] projections, as [hidden, hd].
-            let cols = |m: &[f32]| -> Vec<f32> {
-                (0..hidden)
-                    .flat_map(|r| {
-                        m[r * nkv * hd_us + g * hd_us..r * nkv * hd_us + (g + 1) * hd_us]
-                            .iter()
-                            .copied()
-                    })
-                    .collect()
-            };
-            let t_wk_g = gb.input(&p(&format!("wk{g}")), &[hd, h], &cols(w.wk))?;
-            let t_wv_g = gb.input(&p(&format!("wv{g}")), &[hd, h], &cols(w.wv))?;
-            let (n_kc_in, n_vc_in, n_kc_out, n_vc_out) = cache_names(li, g);
-            let kc_in = gb.scratch(&n_kc_in, &[hd, keys])?;
-            let vc_in = gb.scratch(&n_vc_in, &[hd, keys])?;
-            let kc_out = gb.scratch(&n_kc_out, &[hd, keys])?;
-            let vc_out = gb.scratch(&n_vc_out, &[hd, keys])?;
-            let k_g = gb.mid(&p(&format!("k{g}")), &[hd, t], bf)?;
-            let kn = gb.mid(&p(&format!("kn{g}")), &[hd, t], bf)?;
-            let vn = gb.mid(&p(&format!("vn{g}")), &[hd, t], bf)?;
-            let kp = gb.mid(&p(&format!("kp{g}")), &[hd, keys], bf)?;
-            let vp = gb.mid(&p(&format!("vp{g}")), &[hd, keys], bf)?;
-            gb.node(
-                "gemm",
-                &p(&format!("k_proj{g}")),
-                &[t_n1, t_wk_g],
-                &[k_g],
-                pg.0,
-                pg.1,
-            )?;
-            gb.node(
-                "rope_st2_fwd_bf16",
-                &p(&format!("rope_k{g}")),
-                &[k_g, sh.sin, sh.cos],
-                &[kn],
-                pr.0,
-                pr.1,
-            )?;
-            gb.node(
-                "gemm",
-                &p(&format!("v_proj{g}")),
-                &[t_n1, t_wv_g],
-                &[vn],
-                pg.0,
-                pg.1,
-            )?;
-            // placed[position, hd] = place[position, row] @ block[row, hd]
-            gb.node(
-                "gemm",
-                &p(&format!("k_place{g}")),
-                &[place, kn],
-                &[kp],
-                pg.0,
-                pg.1,
-            )?;
-            gb.node(
-                "gemm",
-                &p(&format!("v_place{g}")),
-                &[place, vn],
-                &[vp],
-                pg.0,
-                pg.1,
-            )?;
-            gb.node(
-                "add_fwd_bf16",
-                &p(&format!("k_cache{g}")),
-                &[kc_in, kp],
-                &[kc_out],
-                none.0,
-                none.1,
-            )?;
-            gb.node(
-                "add_fwd_bf16",
-                &p(&format!("v_cache{g}")),
-                &[vc_in, vp],
-                &[vc_out],
-                none.0,
-                none.1,
-            )?;
-            k_full.push(kc_out);
-            v_full.push(vc_out);
-        }
-    } else {
-        let t_wk = gb.input(&p("wk"), &[kvd, h], w.wk)?;
-        let t_wv = gb.input(&p("wv"), &[kvd, h], w.wv)?;
-        let t_k = gb.mid(&p("k"), &[kvd, t], bf)?;
-        let t_v = gb.mid(&p("v"), &[kvd, t], bf)?;
-        gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k], pg.0, pg.1)?;
-        gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v], pg.0, pg.1)?;
-        let (ks, vs) = if nkv > 1 {
-            let (k_h, v_h) = (heads(gb, "k", nkv)?, heads(gb, "v", nkv)?);
-            gb.node("split", &p("split_k"), &[t_k], &k_h, pax.0, pax.1)?;
-            gb.node("split", &p("split_v"), &[t_v], &v_h, pax.0, pax.1)?;
-            (k_h, v_h)
-        } else {
-            (vec![t_k], vec![t_v])
-        };
-        for (g, &kg) in ks.iter().enumerate() {
-            let kr = gb.mid(&p(&format!("kr{g}")), &[hd, t], bf)?;
-            gb.node(
-                "rope_st2_fwd_bf16",
-                &p(&format!("rope_k{g}")),
-                &[kg, sh.sin, sh.cos],
-                &[kr],
-                pr.0,
-                pr.1,
-            )?;
-            k_full.push(kr);
-            v_full.push(vs[g]);
-        }
-    }
-    let mut at_h: Vec<synTensor> = Vec::with_capacity(nh);
-    for (j, &qj) in qs.iter().enumerate() {
-        let g = j / n_rep;
-        let qr = gb.mid(&p(&format!("qr{j}")), &[hd, t], bf)?;
-        let sc = gb.mid(&p(&format!("scores{j}")), &[keys, t], bf)?;
-        let pr_t = gb.mid(&p(&format!("probs{j}")), &[keys, t], bf)?;
-        let at = gb.mid(&p(&format!("attn{j}")), &[hd, t], bf)?;
+    gb.node("reshape", &p("n1_4d"), &[t_n1], &[t_n1_4], none.0, none.1)?;
+    gb.node(
+        "batch_gemm",
+        &p("q_proj"),
+        &[t_n1_4, t_wq],
+        &[t_q],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("k_proj"),
+        &[t_n1_4, t_wk],
+        &[t_k],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "batch_gemm",
+        &p("v_proj"),
+        &[t_n1_4, t_wv],
+        &[t_v],
+        pg.0,
+        pg.1,
+    )?;
+    gb.node(
+        "rope_st2_fwd_bf16",
+        &p("rope_q"),
+        &[t_q, sh.sin, sh.cos],
+        &[t_qr],
+        pr.0,
+        pr.1,
+    )?;
+    gb.node(
+        "rope_st2_fwd_bf16",
+        &p("rope_k"),
+        &[t_k, sh.sin, sh.cos],
+        &[t_kr],
+        pr.0,
+        pr.1,
+    )?;
+
+    // Keys and values attention reads: the block's own, or the cache updated
+    // with the block: `cache_out = cache_in + place @ block` (see cached.rs).
+    let (k_full, v_full) = if let Some(place) = sh.place {
+        let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
+        let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups])?;
+        let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups])?;
+        let kco = gb.scratch(&n_kco, &[hd, keys, 1, groups])?;
+        let vco = gb.scratch(&n_vco, &[hd, keys, 1, groups])?;
+        let kp = gb.mid(&p("kp"), &[hd, keys, 1, groups], bf)?;
+        let vp = gb.mid(&p("vp"), &[hd, keys, 1, groups], bf)?;
         gb.node(
-            "rope_st2_fwd_bf16",
-            &p(&format!("rope_q{j}")),
-            &[qj, sh.sin, sh.cos],
-            &[qr],
-            pr.0,
-            pr.1,
-        )?;
-        // scores[query, key] = qr @ k^T with K in its natural [seq, head_dim] layout.
-        gb.node(
-            "gemm",
-            &p(&format!("qk{j}")),
-            &[qr, k_full[g]],
-            &[sc],
-            pgt.0,
-            pgt.1,
-        )?;
-        let sm_in = if let Some(mask) = sh.mask {
-            let masked = gb.mid(&p(&format!("masked{j}")), &[keys, t], bf)?;
-            gb.node(
-                "add_fwd_bf16",
-                &p(&format!("mask{j}")),
-                &[sc, mask],
-                &[masked],
-                none.0,
-                none.1,
-            )?;
-            masked
-        } else {
-            sc
-        };
-        gb.node(
-            "softmax_fwd_bf16",
-            &p(&format!("softmax{j}")),
-            &[sm_in],
-            &[pr_t],
-            ps.0,
-            ps.1,
-        )?;
-        gb.node(
-            "gemm",
-            &p(&format!("av{j}")),
-            &[pr_t, v_full[g]],
-            &[at],
+            "batch_gemm",
+            &p("k_place"),
+            &[place, t_kr],
+            &[kp],
             pg.0,
             pg.1,
         )?;
-        at_h.push(at);
-    }
-    let attn_full = if nh > 1 {
-        gb.node("concat", &p("merge_heads"), &at_h, &[t_attn], pax.0, pax.1)?;
-        t_attn
+        gb.node(
+            "batch_gemm",
+            &p("v_place"),
+            &[place, t_v],
+            &[vp],
+            pg.0,
+            pg.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("k_cache"),
+            &[kci, kp],
+            &[kco],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("v_cache"),
+            &[vci, vp],
+            &[vco],
+            none.0,
+            none.1,
+        )?;
+        (kco, vco)
     } else {
-        at_h[0]
+        (t_kr, t_v)
     };
-    gb.node("gemm", &p("o_proj"), &[attn_full, t_wo], &[t_o], pg.0, pg.1)?;
+    // scores[key, query] per head = q @ k^T with K in its natural layout.
+    gb.node(
+        "batch_gemm",
+        &p("qk"),
+        &[t_qr, k_full],
+        &[t_sc],
+        pgt.0,
+        pgt.1,
+    )?;
+    let sm_in = if let Some(mask) = sh.mask {
+        let masked = gb.mid(&p("masked"), &[keys, t, hpg, groups], bf)?;
+        gb.node(
+            "add_fwd_bf16",
+            &p("mask"),
+            &[t_sc, mask],
+            &[masked],
+            none.0,
+            none.1,
+        )?;
+        masked
+    } else {
+        t_sc
+    };
+    gb.node(
+        "softmax_fwd_bf16",
+        &p("softmax"),
+        &[sm_in],
+        &[t_pr],
+        ps.0,
+        ps.1,
+    )?;
+    gb.node("batch_gemm", &p("av"), &[t_pr, v_full], &[t_at], pg.0, pg.1)?;
+    // [hd, t, hpg, groups] -> [hd, t, heads] -> [hd, heads, t] = [hidden, t].
+    gb.node("reshape", &p("at_3d"), &[t_at], &[t_at3], none.0, none.1)?;
+    gb.node(
+        "transpose",
+        &p("heads_last"),
+        &[t_at3],
+        &[t_att],
+        ptr_.0,
+        ptr_.1,
+    )?;
+    gb.node(
+        "reshape",
+        &p("attn_2d"),
+        &[t_att],
+        &[t_attn],
+        none.0,
+        none.1,
+    )?;
+    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pg.0, pg.1)?;
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
@@ -740,7 +726,7 @@ fn build_stack(
         })
         .collect();
     let t_mask = if causal {
-        Some(gb.input("MASK", &[t, t], &mask_host)?)
+        Some(gb.input("MASK", &[t, t, 1, 1], &mask_host)?)
     } else {
         None
     };

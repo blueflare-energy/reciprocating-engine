@@ -62,8 +62,8 @@ fn parse_args() -> reng_core::Result<Args> {
     }
     assert!(a.prompt >= 1 && a.n_new >= 1);
     assert!(
-        a.prompt + a.n_new + a.warmup <= a.capacity,
-        "prompt + new + warmup must fit the cache capacity"
+        a.prompt + a.n_new <= a.capacity,
+        "prompt + new must fit the cache capacity"
     );
     Ok(a)
 }
@@ -101,12 +101,13 @@ fn main() -> reng_core::Result<()> {
         .map(|i| (i * 7919 + 13) % vocab)
         .collect();
 
-    // Warm the recipe (first launches on a cold device are slower), then
+    // Warm both recipes (the first launches of a recipe are slower), then
     // measure prefill as one fresh sequence.
     for _ in 0..a.warmup {
+        g.feed(&prompt)?;
         g.feed(&prompt[..1])?;
+        g.reset()?;
     }
-    g.reset()?;
     let t1 = Instant::now();
     g.feed(&prompt)?;
     let prefill_s = t1.elapsed().as_secs_f64();
