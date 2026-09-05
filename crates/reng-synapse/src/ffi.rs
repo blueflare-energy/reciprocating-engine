@@ -15,6 +15,7 @@ pub type synRecipeHandle = *mut c_void;
 pub type synStreamHandle = *mut c_void;
 pub type synSectionHandle = *mut c_void;
 pub type synTensor = *mut c_void;
+pub type synEventHandle = *mut c_void;
 
 pub const SYN_SUCCESS: synStatus = 0;
 pub const SYN_DEVICE_GAUDI2: c_int = 4;
@@ -84,6 +85,43 @@ unsafe extern "C" {
     pub fn synStreamDestroy(streamHandle: synStreamHandle) -> synStatus;
     pub fn synStreamSynchronize(streamHandle: synStreamHandle) -> synStatus;
     pub fn synDeviceSynchronize(deviceId: synDeviceId) -> synStatus;
+    pub fn synEventCreate(
+        pEventHandle: *mut synEventHandle,
+        deviceId: synDeviceId,
+        flags: u32,
+    ) -> synStatus;
+    pub fn synEventDestroy(eventHandle: synEventHandle) -> synStatus;
+    pub fn synEventRecord(eventHandle: synEventHandle, streamHandle: synStreamHandle) -> synStatus;
+    pub fn synStreamWaitEvent(
+        streamHandle: synStreamHandle,
+        eventHandle: synEventHandle,
+        flags: u32,
+    ) -> synStatus;
+    pub fn synEventSynchronize(eventHandle: synEventHandle) -> synStatus;
+    pub fn synEventQuery(eventHandle: synEventHandle) -> synStatus;
+    pub fn synMemsetD32Async(
+        pDeviceMem: u64,
+        value: u32,
+        numOfElements: usize,
+        streamHandle: synStreamHandle,
+    ) -> synStatus;
+    pub fn synTensorSetExternal(tensor: synTensor, isExternal: bool) -> synStatus;
+    pub fn synEventMapTensor(
+        eventHandles: *mut synEventHandle,
+        numOfEvents: usize,
+        launchTensorsInfo: *const synLaunchTensorInfo,
+        recipeHandle: synRecipeHandle,
+    ) -> synStatus;
+    pub fn synLaunchWithExternalEvents(
+        streamHandle: synStreamHandle,
+        launchTensorsInfoExt: *const synLaunchTensorInfo,
+        numberOfTensors: u32,
+        pWorkspace: u64,
+        pRecipeHandle: synRecipeHandle,
+        eventHandleList: *mut synEventHandle,
+        numberOfEvents: u32,
+        flags: u32,
+    ) -> synStatus;
     pub fn synMemCopyAsync(
         streamHandle: synStreamHandle,
         src: u64,
