@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788602668224,
+  "lastUpdate": 1788603048153,
   "repoUrl": "https://github.com/blueflare-energy/reciprocating-engine",
   "entries": {
     "Gaudi2 inference": [
@@ -90,6 +90,52 @@ window.BENCHMARK_DATA = {
           {
             "name": "SmolLM2-135M decode % of ceiling (b1)",
             "value": 4.348755586709772,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "noah@it.bluefla.re",
+            "name": "Noah"
+          },
+          "committer": {
+            "email": "noah@it.bluefla.re",
+            "name": "bfe-noah"
+          },
+          "distinct": true,
+          "id": "18095324337f924d74ca3e18ee9f46dfffc94f2c",
+          "message": "reng-synapse: single-node probe runner and batched-attention contract tests\n\nprobe.rs: run_node builds a one-node graph over host inputs and reads the\noutput back through the full readback protocol, so a kernel's rank, layout,\nbroadcasting and parameter struct can be pinned before it goes into a model\ngraph.\n\nreng-bgemm-test: batch_gemm with the batch outermost, transpose_b, and a\nbatch-1 B broadcast all match the CPU reference (rel_L2 0.0027).\n\nreng-batched-test: everything a one-node-per-op attention layer needs:\n4-D batch_gemm with the inner batch dim of B broadcast (query heads of one\nGQA group against one K head), batch_gemm with A broadcast against per-head\nweight blocks, add_fwd_bf16 broadcasting a [n,m,1,1] mask over [n,m,g,h],\nsoftmax over the FCD of a 4-D tensor, rope_st2_fwd_bf16 on [hd,rows,heads]\nwith a 2-D table, and transpose (synTransposeParams is five u32 permutation\nentries plus the dim count). All six pass.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01VUoyvmdyW73XuUwedpKuqZ",
+          "timestamp": "2026-09-05T04:10:15-06:00",
+          "tree_id": "0e0682683be9a4c9b884869bb48d5a485047947b",
+          "url": "https://github.com/blueflare-energy/reciprocating-engine/commit/18095324337f924d74ca3e18ee9f46dfffc94f2c"
+        },
+        "date": 1788603047355,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 5164.227268604694,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 0.44776759248856035,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b1)",
+            "value": 394.7591430751098,
+            "unit": "tok/s",
+            "extra": "ctx ~160; median step 2.44 ms; ceiling 8986 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b1)",
+            "value": 4.393043190537673,
             "unit": "%",
             "extra": "HbmBandwidth bound"
           }
