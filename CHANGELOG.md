@@ -67,6 +67,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agreement with last-logits cosine 1.0000; b1 512 tok/s, b8 4205.
   `reng-layer-test` uses the dense input generator of the other tests
   and `reng-norm-test` takes `[scale] [eps]`.
+- Mistral-7B verified without engine changes: v0.3 (vocab 32768,
+  rope_theta 1e6, no window) 7/8 exact plus a reference near-tie, 296/304
+  argmax agreement with last-logits cosine 1.0000 at 304 tokens, b1 136
+  tok/s (79.0%), b8 1079 (79.1%); v0.1 (`sliding_window 4096`) 8/8 exact,
+  and at a 4500-token prompt with a password stated in the first tokens
+  and asked for at the end, the windowed prefill reproduces the
+  reference's forgetting (top-1 match, cosine 0.9991) while
+  `RENG_NO_WINDOW=1` does not (top-1 differs, cosine 0.9656).
+- `reng-sdpa-test` and `reng-msoftmax-test` probe the fused attention
+  (`sdpa_recomp_fwd_bf16`) and masked-softmax kernels against host
+  references; `tools/profile/` holds the trace timeline and decode-step
+  gap scripts.
 - `reng-argmax-test`: probes the argmax kernels with the row maximum
   planted at chosen positions and values, single and multi row.
 - `RENG_HOST_ARGMAX=1` makes `reng-generate` read the logits and take

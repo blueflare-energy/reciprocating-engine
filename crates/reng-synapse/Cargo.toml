@@ -126,3 +126,13 @@ required-features = ["link-synapse"]
 name = "reng-argmax-test"
 path = "src/bin/argmax_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-msoftmax-test"
+path = "src/bin/msoftmax_test.rs"
+required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-sdpa-test"
+path = "src/bin/sdpa_test.rs"
+required-features = ["link-synapse"]
