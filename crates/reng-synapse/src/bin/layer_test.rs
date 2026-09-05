@@ -57,6 +57,7 @@ fn main() -> reng_core::Result<()> {
     let w = LayerWeights {
         n_heads,
         n_kv_heads,
+        head_dim: hd,
         g1: &g1,
         g2: &g2,
         wq: &wq,
@@ -66,6 +67,8 @@ fn main() -> reng_core::Result<()> {
         bq: &[],
         bk: &[],
         bv: &[],
+        qn: &[],
+        kn: &[],
         wg: &wg,
         wu: &wu,
         wd: &wd,

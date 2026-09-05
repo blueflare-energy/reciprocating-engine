@@ -95,7 +95,7 @@ impl<'a> CachedModel<'a> {
     ) -> Result<Self> {
         assert!(!m.layers.is_empty() && rows > 0 && capacity > 0);
         let l0 = &m.layers[0];
-        let hd = hidden / l0.n_heads;
+        let hd = l0.head_dim;
         assert_eq!(sin.len(), capacity * hd);
         assert_eq!(cos.len(), capacity * hd);
         assert_eq!(m.final_gamma.len(), hidden);
@@ -144,7 +144,7 @@ impl<'a> CachedModel<'a> {
         capacity: usize,
         inplace: bool,
     ) -> Result<(Gb<'a>, crate::runtime::Out)> {
-        let hd = hidden / m.layers[0].n_heads;
+        let hd = m.layers[0].head_dim;
         let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64 + 1);
         let mut gb = Gb::new()?;
         // Per-step inputs; their contents are replaced before every launch.

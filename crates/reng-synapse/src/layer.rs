@@ -12,24 +12,35 @@ use reng_core::Result;
 /// or transposed; the small vectors are f32.
 #[derive(Clone, Copy)]
 pub struct LayerWeights<'a> {
-    /// Number of query heads; `hidden % n_heads == 0`.
+    /// Number of query heads.
     pub n_heads: usize,
     /// Number of key/value heads (GQA); `n_heads % n_kv_heads == 0`.
     pub n_kv_heads: usize,
+    /// Per-head width. Normally `hidden / n_heads`; Qwen3 sets it in its
+    /// config, and `n_heads * head_dim` (the q width) may differ from
+    /// `hidden`.
+    pub head_dim: usize,
     /// RMSNorm gains, each length `hidden`.
     pub g1: &'a [f32],
     pub g2: &'a [f32],
-    /// Projections stored `[out, in]`, bf16: `wq`, `wo` are `hidden x
-    /// hidden`; `wk`, `wv` are `(n_kv_heads * head_dim) x hidden`.
+    /// Projections stored `[out, in]`, bf16: `wq` is `(n_heads * head_dim)
+    /// x hidden` and `wo` is `hidden x (n_heads * head_dim)`; `wk`, `wv`
+    /// are `(n_kv_heads * head_dim) x hidden`.
     pub wq: &'a [u16],
     pub wk: &'a [u16],
     pub wv: &'a [u16],
     pub wo: &'a [u16],
-    /// Attention biases (Qwen2-style), `hidden` for `bq` and `n_kv_heads *
-    /// head_dim` for `bk`/`bv`; empty when the model has none.
+    /// Attention biases (Qwen2-style), `n_heads * head_dim` for `bq` and
+    /// `n_kv_heads * head_dim` for `bk`/`bv`; empty when the model has none.
     pub bq: &'a [f32],
     pub bk: &'a [f32],
     pub bv: &'a [f32],
+    /// Qwen3-style per-head RMSNorm gains over `head_dim`, applied to every
+    /// query head (`qn`) and every key head (`kn`) after the projection
+    /// (and bias) and before RoPE; empty when the model has none. With
+    /// `qn` present the attention scale is folded into it, not into `wq`.
+    pub qn: &'a [f32],
+    pub kn: &'a [f32],
     /// MLP, bf16 `[out, in]`: `wg`, `wu` are `[inter, hidden]`; `wd` is
     /// `[hidden, inter]`.
     pub wg: &'a [u16],
@@ -38,7 +49,8 @@ pub struct LayerWeights<'a> {
     /// RoPE caches `[tokens, head_dim]` (head_dim contiguous), shared by heads.
     pub sin: &'a [f32],
     pub cos: &'a [f32],
-    /// Attention scale (normally `1/sqrt(head_dim)`), folded into `wq`.
+    /// Attention scale (normally `1/sqrt(head_dim)`), folded into `wq` (or
+    /// into `qn` when present).
     pub scale: f32,
     pub eps: f32,
 }
@@ -54,8 +66,8 @@ pub struct LayerWeights<'a> {
 ///
 /// # Panics
 ///
-/// Panics if any buffer length disagrees with the sizes, if `hidden` is not a
-/// multiple of `n_heads`, or if `n_heads` is not a multiple of `n_kv_heads`.
+/// Panics if any buffer length disagrees with the sizes or if `n_heads` is
+/// not a multiple of `n_kv_heads`.
 pub fn decoder_layer_bf16(
     x: &[f32],
     w: &LayerWeights<'_>,

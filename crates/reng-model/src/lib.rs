@@ -7,7 +7,8 @@
 //! computes `y = x @ W^T`; the engine wants `[in, out]`, so projections are
 //! transposed once at load time. The embedding table stays `[vocab, hidden]`
 //! for the host-side gather; a tied LM head is its transpose, `[hidden, vocab]`.
-//! Qwen2-style attention biases are loaded when present (Llama has none).
+//! Qwen2-style attention biases and Qwen3-style per-head q/k norm gains are
+//! loaded when present (Llama has neither).
 
 use reng_core::{Error, Result};
 use reng_synapse::{bf16_to_f32, f32_to_bf16};
@@ -28,6 +29,11 @@ pub struct LlamaConfig {
     pub num_attention_heads: usize,
     #[serde(default)]
     pub num_key_value_heads: Option<usize>,
+    /// Explicit per-head width (Qwen3); `hidden_size / num_attention_heads`
+    /// when absent. `num_attention_heads * head_dim` may differ from
+    /// `hidden_size` (Qwen3-0.6B: 16 x 128 over a hidden size of 1024).
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     pub rms_norm_eps: f32,
     #[serde(default = "default_theta")]
     pub rope_theta: f32,
@@ -87,7 +93,14 @@ impl LlamaConfig {
 
     #[must_use]
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Width of the query projection, `num_attention_heads * head_dim`.
+    #[must_use]
+    pub fn q_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim()
     }
 }
 
@@ -104,6 +117,10 @@ pub struct LayerTensors {
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
+    /// Qwen3 q/k norm gains, each `head_dim`; empty when the checkpoint
+    /// has none.
+    pub qn: Vec<f32>,
+    pub kn: Vec<f32>,
     pub wg: Vec<u16>,
     pub wu: Vec<u16>,
     pub wd: Vec<u16>,
@@ -204,9 +221,8 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-/// `[rows, cols]` row-major to `[cols, rows]`.
-/// A 1-D tensor that a checkpoint may omit (attention biases): empty when
-/// absent, checked for length when present.
+/// A 1-D tensor that a checkpoint may omit (attention biases, q/k norm
+/// gains): empty when absent, checked for length when present.
 fn optional_vec(st: &SafeTensors<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
     if st.tensor(name).is_err() {
         return Ok(Vec::new());
@@ -310,7 +326,8 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     let parsed = shards.parse()?;
     let st = |name: &str| shards.shard(&parsed, name);
     let (h, i, v) = (cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size);
-    let kvd = cfg.n_kv_heads() * cfg.head_dim();
+    let (hd, qd) = (cfg.head_dim(), cfg.q_dim());
+    let kvd = cfg.n_kv_heads() * hd;
 
     let (embed, eshape) =
         tensor_bf16(st("model.embed_tokens.weight"), "model.embed_tokens.weight")?;
@@ -351,14 +368,14 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             Ok(out)
         };
         let (wq, wk, wv) = if has("self_attn.qkv_proj.weight") {
-            let mut parts = split("self_attn.qkv_proj.weight", &[h, kvd, kvd], h)?;
+            let mut parts = split("self_attn.qkv_proj.weight", &[qd, kvd, kvd], h)?;
             let wv = parts.pop().unwrap();
             let wk = parts.pop().unwrap();
             let wq = parts.pop().unwrap();
             (wq, wk, wv)
         } else {
             (
-                lin("self_attn.q_proj.weight", h, h)?,
+                lin("self_attn.q_proj.weight", qd, h)?,
                 lin("self_attn.k_proj.weight", kvd, h)?,
                 lin("self_attn.v_proj.weight", kvd, h)?,
             )
@@ -384,10 +401,12 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             wq,
             wk,
             wv,
-            wo: lin("self_attn.o_proj.weight", h, h)?,
-            bq: opt("self_attn.q_proj.bias", h)?,
+            wo: lin("self_attn.o_proj.weight", h, qd)?,
+            bq: opt("self_attn.q_proj.bias", qd)?,
             bk: opt("self_attn.k_proj.bias", kvd)?,
             bv: opt("self_attn.v_proj.bias", kvd)?,
+            qn: opt("self_attn.q_norm.weight", hd)?,
+            kn: opt("self_attn.k_norm.weight", hd)?,
             wg,
             wu,
             wd: lin("mlp.down_proj.weight", h, i)?,
@@ -536,6 +555,7 @@ fn layer_views<'a>(
         .map(|l| LayerWeights {
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.n_kv_heads(),
+            head_dim: hd,
             g1: &l.g1,
             g2: &l.g2,
             wq: &l.wq,
@@ -545,6 +565,8 @@ fn layer_views<'a>(
             bq: &l.bq,
             bk: &l.bk,
             bv: &l.bv,
+            qn: &l.qn,
+            kn: &l.kn,
             wg: &l.wg,
             wu: &l.wu,
             wd: &l.wd,

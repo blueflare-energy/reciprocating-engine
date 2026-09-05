@@ -76,6 +76,17 @@ fn scale_bf16(w: &[u16], scale: f32) -> Vec<u16> {
         .collect()
 }
 
+/// `wq` with the attention scale folded in: a scaled bf16 copy, or the
+/// checkpoint slice itself when the model has a q norm, which would divide
+/// the scale out of `wq` again (it rides on the norm gain instead).
+fn scaled_wq<'a>(w: &LayerWeights<'a>) -> std::borrow::Cow<'a, [u16]> {
+    if w.qn.is_empty() {
+        std::borrow::Cow::Owned(scale_bf16(w.wq, w.scale))
+    } else {
+        std::borrow::Cow::Borrowed(w.wq)
+    }
+}
+
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
 }
@@ -496,16 +507,20 @@ pub(crate) fn build_layer<'a>(
     out: Option<synTensor>,
 ) -> Result<synTensor> {
     let (nh, nkv) = (w.n_heads, w.n_kv_heads);
-    assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
-    let hd_us = hidden / nh;
+    assert!(nh >= 1 && w.head_dim >= 1 && nkv >= 1 && nh % nkv == 0);
+    let hd_us = w.head_dim;
     let hpg_us = nh / nkv;
-    let (t, h, i, hd, hpg, groups) = (
+    // Width of the query projection (all heads); `hidden` unless the
+    // config decouples `head_dim` from `hidden / n_heads`.
+    let qw_us = nh * hd_us;
+    let (t, h, i, hd, hpg, groups, qw) = (
         tokens as u64,
         hidden as u64,
         inter as u64,
         hd_us as u64,
         hpg_us as u64,
         nkv as u64,
+        qw_us as u64,
     );
     // Key axis of the score matrices: the block alone, or the whole cache
     // (its usable positions plus the trash slot).
@@ -523,14 +538,13 @@ pub(crate) fn build_layer<'a>(
     let head_blocks = env_on("RENG_HEAD_BLOCKS");
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    let wq_scaled = scale_bf16(w.wq, w.scale);
+    // With a per-head q norm the scale cannot ride on `wq` (the norm would
+    // divide it out again); it goes on the norm gain instead.
+    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let wq_scaled = scaled_wq(w);
     let (t_wq, t_wk, t_wv) = if head_blocks {
         (
-            gb.input_bf16(
-                &p("wq"),
-                &[h, hd, hpg, groups],
-                std::borrow::Cow::Owned(wq_scaled),
-            )?,
+            gb.input_bf16(&p("wq"), &[h, hd, hpg, groups], wq_scaled)?,
             gb.input_bf16(
                 &p("wk"),
                 &[h, hd, 1, groups],
@@ -544,7 +558,7 @@ pub(crate) fn build_layer<'a>(
         )
     } else {
         (
-            gb.input_bf16(&p("wq2"), &[h, h], std::borrow::Cow::Owned(wq_scaled))?,
+            gb.input_bf16(&p("wq2"), &[h, qw], wq_scaled)?,
             gb.input_bf16(
                 &p("wk2"),
                 &[h, hd * groups],
@@ -557,7 +571,7 @@ pub(crate) fn build_layer<'a>(
             )?,
         )
     };
-    let t_wo = gb.input_bf16(&p("wo"), &[h, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wo = gb.input_bf16(&p("wo"), &[qw, h], std::borrow::Cow::Borrowed(w.wo))?;
     let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
     let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
@@ -575,7 +589,7 @@ pub(crate) fn build_layer<'a>(
     let t_at = gb.mid(&p("at"), &[hd, t, hpg, groups], bf)?;
     let t_at3 = gb.mid(&p("at3"), &[hd, t, hpg * groups], bf)?;
     let t_att = gb.mid(&p("att"), &[hd, hpg * groups, t], bf)?;
-    let t_attn = gb.mid(&p("attn"), &[h, t], bf)?;
+    let t_attn = gb.mid(&p("attn"), &[qw, t], bf)?;
     let t_o = gb.mid(&p("o"), &[h, t], bf)?;
     let t_h = gb.mid(&p("h"), &[h, t], bf)?;
     let t_n2 = gb.mid(&p("n2"), &[h, t], bf)?;
@@ -690,7 +704,7 @@ pub(crate) fn build_layer<'a>(
             core::mem::size_of::<TransposeParams>() as u32,
         );
         for (name, wt, n_out, heads, out) in [
-            ("q", t_wq, h, hpg * groups, t_q),
+            ("q", t_wq, qw, hpg * groups, t_q),
             ("k", t_wk, hd * groups, groups, t_k),
             ("v", t_wv, hd * groups, groups, t_v),
         ] {
@@ -735,7 +749,7 @@ pub(crate) fn build_layer<'a>(
     let (t_q, t_k, t_v) = if w.bq.is_empty() {
         (t_q, t_k, t_v)
     } else {
-        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * w.scale).collect();
+        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * q_scale).collect();
         let t_bq = gb.input(&p("bq"), &[hd, 1, hpg, groups], &bq_scaled)?;
         let t_bk = gb.input(&p("bk"), &[hd, 1, 1, groups], w.bk)?;
         let t_bv = gb.input(&p("bv"), &[hd, 1, 1, groups], w.bv)?;
@@ -767,6 +781,37 @@ pub(crate) fn build_layer<'a>(
             none.1,
         )?;
         (qb, kb, vb)
+    };
+    // Qwen3 q/k norms (when present): an RMSNorm over the head dim (the
+    // FCD) of every query and key head, the gain `[hd]` broadcast over the
+    // outer dims, exactly like the layer norms over `[hidden, t]`.
+    let (t_q, t_k) = if w.qn.is_empty() {
+        (t_q, t_k)
+    } else {
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let t_qn = gb.input(&p("qn"), &[hd], &qn_scaled)?;
+        let t_kn = gb.input(&p("kn"), &[hd], w.kn)?;
+        let qn = gb.mid(&p("qn_out"), &[hd, t, hpg, groups], bf)?;
+        let qn_inv = gb.mid(&p("qn_inv"), &[1, t, hpg, groups], SYN_TYPE_F32)?;
+        let kn = gb.mid(&p("kn_out"), &[hd, t, 1, groups], bf)?;
+        let kn_inv = gb.mid(&p("kn_inv"), &[1, t, 1, groups], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("q_norm"),
+            &[t_q, t_qn],
+            &[qn, qn_inv],
+            prm.0,
+            prm.1,
+        )?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("k_norm"),
+            &[t_k, t_kn],
+            &[kn, kn_inv],
+            prm.0,
+            prm.1,
+        )?;
+        (qn, kn)
     };
     gb.node(
         "rope_st2_fwd_bf16",
@@ -985,10 +1030,10 @@ pub(crate) fn build_layer_batched<'a>(
     inter: usize,
 ) -> Result<synTensor> {
     let (nh, nkv) = (w.n_heads, w.n_kv_heads);
-    assert!(nh >= 1 && hidden % nh == 0 && nkv >= 1 && nh % nkv == 0);
-    let hd_us = hidden / nh;
+    assert!(nh >= 1 && w.head_dim >= 1 && nkv >= 1 && nh % nkv == 0);
+    let hd_us = w.head_dim;
     let hpg_us = nh / nkv;
-    let (h, i, hd, hpg, groups, keys, b) = (
+    let (h, i, hd, hpg, groups, keys, b, qw) = (
         hidden as u64,
         inter as u64,
         hd_us as u64,
@@ -996,9 +1041,12 @@ pub(crate) fn build_layer_batched<'a>(
         nkv as u64,
         sh.capacity as u64 + 1,
         sh.batch as u64,
+        (nh * hd_us) as u64,
     );
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
+    // See `build_layer`: the scale rides on the q norm gain when there is one.
+    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
     // With one row per sequence the projections are plain gemms with
@@ -1007,11 +1055,7 @@ pub(crate) fn build_layer_batched<'a>(
     // outermost), so the head layout is a free reshape. These weights are
     // laid out differently from the wide recipe's per-head blocks, so they
     // get their own names and buffers.
-    let t_wq = gb.input_bf16(
-        &p("wq2"),
-        &[h, h],
-        std::borrow::Cow::Owned(scale_bf16(w.wq, w.scale)),
-    )?;
+    let t_wq = gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?;
     let t_wk = gb.input_bf16(
         &p("wk2"),
         &[h, hd * groups],
@@ -1022,14 +1066,14 @@ pub(crate) fn build_layer_batched<'a>(
         &[h, hd * groups],
         std::borrow::Cow::Borrowed(w.wv),
     )?;
-    let t_wo = gb.input_bf16(&p("wo"), &[h, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wo = gb.input_bf16(&p("wo"), &[qw, h], std::borrow::Cow::Borrowed(w.wo))?;
     let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
     let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
 
     let t_n1 = gb.mid(&p("n1"), &[h, b], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32)?;
-    let t_q2 = gb.mid(&p("q2"), &[h, b], bf)?;
+    let t_q2 = gb.mid(&p("q2"), &[qw, b], bf)?;
     let t_k2 = gb.mid(&p("k2"), &[hd * groups, b], bf)?;
     let t_v2 = gb.mid(&p("v2"), &[hd * groups, b], bf)?;
     let t_q = gb.mid(&p("q"), &[hd, 1, hpg, groups, b], bf)?;
@@ -1048,7 +1092,7 @@ pub(crate) fn build_layer_batched<'a>(
     let t_masked = gb.mid(&p("masked"), &[keys, 1, hpg, groups, b], bf)?;
     let t_pr = gb.mid(&p("probs"), &[keys, 1, hpg, groups, b], bf)?;
     let t_at = gb.mid(&p("at"), &[hd, 1, hpg, groups, b], bf)?;
-    let t_attn = gb.mid(&p("attn"), &[h, b], bf)?;
+    let t_attn = gb.mid(&p("attn"), &[qw, b], bf)?;
     let t_o = gb.mid(&p("o"), &[h, b], bf)?;
     let t_h = gb.mid(&p("h"), &[h, b], bf)?;
     let t_n2 = gb.mid(&p("n2"), &[h, b], bf)?;
@@ -1123,7 +1167,7 @@ pub(crate) fn build_layer_batched<'a>(
     let (t_q, t_k, t_v) = if w.bq.is_empty() {
         (t_q, t_k, t_v)
     } else {
-        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * w.scale).collect();
+        let bq_scaled: Vec<f32> = w.bq.iter().map(|v| v * q_scale).collect();
         let t_bq = gb.input(&p("bq"), &[hd, 1, hpg, groups, 1], &bq_scaled)?;
         let t_bk = gb.input(&p("bk"), &[hd, 1, 1, groups, 1], w.bk)?;
         let t_bv = gb.input(&p("bv"), &[hd, 1, 1, groups, 1], w.bv)?;
@@ -1155,6 +1199,35 @@ pub(crate) fn build_layer_batched<'a>(
             none.1,
         )?;
         (qb, kb, vb)
+    };
+    // Qwen3 q/k norms (when present), as in `build_layer`.
+    let (t_q, t_k) = if w.qn.is_empty() {
+        (t_q, t_k)
+    } else {
+        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
+        let t_qn = gb.input(&p("qn"), &[hd], &qn_scaled)?;
+        let t_kn = gb.input(&p("kn"), &[hd], w.kn)?;
+        let qn = gb.mid(&p("qn_out"), &[hd, 1, hpg, groups, b], bf)?;
+        let qn_inv = gb.mid(&p("qn_inv"), &[1, 1, hpg, groups, b], SYN_TYPE_F32)?;
+        let kn = gb.mid(&p("kn_out"), &[hd, 1, 1, groups, b], bf)?;
+        let kn_inv = gb.mid(&p("kn_inv"), &[1, 1, 1, groups, b], SYN_TYPE_F32)?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("q_norm"),
+            &[t_q, t_qn],
+            &[qn, qn_inv],
+            prm.0,
+            prm.1,
+        )?;
+        gb.node(
+            "rms_norm_fwd_bf16",
+            &p("k_norm"),
+            &[t_k, t_kn],
+            &[kn, kn_inv],
+            prm.0,
+            prm.1,
+        )?;
+        (qn, kn)
     };
     gb.node(
         "rope_st2_fwd_bf16",
@@ -1425,7 +1498,7 @@ fn build_stack<'a>(
     probe_out: Option<synTensor>,
 ) -> Result<(Gb<'a>, synTensor)> {
     let l0 = &m.layers[0];
-    let hd = hidden / l0.n_heads;
+    let hd = l0.head_dim;
     assert_eq!(l0.sin.len(), tokens * hd);
     let (t, h, hd64) = (tokens as u64, hidden as u64, hd as u64);
     let mut gb = Gb::new()?;
@@ -1552,7 +1625,8 @@ pub fn layer_cpu(
     causal: bool,
 ) -> Vec<f32> {
     let (nh, nkv) = (w.n_heads, w.n_kv_heads);
-    let hd = hidden / nh;
+    let hd = w.head_dim;
+    let qw = nh * hd;
     let kvd = nkv * hd;
     let n_rep = nh / nkv;
     let rmsnorm = |src: &[f32], g: &[f32]| -> Vec<f32> {
@@ -1601,8 +1675,28 @@ pub fn layer_cpu(
         }
     };
 
+    // Per-head RMSNorm over `hd` of every head of a `[tokens, stride]`
+    // tensor (Qwen3 q/k norms), in place; a no-op without a gain.
+    let head_norm = |m: &mut [f32], stride: usize, g: &[f32]| {
+        if g.is_empty() {
+            return;
+        }
+        for row in m.chunks_exact_mut(stride) {
+            for head in row.chunks_exact_mut(hd) {
+                let ms = head.iter().map(|v| v * v).sum::<f32>() / hd as f32;
+                let inv = 1.0 / (ms + w.eps).sqrt();
+                for (v, gain) in head.iter_mut().zip(g) {
+                    *v *= inv * gain;
+                }
+            }
+        }
+    };
     let n1 = rmsnorm(x, w.g1);
-    let wq_scaled = scale_bf16(w.wq, w.scale);
+    // The scale rides on `wq` (and `bq`), or on the q norm gain when the
+    // model has one (the norm would divide it out of `wq`).
+    let q_scale = if w.qn.is_empty() { w.scale } else { 1.0 };
+    let wq_scaled = scaled_wq(w);
+    let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * w.scale).collect();
     let bias = |mut m: Vec<f32>, b: &[f32], scale: f32| -> Vec<f32> {
         if !b.is_empty() {
             let cols = b.len();
@@ -1612,18 +1706,20 @@ pub fn layer_cpu(
         }
         m
     };
-    let q = bias(matmul(&n1, &wq_scaled, hidden, hidden), w.bq, w.scale);
-    let k = bias(matmul(&n1, w.wk, hidden, kvd), w.bk, 1.0);
+    let mut q = bias(matmul(&n1, &wq_scaled, hidden, qw), w.bq, q_scale);
+    let mut k = bias(matmul(&n1, w.wk, hidden, kvd), w.bk, 1.0);
     let v = bias(matmul(&n1, w.wv, hidden, kvd), w.bv, 1.0);
-    let mut qr = vec![0.0f32; tokens * hidden];
+    head_norm(&mut q, qw, &qn_scaled);
+    head_norm(&mut k, kvd, w.kn);
+    let mut qr = vec![0.0f32; tokens * qw];
     let mut kr = vec![0.0f32; tokens * kvd];
     for head in 0..nh {
-        rope_head(&q, hidden, head, &mut qr);
+        rope_head(&q, qw, head, &mut qr);
     }
     for g in 0..nkv {
         rope_head(&k, kvd, g, &mut kr);
     }
-    let mut attn = vec![0.0f32; tokens * hidden];
+    let mut attn = vec![0.0f32; tokens * qw];
     let mut scores = vec![0.0f32; tokens];
     for head in 0..nh {
         let g = head / n_rep;
@@ -1633,7 +1729,7 @@ pub fn layer_cpu(
             let limit = if causal { qi + 1 } else { tokens };
             for (ki, s) in scores.iter_mut().enumerate().take(limit) {
                 *s = (0..hd)
-                    .map(|d| qr[qi * hidden + qoff + d] * kr[ki * kvd + koff + d])
+                    .map(|d| qr[qi * qw + qoff + d] * kr[ki * kvd + koff + d])
                     .sum();
             }
             let mx = scores[..limit]
@@ -1648,12 +1744,12 @@ pub fn layer_cpu(
             for (ki, s) in scores[..limit].iter().enumerate() {
                 let pr = s / sum;
                 for d in 0..hd {
-                    attn[qi * hidden + qoff + d] += pr * v[ki * kvd + koff + d];
+                    attn[qi * qw + qoff + d] += pr * v[ki * kvd + koff + d];
                 }
             }
         }
     }
-    let o = matmul(&attn, w.wo, hidden, hidden);
+    let o = matmul(&attn, w.wo, qw, hidden);
     let hres: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
     let n2 = rmsnorm(&hres, w.g2);
     let gate = matmul(&n2, w.wg, hidden, inter);

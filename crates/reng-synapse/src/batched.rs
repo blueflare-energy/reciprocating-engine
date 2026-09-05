@@ -115,7 +115,7 @@ impl<'a> BatchedModel<'a> {
     ) -> Result<Self> {
         assert!(!m.layers.is_empty() && batch > 0 && rows > 0 && capacity > 0);
         let l0 = &m.layers[0];
-        let hd = hidden / l0.n_heads;
+        let hd = l0.head_dim;
         assert_eq!(sin.len(), capacity * hd);
         assert_eq!(cos.len(), capacity * hd);
         assert_eq!(m.final_gamma.len(), hidden);
@@ -173,7 +173,7 @@ impl<'a> BatchedModel<'a> {
         tag: &str,
     ) -> Result<(Gb<'a>, Out)> {
         let l0 = &m.layers[0];
-        let hd = hidden / l0.n_heads;
+        let hd = l0.head_dim;
         let (h, hd64, keys, b) = (hidden as u64, hd as u64, cap as u64 + 1, batch as u64);
         let groups = l0.n_kv_heads as u64;
         let mut gb = Gb::new()?;
@@ -223,7 +223,7 @@ impl<'a> BatchedModel<'a> {
         rows: usize,
         cap: usize,
     ) -> Result<(Gb<'a>, Out)> {
-        let hd = hidden / m.layers[0].n_heads;
+        let hd = m.layers[0].head_dim;
         let groups = m.layers[0].n_kv_heads;
         let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, cap as u64 + 1);
         let mut gb = Gb::new()?;

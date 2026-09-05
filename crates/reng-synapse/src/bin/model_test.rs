@@ -94,6 +94,7 @@ fn main() -> reng_core::Result<()> {
         .map(|o| LayerWeights {
             n_heads,
             n_kv_heads,
+            head_dim: hd,
             g1: &o.g1,
             g2: &o.g2,
             wq: &o.wq,
@@ -103,6 +104,8 @@ fn main() -> reng_core::Result<()> {
             bq: &[],
             bk: &[],
             bv: &[],
+            qn: &[],
+            kn: &[],
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,

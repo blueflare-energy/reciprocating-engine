@@ -33,6 +33,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DeepSeek-R1-Distill-Llama-8B and Phi-3-mini-4k-instruct (its fused
   qkv_proj and gate_up_proj weights are split into row blocks by the
   loader).
+- Qwen3: per-head q/k RMSNorm (`q_norm`/`k_norm` gains, applied after the
+  projection and before RoPE; the attention scale folds into the q gain)
+  and an explicit `head_dim` whose `num_attention_heads * head_dim` may
+  differ from `hidden_size`; verified Qwen3-0.6B and Qwen3-1.7B.
 - `RENG_MODULE_ID` picks the card by its SynapseAI module id
   (`synDeviceAcquireByModuleId`); without it the runtime takes any free
   card. `HABANA_VISIBLE_DEVICES` never steered the acquire, so the bench
