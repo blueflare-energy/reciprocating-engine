@@ -540,8 +540,7 @@ pub fn model_forward_bf16(
     let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + 1);
     let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in + 1);
     let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + 1);
-    for idx in 0..n_in {
-        let data = &gb.data[idx];
+    for (idx, data) in gb.data.iter().enumerate() {
         let bytes = (data.len() * 2) as u64;
         let mut d = 0u64;
         syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
