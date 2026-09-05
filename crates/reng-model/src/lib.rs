@@ -1,5 +1,5 @@
 //! Load a Llama-family model from a HuggingFace directory (`config.json` +
-//! `model.safetensors`) and run it on Gaudi2 through the fused-graph engine
+//! `model.safetensors`, single file or shards) and run it on Gaudi2 through the fused-graph engine
 //! in `reng-synapse`: one-shot prefill, or KV-cached generation through
 //! [`Generator`].
 //!
@@ -176,21 +176,88 @@ fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Re
     Ok(transpose(&v, out_dim, in_dim))
 }
 
-/// Load `model.safetensors` from a model directory into engine layout.
+/// The checkpoint's safetensors files, one or several (sharded checkpoints
+/// list their tensors in `model.safetensors.index.json`), all loaded.
+struct Shards {
+    files: Vec<Vec<u8>>,
+    /// Tensor name to shard index; empty for a single-file checkpoint.
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl Shards {
+    fn open(dir: &Path) -> Result<Self> {
+        let single = dir.join("model.safetensors");
+        if single.exists() {
+            let bytes = std::fs::read(&single)
+                .map_err(|e| Error::Other(format!("model.safetensors: {e}")))?;
+            return Ok(Self {
+                files: vec![bytes],
+                index: std::collections::HashMap::new(),
+            });
+        }
+        let idx_path = dir.join("model.safetensors.index.json");
+        let text = std::fs::read_to_string(&idx_path)
+            .map_err(|e| Error::Other(format!("neither model.safetensors nor its index: {e}")))?;
+        let idx: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Other(format!("safetensors index: {e}")))?;
+        let map = idx
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| Error::Other("safetensors index has no weight_map".into()))?;
+        let mut names: Vec<String> = map
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names.dedup();
+        let mut files = Vec::with_capacity(names.len());
+        for name in &names {
+            files.push(
+                std::fs::read(dir.join(name)).map_err(|e| Error::Other(format!("{name}: {e}")))?,
+            );
+        }
+        let index = map
+            .iter()
+            .filter_map(|(k, v)| {
+                let file = v.as_str()?;
+                Some((k.clone(), names.iter().position(|n| n == file)?))
+            })
+            .collect();
+        Ok(Self { files, index })
+    }
+
+    /// Parse every shard (borrowing the bytes).
+    fn parse(&self) -> Result<Vec<SafeTensors<'_>>> {
+        self.files
+            .iter()
+            .map(|b| {
+                SafeTensors::deserialize(b).map_err(|e| Error::Other(format!("safetensors: {e}")))
+            })
+            .collect()
+    }
+
+    /// The parsed shard holding `name` (the only shard when unsharded).
+    fn shard<'a>(&self, parsed: &'a [SafeTensors<'a>], name: &str) -> &'a SafeTensors<'a> {
+        let i = self.index.get(name).copied().unwrap_or(0);
+        &parsed[i]
+    }
+}
+
+/// Load the checkpoint (`model.safetensors`, or its shards) from a model
+/// directory into engine layout.
 ///
 /// # Errors
 ///
-/// Returns an error if the file is missing, a tensor is absent or has an
+/// Returns an error if the files are missing, a tensor is absent or has an
 /// unexpected shape or dtype, or the LM head is untied and absent.
 pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
-    let bytes = std::fs::read(dir.join("model.safetensors"))
-        .map_err(|e| Error::Other(format!("model.safetensors: {e}")))?;
-    let st = SafeTensors::deserialize(&bytes)
-        .map_err(|e| Error::Other(format!("model.safetensors: {e}")))?;
+    let shards = Shards::open(dir)?;
+    let parsed = shards.parse()?;
+    let st = |name: &str| shards.shard(&parsed, name);
     let (h, i, v) = (cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size);
     let kvd = cfg.n_kv_heads() * cfg.head_dim();
 
-    let (embed, eshape) = tensor_f32(&st, "model.embed_tokens.weight")?;
+    let (embed, eshape) = tensor_f32(st("model.embed_tokens.weight"), "model.embed_tokens.weight")?;
     if eshape != [v, h] {
         return Err(Error::Other(format!(
             "embed_tokens shape {eshape:?}, expected [{v}, {h}]"
@@ -199,24 +266,38 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for l in 0..cfg.num_hidden_layers {
         let p = |s: &str| format!("model.layers.{l}.{s}");
+        let g = |name: &str| -> Result<Vec<f32>> {
+            let n = p(name);
+            Ok(tensor_f32(st(&n), &n)?.0)
+        };
+        let lin = |name: &str, o: usize, inp: usize| -> Result<Vec<f32>> {
+            let n = p(name);
+            linear(st(&n), &n, o, inp)
+        };
+        let opt = |name: &str, len: usize| -> Result<Vec<f32>> {
+            let n = p(name);
+            optional_vec(st(&n), &n, len)
+        };
         layers.push(LayerTensors {
-            g1: tensor_f32(&st, &p("input_layernorm.weight"))?.0,
-            g2: tensor_f32(&st, &p("post_attention_layernorm.weight"))?.0,
-            wq: linear(&st, &p("self_attn.q_proj.weight"), h, h)?,
-            wk: linear(&st, &p("self_attn.k_proj.weight"), kvd, h)?,
-            wv: linear(&st, &p("self_attn.v_proj.weight"), kvd, h)?,
-            wo: linear(&st, &p("self_attn.o_proj.weight"), h, h)?,
-            bq: optional_vec(&st, &p("self_attn.q_proj.bias"), h)?,
-            bk: optional_vec(&st, &p("self_attn.k_proj.bias"), kvd)?,
-            bv: optional_vec(&st, &p("self_attn.v_proj.bias"), kvd)?,
-            wg: linear(&st, &p("mlp.gate_proj.weight"), i, h)?,
-            wu: linear(&st, &p("mlp.up_proj.weight"), i, h)?,
-            wd: linear(&st, &p("mlp.down_proj.weight"), h, i)?,
+            g1: g("input_layernorm.weight")?,
+            g2: g("post_attention_layernorm.weight")?,
+            wq: lin("self_attn.q_proj.weight", h, h)?,
+            wk: lin("self_attn.k_proj.weight", kvd, h)?,
+            wv: lin("self_attn.v_proj.weight", kvd, h)?,
+            wo: lin("self_attn.o_proj.weight", h, h)?,
+            bq: opt("self_attn.q_proj.bias", h)?,
+            bk: opt("self_attn.k_proj.bias", kvd)?,
+            bv: opt("self_attn.v_proj.bias", kvd)?,
+            wg: lin("mlp.gate_proj.weight", i, h)?,
+            wu: lin("mlp.up_proj.weight", i, h)?,
+            wd: lin("mlp.down_proj.weight", h, i)?,
         });
     }
-    let final_gamma = tensor_f32(&st, "model.norm.weight")?.0;
-    let lm_head = if st.tensor("lm_head.weight").is_ok() {
-        linear(&st, "lm_head.weight", v, h)?
+    let final_gamma = tensor_f32(st("model.norm.weight"), "model.norm.weight")?.0;
+    let has_head = shards.index.contains_key("lm_head.weight")
+        || (shards.index.is_empty() && parsed[0].tensor("lm_head.weight").is_ok());
+    let lm_head = if has_head {
+        linear(st("lm_head.weight"), "lm_head.weight", v, h)?
     } else if cfg.tie_word_embeddings {
         transpose(&embed, v, h)
     } else {
