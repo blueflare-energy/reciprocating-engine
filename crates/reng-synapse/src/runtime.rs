@@ -545,6 +545,9 @@ impl<'a> Runtime<'a> {
         }
         let mut staging = Staging::new(dev, total, largest)?;
         let mut fence = Fence::none();
+        // Device bytes this runtime allocates itself (shared buffers are the
+        // parent's), reported by `RENG_RECIPE_TRACE`.
+        let (mut in_bytes, mut scratch_bytes) = (0u64, 0u64);
         for (idx, &id) in ids.iter().take(n_in).enumerate() {
             let d = if let Some(d) = shared(&gb.names[idx], &gb.sizes[idx]) {
                 own_input.push(false);
@@ -553,6 +556,7 @@ impl<'a> Runtime<'a> {
                 let src = input_bytes(idx);
                 let mut d = 0u64;
                 syn!(synDeviceMalloc(dev, src.len() as u64, 0, 0, &mut d));
+                in_bytes += src.len() as u64;
                 owned.push(d);
                 staging.upload(dev, stream, &mut fence, src, d)?;
                 own_input.push(true);
@@ -591,6 +595,7 @@ impl<'a> Runtime<'a> {
             } else {
                 let mut d = 0u64;
                 syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
+                scratch_bytes += bytes;
                 owned.push(d);
                 // Device-resident state starts as zeros (finite, so a
                 // masked-out stale cache row can never poison a softmax).
@@ -637,13 +642,19 @@ impl<'a> Runtime<'a> {
         }
         syn!(synStreamSynchronize(stream));
         if trace {
+            let to_gb = |b: u64| b as f64 / 1e9;
             eprintln!(
-                "runtime: compile {:.2} s, device {:.2} s, buffers + uploads {:.2} s ({} inputs, {} shared)",
+                "runtime: compile {:.2} s, device {:.2} s, buffers + uploads {:.2} s ({} inputs, {} shared); device bytes {:.2} GB (inputs {:.2}, scratch {:.2}, output {:.2}, workspace {:.2})",
                 t_compile.as_secs_f64(),
                 t_device.as_secs_f64(),
                 (t0.elapsed() - t_compile - t_device).as_secs_f64(),
                 n_in,
-                own_input.iter().filter(|o| !**o).count()
+                own_input.iter().filter(|o| !**o).count(),
+                to_gb(in_bytes + scratch_bytes + out_bytes + ws + slack),
+                to_gb(in_bytes),
+                to_gb(scratch_bytes),
+                to_gb(out_bytes),
+                to_gb(ws + slack)
             );
         }
         Ok(Self {
