@@ -122,17 +122,16 @@ fn main() -> reng_core::Result<()> {
             g.reset();
         }
         let t1 = Instant::now();
-        g.feed(&prompt)?;
+        let mut next = g.feed_id(&prompt)?;
         let prefill_s = t1.elapsed().as_secs_f64();
-        // Decode: one token per step, greedy on the engine's own output.
-        let mut next = prompt[a.prompt - 1];
+        // Decode: one token per step, greedy on the engine's own output
+        // (argmax on the device).
         let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
         let t2 = Instant::now();
         for _ in 0..a.n_new {
             let t = Instant::now();
-            let logits = g.feed(&[next])?;
+            next = g.feed_id(&[next])?;
             step_s.push(t.elapsed().as_secs_f64());
-            next = reng_model::argmax_rows(&logits, cfg.vocab_size)[0] as u32;
         }
         (
             prefill_s,
@@ -154,26 +153,22 @@ fn main() -> reng_core::Result<()> {
         let mut next: Vec<u32> = vec![prompt[a.prompt - 1]; batch];
         for _ in 0..a.warmup {
             for b in 0..batch {
-                g.prefill(b, &prompt)?;
+                g.prefill_id(b, &prompt)?;
             }
-            g.step(&next)?;
+            g.step_ids(&next)?;
         }
         // Prefill: every sequence, one at a time (the wide recipe).
         let t1 = Instant::now();
-        for b in 0..batch {
-            g.prefill(b, &prompt)?;
+        for (b, n) in next.iter_mut().enumerate() {
+            *n = g.prefill_id(b, &prompt)?;
         }
         let prefill_s = t1.elapsed().as_secs_f64() / batch as f64;
         let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
         let t2 = Instant::now();
         for _ in 0..a.n_new {
             let t = Instant::now();
-            let logits = g.step(&next)?;
+            next = g.step_ids(&next)?;
             step_s.push(t.elapsed().as_secs_f64());
-            let ids = reng_model::argmax_rows(&logits, cfg.vocab_size);
-            for (n, id) in next.iter_mut().zip(ids) {
-                *n = id as u32;
-            }
         }
         (
             prefill_s,

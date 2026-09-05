@@ -604,6 +604,74 @@ fn case_scatter_nd() -> reng_core::Result<f32> {
     )))
 }
 
+/// Case 11: `argmax_dim0_fwd_bf16` over the FCD of `[vocab, rows]` to int32
+/// `[1, rows]`.
+fn case_argmax() -> reng_core::Result<f32> {
+    #[repr(C)]
+    struct ReductionParams {
+        reduction_dimension: u32,
+    }
+    let (vocab, rows) = (512usize, 4usize);
+    let x = ramp(vocab * rows, 15);
+    let p = ReductionParams {
+        reduction_dimension: 0,
+    };
+    let (pp, ps) = params(&p);
+    let mut ids = Vec::new();
+    let mut last_err = String::new();
+    'outer: for guid in ["argmax_fwd_bf16", "argmax_fwd_i32", "argmax_dim0_fwd_bf16"] {
+        for out_sizes in [vec![1u64, rows as u64], vec![rows as u64]] {
+            match reng_synapse::run_node_i32(
+                guid,
+                &[NodeInput {
+                    name: "X",
+                    sizes: &[vocab as u64, rows as u64],
+                    data: &x,
+                    raw: None,
+                }],
+                &out_sizes,
+                pp,
+                ps,
+            ) {
+                Ok(v) => {
+                    println!("  {guid} with output {out_sizes:?}: ok");
+                    ids = v;
+                    break 'outer;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    println!(
+                        "  {guid} with output {out_sizes:?}: rejected ({})",
+                        &msg[..msg.len().min(50)]
+                    );
+                    last_err = msg;
+                }
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Err(reng_core::Error::Other(format!(
+            "no argmax guid worked: {last_err}"
+        )));
+    }
+    let mut wrong = 0;
+    for r in 0..rows {
+        let row = &x[r * vocab..(r + 1) * vocab];
+        let best = row
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if bf16(v) > b.1 { (i, bf16(v)) } else { b }
+            })
+            .0;
+        if ids[r] as usize != best {
+            wrong += 1;
+            println!("  row {r}: engine {} expected {best}", ids[r]);
+        }
+    }
+    Ok(wrong as f32)
+}
+
 fn main() -> reng_core::Result<()> {
     let names = [
         "batch_gemm GQA inner-batch broadcast (transpose_b)",
@@ -617,6 +685,7 @@ fn main() -> reng_core::Result<()> {
         "batch_gemm 5-D, weights broadcast over the sequence batch",
         "rope_st2_fwd_bf16 with a per-sequence 5-D table",
         "ScatterND of hd rows into a [hd,keys,1,groups] cache",
+        "argmax_dim0_fwd_bf16 over [vocab, rows] to int32 [1, rows]",
     ];
     let selected: Vec<usize> = match std::env::args()
         .nth(1)
@@ -638,7 +707,8 @@ fn main() -> reng_core::Result<()> {
             7 => case_softmax_mask(),
             8 => case_batched_decode_gemm(),
             9 => case_rope_per_sequence(),
-            _ => case_scatter_nd(),
+            10 => case_scatter_nd(),
+            _ => case_argmax(),
         };
         match res {
             Ok(r) if r < 0.02 => println!("case {ci}: {}: rel_L2={r:.4} ok", names[ci]),

@@ -184,15 +184,14 @@ fn main() -> reng_core::Result<()> {
     let mut pending = 0;
     for step in 0..n_new {
         let t0 = Instant::now();
-        let last_logits = match cached.as_mut() {
-            Some(g) => g.feed(&ids[pending..])?,
+        let last = match cached.as_mut() {
+            Some(g) => g.feed_id(&ids[pending..])?,
             None => {
                 let logits = prefill_logits(&w, &cfg, &ids)?;
-                logits[(ids.len() - 1) * vocab..].to_vec()
+                argmax_rows(&logits[(ids.len() - 1) * vocab..], vocab)[0] as u32
             }
         };
         pending = ids.len();
-        let last = argmax_rows(&last_logits, vocab)[0] as u32;
         step_secs.push(t0.elapsed().as_secs_f32());
         generated.push(last);
         match &reference {

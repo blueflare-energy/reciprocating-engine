@@ -432,6 +432,25 @@ impl<'a> Generator<'a> {
         }
         Ok(last)
     }
+
+    /// Append `ids` and return the greedy next token (argmax on the device).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty or would overflow the cache.
+    pub fn feed_id(&mut self, ids: &[u32]) -> Result<u32> {
+        assert!(!ids.is_empty());
+        let mut last = 0;
+        for block in ids.chunks(self.model.rows()) {
+            let x = embed_tokens(self.w, self.cfg, block);
+            last = self.model.step_last_id(&x)?;
+        }
+        Ok(last)
+    }
 }
 
 /// `B` sequences decoded in lockstep with a `B`-slot KV cache; prompts are
@@ -511,6 +530,31 @@ impl<'a> BatchedGenerator<'a> {
         assert_eq!(ids.len(), self.model.batch());
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.step(&x)
+    }
+
+    /// Start sequence `b` afresh, feed it `ids`, and return the greedy next
+    /// token (argmax on the device).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    pub fn prefill_id(&mut self, b: usize, ids: &[u32]) -> Result<u32> {
+        assert!(!ids.is_empty());
+        self.model.reset(b);
+        let x = embed_tokens(self.w, self.cfg, ids);
+        self.model.prefill_id(b, &x)
+    }
+
+    /// Advance every sequence by one token and return the greedy next token
+    /// of each (argmax on the device).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    pub fn step_ids(&mut self, ids: &[u32]) -> Result<Vec<u32>> {
+        assert_eq!(ids.len(), self.model.batch());
+        let x = embed_tokens(self.w, self.cfg, ids);
+        self.model.step_ids(&x)
     }
 }
 

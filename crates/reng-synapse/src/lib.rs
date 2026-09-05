@@ -125,7 +125,7 @@ pub use batched::BatchedModel;
 mod probe;
 
 #[cfg(feature = "link-synapse")]
-pub use probe::{NodeInput, SYN_TYPE_INT32, run_node};
+pub use probe::{NodeInput, SYN_TYPE_INT32, run_node, run_node_i32};
 
 /// Vendor parameter structs, for [`run_node`] probes.
 #[cfg(feature = "link-synapse")]

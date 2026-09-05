@@ -73,10 +73,27 @@ fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
 }
 
-/// The single persistent tensor a graph run reads back, `[fcd, rows]`.
+/// Element type of a read-back tensor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutKind {
+    Bf16,
+    I32,
+}
+
+impl OutKind {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::I32 => 4,
+        }
+    }
+}
+
+/// The single persistent tensor a graph run reads back, `[fcd, .., rows]`.
 pub(crate) struct Out {
     pub name: CString,
     pub sizes: Vec<u64>,
+    pub kind: OutKind,
 }
 
 impl Out {
@@ -87,6 +104,47 @@ impl Out {
     /// Elements per outermost row.
     fn row_elems(&self) -> usize {
         self.elems() / *self.sizes.last().unwrap_or(&1) as usize
+    }
+}
+
+/// Fill `n` elements of `elem_bytes` each at `buf` with the host sentinel.
+///
+/// # Safety
+///
+/// `buf` must hold `n * elem_bytes` bytes.
+unsafe fn fill_host_sentinel(buf: *mut c_void, n: usize, elem_bytes: usize) {
+    if elem_bytes == 2 {
+        let p = buf.cast::<u16>();
+        for j in 0..n {
+            unsafe { *p.add(j) = HOST_SENTINEL_BF16 };
+        }
+    } else {
+        let p = buf.cast::<u32>();
+        for j in 0..n {
+            unsafe { *p.add(j) = HOST_SENTINEL_D32 };
+        }
+    }
+}
+
+/// Whether any of `n` elements at `buf` still shows `pattern16` (2-byte
+/// elements) or `pattern32` (4-byte elements).
+///
+/// # Safety
+///
+/// `buf` must hold `n * elem_bytes` bytes.
+unsafe fn any_sentinel(
+    buf: *mut c_void,
+    n: usize,
+    elem_bytes: usize,
+    pattern16: u16,
+    pattern32: u32,
+) -> bool {
+    if elem_bytes == 2 {
+        let p = buf.cast::<u16>();
+        (0..n).any(|j| unsafe { core::ptr::read_volatile(p.add(j)) } == pattern16)
+    } else {
+        let p = buf.cast::<u32>();
+        (0..n).any(|j| unsafe { core::ptr::read_volatile(p.add(j)) } == pattern32)
     }
 }
 
@@ -140,6 +198,9 @@ pub(crate) struct Runtime {
     fence_in: *mut c_void,
     fence_out: *mut c_void,
     fence_seq: u32,
+    /// Pinned buffer for [`Runtime::read_bf16_range`], grown on demand.
+    h_aux: *mut c_void,
+    aux_bytes: u64,
     out: Out,
     dws: u64,
 }
@@ -283,7 +344,7 @@ impl Runtime {
             );
             dev_bufs.push(d);
         }
-        let out_bytes = (out.elems() * 2) as u64;
+        let out_bytes = (out.elems() * out.kind.bytes()) as u64;
         let mut d_out = 0u64;
         syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
         let mut h_out: *mut c_void = core::ptr::null_mut();
@@ -329,6 +390,8 @@ impl Runtime {
             fence_in: core::ptr::null_mut(),
             fence_out: core::ptr::null_mut(),
             fence_seq: 0,
+            h_aux: core::ptr::null_mut(),
+            aux_bytes: 0,
             out,
             dws,
         })
@@ -527,23 +590,45 @@ impl Runtime {
         self.launch_and_read_range(0, rows)
     }
 
-    /// Launch the recipe and read back `rows` outermost rows of the output
-    /// starting at row `first`, as f32.
-    #[allow(clippy::too_many_lines)]
+    /// Launch the recipe and read back `rows` outermost rows of a bf16
+    /// output starting at row `first`, as f32.
     pub fn launch_and_read_range(&mut self, first: usize, rows: usize) -> Result<Vec<f32>> {
+        assert!(self.out.kind == OutKind::Bf16, "output is not bf16");
+        let bytes = self.launch_and_read_bytes(first, rows)?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect())
+    }
+
+    /// Launch the recipe and read back `rows` outermost rows of an int32
+    /// output starting at row `first`.
+    pub fn launch_and_read_i32(&mut self, first: usize, rows: usize) -> Result<Vec<i32>> {
+        assert!(self.out.kind == OutKind::I32, "output is not int32");
+        let bytes = self.launch_and_read_bytes(first, rows)?;
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect())
+    }
+
+    /// Launch the recipe and read back a row range of the output as raw bytes.
+    #[allow(clippy::too_many_lines)]
+    fn launch_and_read_bytes(&mut self, first: usize, rows: usize) -> Result<Vec<u8>> {
         let row_elems = self.out.row_elems();
+        let eb = self.out.kind.bytes();
         let n_out = rows * row_elems;
         assert!((first + rows) * row_elems <= self.out.elems());
-        let out_bytes = (n_out * 2) as u64;
+        let out_bytes = (n_out * eb) as u64;
         let (stream, dev, h_out) = (self.stream, self.dev, self.h_out);
-        let d_out = self.d_out + (first * row_elems * 2) as u64;
+        let d_out = self.d_out + (first * row_elems * eb) as u64;
         let trace = env_on("RENG_STEP_TRACE");
         let t0 = Instant::now();
         // Pre-fill the device output with the recipe-completion sentinel.
         syn!(synMemsetD32Async(
             self.d_out,
             SENTINEL_D32,
-            self.out.elems() / 2,
+            self.out.elems() * eb / 4,
             stream
         ));
         syn!(synStreamSynchronize(stream));
@@ -574,13 +659,8 @@ impl Runtime {
         // stream sync returns before the copy has landed on this stack).
         let started = Instant::now();
         let read_once = |s: synStreamHandle| -> Result<()> {
-            // SAFETY: h_out holds at least n_out bf16 elements.
-            unsafe {
-                let p = h_out.cast::<u16>();
-                for j in 0..n_out {
-                    *p.add(j) = HOST_SENTINEL_BF16;
-                }
-            }
+            // SAFETY: h_out holds at least n_out elements of eb bytes.
+            unsafe { fill_host_sentinel(h_out, n_out, eb) };
             syn!(synMemCopyAsync(
                 s,
                 d_out,
@@ -592,8 +672,7 @@ impl Runtime {
             loop {
                 // SAFETY: as above; the DMA writes each element exactly once.
                 let pending = unsafe {
-                    let p = h_out.cast::<u16>();
-                    (0..n_out).any(|j| core::ptr::read_volatile(p.add(j)) == HOST_SENTINEL_BF16)
+                    any_sentinel(h_out, n_out, eb, HOST_SENTINEL_BF16, HOST_SENTINEL_D32)
                 };
                 if !pending {
                     return Ok(());
@@ -606,13 +685,9 @@ impl Runtime {
                 std::hint::spin_loop();
             }
         };
-        // SAFETY (closure body): h_out holds n_out bf16 elements for the whole call.
-        let incomplete = || -> usize {
-            let p = h_out.cast::<u16>();
-            (0..n_out)
-                .filter(|&j| unsafe { *p.add(j) } == SENTINEL_BF16)
-                .count()
-        };
+        // SAFETY (closure body): h_out holds n_out elements for the whole call.
+        let incomplete =
+            || -> bool { unsafe { any_sentinel(h_out, n_out, eb, SENTINEL_BF16, SENTINEL_D32) } };
         if env_on("RENG_EVBRIDGE") {
             let mut ev: synEventHandle = core::ptr::null_mut();
             syn!(synEventCreate(&mut ev, dev, 0));
@@ -629,26 +704,24 @@ impl Runtime {
             read_once(stream)?;
         }
         let mut polls = 0u32;
-        let mut left = incomplete();
-        while left > 0 {
+        while incomplete() {
             if started.elapsed() > READBACK_TIMEOUT {
                 return Err(Error::Other(format!(
-                    "recipe output incomplete after {READBACK_TIMEOUT:?}: {left} of {n_out} elements unwritten"
+                    "recipe output incomplete after {READBACK_TIMEOUT:?}"
                 )));
             }
             std::thread::sleep(Duration::from_micros(200));
             read_once(stream)?;
             polls += 1;
-            left = incomplete();
         }
         // Diagnostic stability check (see `stability_window`).
-        let snapshot = |buf: *mut c_void, n: usize| -> Vec<u16> {
-            // SAFETY: buf holds n bf16 elements.
-            unsafe { std::slice::from_raw_parts(buf.cast::<u16>(), n).to_vec() }
+        let snapshot = |buf: *mut c_void, n: usize| -> Vec<u8> {
+            // SAFETY: buf holds n bytes.
+            unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), n).to_vec() }
         };
         let mut stable_polls = 0u32;
         if let Some(window) = stability_window() {
-            let mut prev = snapshot(h_out, n_out);
+            let mut prev = snapshot(h_out, n_out * eb);
             loop {
                 if started.elapsed() > READBACK_TIMEOUT {
                     return Err(Error::Other(format!(
@@ -657,7 +730,7 @@ impl Runtime {
                 }
                 std::thread::sleep(window);
                 read_once(stream)?;
-                let cur = snapshot(h_out, n_out);
+                let cur = snapshot(h_out, n_out * eb);
                 stable_polls += 1;
                 if cur == prev {
                     break;
@@ -683,15 +756,59 @@ impl Runtime {
         if env_on("RENG_DUMP_SCRATCH") {
             self.dump_scratch()?;
         }
-        let mut result = vec![0.0f32; n_out];
-        // SAFETY: h_out holds n_out bf16 elements just copied back.
-        unsafe {
-            let po = h_out.cast::<u16>();
-            for (j, o) in result.iter_mut().enumerate() {
-                *o = bf16_to_f32(*po.add(j));
+        Ok(snapshot(h_out, n_out * eb))
+    }
+
+    /// After a launch has completed, read back `rows` outermost rows of the
+    /// persistent tensor `name` starting at row `first`, as f32 (bf16 data).
+    /// Only the copy-landed sentinel is used: the recipe is known complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the copy never lands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a persistent tensor of this graph.
+    pub fn read_bf16_range(&mut self, name: &str, first: usize, rows: usize) -> Result<Vec<f32>> {
+        let shape = self.shapes[name].clone();
+        let row_elems = (shape.iter().product::<u64>() / *shape.last().unwrap_or(&1)) as usize;
+        let n = rows * row_elems;
+        assert!((first + rows) * row_elems <= shape.iter().product::<u64>() as usize);
+        let bytes = (n * 2) as u64;
+        if self.aux_bytes < bytes {
+            if !self.h_aux.is_null() {
+                unsafe { synHostFree(self.dev, self.h_aux, 0) };
             }
+            let mut hb: *mut c_void = core::ptr::null_mut();
+            syn!(synHostMalloc(self.dev, bytes, 0, &mut hb));
+            self.h_aux = hb;
+            self.aux_bytes = bytes;
         }
-        Ok(result)
+        let src = self.addrs[name] + (first * row_elems * 2) as u64;
+        let started = Instant::now();
+        // SAFETY: h_aux holds at least n bf16 elements.
+        unsafe { fill_host_sentinel(self.h_aux, n, 2) };
+        syn!(synMemCopyAsync(
+            self.stream,
+            src,
+            bytes,
+            self.h_aux as u64,
+            SYN_DRAM_TO_HOST
+        ));
+        syn!(synStreamSynchronize(self.stream));
+        // SAFETY: as above.
+        while unsafe { any_sentinel(self.h_aux, n, 2, HOST_SENTINEL_BF16, HOST_SENTINEL_D32) } {
+            if started.elapsed() > READBACK_TIMEOUT {
+                return Err(Error::Other(format!(
+                    "read of {name}: copy did not land within {READBACK_TIMEOUT:?}"
+                )));
+            }
+            std::hint::spin_loop();
+        }
+        // SAFETY: h_aux holds n bf16 elements just copied.
+        let words = unsafe { std::slice::from_raw_parts(self.h_aux.cast::<u16>(), n) };
+        Ok(words.iter().map(|&w| bf16_to_f32(w)).collect())
     }
 }
 
@@ -756,6 +873,9 @@ impl Drop for Runtime {
             if !self.fence_in.is_null() {
                 synHostFree(self.dev, self.fence_in, 0);
                 synHostFree(self.dev, self.fence_out, 0);
+            }
+            if !self.h_aux.is_null() {
+                synHostFree(self.dev, self.h_aux, 0);
             }
             for &d in &self.owned {
                 synDeviceFree(self.dev, d, 0);

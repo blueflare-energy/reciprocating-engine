@@ -4,7 +4,7 @@
 //! it goes into a model graph; every `reng-*-test` for a new guid uses it.
 
 use crate::model::{Gb, make_tensor};
-use crate::runtime::{Out, Runtime};
+use crate::runtime::{Out, OutKind, Runtime};
 use core::ffi::c_void;
 use reng_core::Result;
 
@@ -19,7 +19,7 @@ pub struct NodeInput<'a> {
 }
 
 /// Synapse dtype code for int32 (`syn_type_int32`).
-pub const SYN_TYPE_INT32: core::ffi::c_int = 1 << 4;
+pub use crate::ffi::SYN_TYPE_INT32;
 
 /// Build a graph with the single node `guid` over `ins`, producing one bf16
 /// output of `out_sizes`, run it once, and return the output as f32.
@@ -40,6 +40,54 @@ pub fn run_node(
     params: *const c_void,
     params_size: u32,
 ) -> Result<Vec<f32>> {
+    let mut rt = build_probe(
+        guid,
+        ins,
+        out_sizes,
+        crate::ffi::SYN_TYPE_BF16,
+        OutKind::Bf16,
+        params,
+        params_size,
+    )?;
+    let rows = *out_sizes.last().unwrap_or(&1) as usize;
+    rt.launch_and_read(rows)
+}
+
+/// Like [`run_node`] but with an int32 output.
+///
+/// # Errors
+///
+/// As [`run_node`].
+pub fn run_node_i32(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    out_sizes: &[u64],
+    params: *const c_void,
+    params_size: u32,
+) -> Result<Vec<i32>> {
+    let mut rt = build_probe(
+        guid,
+        ins,
+        out_sizes,
+        SYN_TYPE_INT32,
+        OutKind::I32,
+        params,
+        params_size,
+    )?;
+    let rows = *out_sizes.last().unwrap_or(&1) as usize;
+    rt.launch_and_read_i32(0, rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_probe(
+    guid: &str,
+    ins: &[NodeInput<'_>],
+    out_sizes: &[u64],
+    out_dtype: core::ffi::c_int,
+    kind: OutKind,
+    params: *const c_void,
+    params_size: u32,
+) -> Result<Runtime> {
     let mut gb = Gb::new()?;
     let mut tensors = Vec::with_capacity(ins.len());
     for i in ins {
@@ -50,12 +98,12 @@ pub fn run_node(
             tensors.push(gb.input(i.name, i.sizes, i.data)?);
         }
     }
-    let (t_out, n_out) = make_tensor(gb.graph, "OUT", out_sizes, crate::ffi::SYN_TYPE_BF16, true)?;
+    let (t_out, n_out) = make_tensor(gb.graph, "OUT", out_sizes, out_dtype, true)?;
     gb.node(guid, "probe", &tensors, &[t_out], params, params_size)?;
     let out = Out {
         name: n_out,
         sizes: out_sizes.to_vec(),
+        kind,
     };
-    let rows = *out_sizes.last().unwrap_or(&1) as usize;
-    Runtime::new(gb, out)?.launch_and_read(rows)
+    Runtime::new(gb, out)
 }

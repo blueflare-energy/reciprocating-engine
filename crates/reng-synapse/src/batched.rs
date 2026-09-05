@@ -113,7 +113,7 @@ impl BatchedModel {
         for (li, lw) in m.layers.iter().enumerate() {
             cur = build_layer_batched(&mut gb, li, cur, lw, &sh, hidden, inter)?;
         }
-        let out = build_head(&mut gb, cur, m, batch, hidden, vocab)?;
+        let out = build_head(&mut gb, cur, m, batch, hidden, vocab, true)?;
         let rt = Runtime::new(gb, out)?;
         let ix = Inputs {
             x: rt.input_index("XB"),
@@ -191,7 +191,7 @@ impl BatchedModel {
         for (li, lw) in m.layers.iter().enumerate() {
             cur = build_layer(&mut gb, li, cur, lw, &sh, rows, hidden, inter, None)?;
         }
-        let out = build_head(&mut gb, cur, m, rows, hidden, vocab)?;
+        let out = build_head(&mut gb, cur, m, rows, hidden, vocab, true)?;
         Ok((gb, out))
     }
 
@@ -236,6 +236,21 @@ impl BatchedModel {
     /// Panics if `x` is empty, not a whole number of rows, or overflows the
     /// cache.
     pub fn prefill(&mut self, b: usize, x: &[f32]) -> Result<Vec<f32>> {
+        self.prefill_rows(b, x, true)
+    }
+
+    /// Like [`BatchedModel::prefill`] but returns only the argmax id of the
+    /// last row, computed on the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    pub fn prefill_id(&mut self, b: usize, x: &[f32]) -> Result<u32> {
+        let v = self.prefill_rows(b, x, false)?;
+        Ok(v[0] as u32)
+    }
+
+    fn prefill_rows(&mut self, b: usize, x: &[f32], want_logits: bool) -> Result<Vec<f32>> {
         let (h, hd, p, c) = (self.hidden, self.head_dim, self.rows, self.capacity);
         assert_eq!(x.len() % h, 0);
         let n_total = x.len() / h;
@@ -290,7 +305,12 @@ impl BatchedModel {
             self.pf.upload_bf16(self.pf_ix.mask, &mb)?;
             self.pf.upload_raw(self.pf_ix.kidx, &ib)?;
             self.pf.fence()?;
-            last = self.pf.launch_and_read_range(n - 1, 1)?;
+            let ids = self.pf.launch_and_read_i32(n - 1, 1)?;
+            last = if want_logits {
+                self.pf.read_bf16_range("LOGITS", n - 1, 1)?
+            } else {
+                vec![ids[0] as f32]
+            };
             self.pos[b] += n;
         }
         Ok(last)
@@ -307,6 +327,21 @@ impl BatchedModel {
     ///
     /// Panics if `x` is not `B` rows or a sequence would overflow the cache.
     pub fn step(&mut self, x: &[f32]) -> Result<Vec<f32>> {
+        self.step_rows(x, true)
+    }
+
+    /// Like [`BatchedModel::step`] but returns one argmax token id per
+    /// sequence, computed on the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails.
+    pub fn step_ids(&mut self, x: &[f32]) -> Result<Vec<u32>> {
+        let v = self.step_rows(x, false)?;
+        Ok(v.iter().map(|&i| i as u32).collect())
+    }
+
+    fn step_rows(&mut self, x: &[f32], want_logits: bool) -> Result<Vec<f32>> {
         let (h, hd, c, nb) = (self.hidden, self.head_dim, self.capacity, self.batch);
         assert_eq!(x.len(), nb * h);
         for b in 0..nb {
@@ -336,7 +371,12 @@ impl BatchedModel {
         self.rt.upload_bf16(self.ix.mask, &mb)?;
         self.rt.upload_raw(self.ix.kidx, &ib)?;
         self.rt.fence()?;
-        let logits = self.rt.launch_and_read(nb)?;
+        let ids = self.rt.launch_and_read_i32(0, nb)?;
+        let logits = if want_logits {
+            self.rt.read_bf16_range("LOGITS", 0, nb)?
+        } else {
+            ids.iter().map(|&i| i as f32).collect()
+        };
         for pos in &mut self.pos {
             *pos += 1;
         }

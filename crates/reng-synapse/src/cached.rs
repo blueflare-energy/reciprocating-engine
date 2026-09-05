@@ -23,6 +23,14 @@ use crate::runtime::Runtime;
 use reng_core::Result;
 use std::time::Instant;
 
+/// What a step reads back.
+#[derive(Clone, Copy)]
+enum Read {
+    LastId,
+    LastLogits,
+    AllLogits,
+}
+
 /// Per-step input indices of one compiled recipe.
 struct Inputs {
     x: usize,
@@ -43,7 +51,6 @@ pub struct CachedModel {
     rows: usize,
     capacity: usize,
     hidden: usize,
-    vocab: usize,
     head_dim: usize,
     n_kv: usize,
     pos: usize,
@@ -105,7 +112,6 @@ impl CachedModel {
             rows,
             capacity,
             hidden,
-            vocab,
             head_dim: hd,
             n_kv: l0.n_kv_heads,
             pos: 0,
@@ -149,7 +155,7 @@ impl CachedModel {
         for (li, lw) in m.layers.iter().enumerate() {
             cur = build_layer(&mut gb, li, cur, lw, &sh, rows, hidden, inter, None)?;
         }
-        let out = build_head(&mut gb, cur, m, rows, hidden, vocab)?;
+        let out = build_head(&mut gb, cur, m, rows, hidden, vocab, true)?;
         Ok((gb, out))
     }
 
@@ -207,21 +213,32 @@ impl CachedModel {
     /// Panics if `n` is 0 or exceeds `rows`, if `x` is not a whole number of
     /// rows, or if the block would overflow the cache.
     pub fn step(&mut self, x: &[f32]) -> Result<Vec<f32>> {
-        self.step_rows(x, false)
+        self.step_rows(x, Read::AllLogits)
     }
 
     /// Like [`CachedModel::step`] but returns only the last row's logits
-    /// (`[1, vocab]`), which is all generation needs; reading one row instead
-    /// of a whole block is what keeps long prefills cheap.
+    /// (`[1, vocab]`).
     ///
     /// # Errors
     ///
     /// Returns an error if any SynapseAI call fails or the output never completes.
     pub fn step_last(&mut self, x: &[f32]) -> Result<Vec<f32>> {
-        self.step_rows(x, true)
+        self.step_rows(x, Read::LastLogits)
     }
 
-    fn step_rows(&mut self, x: &[f32], last_only: bool) -> Result<Vec<f32>> {
+    /// Like [`CachedModel::step`] but returns only the argmax token id of the
+    /// last row, computed on the device: the only thing greedy generation
+    /// needs, and four bytes over the bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails or the output never completes.
+    pub fn step_last_id(&mut self, x: &[f32]) -> Result<u32> {
+        let v = self.step_rows(x, Read::LastId)?;
+        Ok(v[0] as u32)
+    }
+
+    fn step_rows(&mut self, x: &[f32], read: Read) -> Result<Vec<f32>> {
         let (h, hd, c) = (self.hidden, self.head_dim, self.capacity);
         assert_eq!(x.len() % h, 0);
         let n = x.len() / h;
@@ -289,10 +306,13 @@ impl CachedModel {
         rt.upload_raw(ix.kidx, &ib)?;
         rt.fence()?;
         let t_upload = t0.elapsed();
-        let logits = if last_only {
-            rt.launch_and_read_range(n - 1, 1)?
-        } else {
-            rt.launch_and_read(n)?
+        // The recipe's read-back tensor is the argmax ids; the logits stay
+        // on the device and are read only when asked for.
+        let ids = rt.launch_and_read_i32(n - 1, 1)?;
+        let logits = match read {
+            Read::LastId => vec![ids[0] as f32],
+            Read::LastLogits => rt.read_bf16_range("LOGITS", n - 1, 1)?,
+            Read::AllLogits => rt.read_bf16_range("LOGITS", 0, n)?,
         };
         if trace {
             eprintln!(
@@ -302,7 +322,6 @@ impl CachedModel {
             );
         }
         self.pos += n;
-        debug_assert_eq!(logits.len(), if last_only { 1 } else { n } * self.vocab);
         Ok(logits)
     }
 }

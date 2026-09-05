@@ -66,15 +66,15 @@ against the `reng-ceiling` roofline:
 
 | Model | Decode b1 tok/s | Decode b8 tok/s | Decode b64 tok/s | Prefill tok/s |
 |---|---|---|---|---|
-| SmolLM2-135M | 679 (7.5%) | 3098 (4.7%) | 5864 (1.8%) | 33.7k (2.9%) |
-| SmolLM2-360M | 532 (15.8%) | 2034 (8.0%) | | |
+| SmolLM2-135M | 806 (9.0%) | 5869 (8.9%) | 29519 (9.1%) | 44.7k (3.9%) |
+| SmolLM2-360M | 532 (15.8%) | | | |
 | Qwen2.5-0.5B | 545 (22.0%) | | | 25.5k (8.1%) |
-| SmolLM2-1.7B | 293 (41.3%) | 969 (18.1%) | 3339 (11.2%) | 15.5k (17.0%) |
+| SmolLM2-1.7B | 371 (52.2%) | 2461 (45.8%) | 6521 (21.8%) | 14.1k (15.5%) |
 
-Batched figures use a cache sized to the context (256 positions). The
-single-sequence step is bound by per-node dispatch across the recipe; the
-batched step by rewriting the whole KV cache every step, which an in-place
-scatter will remove. Both are where the performance work continues.
+The KV cache (1024 positions here) is updated in place by a ScatterND node
+and the greedy token is an argmax on the device, so a decode step moves four
+bytes per sequence over the bus. The step is bound by per-node dispatch
+across the recipe, which is where the performance work continues.
 
 ## Layout
 

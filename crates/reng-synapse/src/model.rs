@@ -29,7 +29,7 @@
 
 use crate::LayerWeights;
 use crate::ffi::*;
-use crate::runtime::{Out, Runtime};
+use crate::runtime::{Out, OutKind, Runtime};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::ffi::CString;
@@ -1053,8 +1053,18 @@ pub(crate) fn build_layer_batched(
     Ok(t_out)
 }
 
-/// Append the final RMSNorm and LM head reading `cur` and return the logits
-/// output `[vocab, tokens]` as the graph's read-back tensor.
+/// `ns_Reduction::Params` for the argmax over the FCD.
+#[repr(C)]
+struct ReductionParams {
+    reduction_dimension: u32,
+}
+
+/// Append the final RMSNorm and LM head reading `cur`. Without `ids_out`
+/// the logits `[vocab, tokens]` are the graph's read-back tensor; with it
+/// the logits stay device-resident (the persistent scratch tensor
+/// `LOGITS`, readable on demand) and an argmax over the vocabulary produces
+/// the read-back tensor `IDS`, int32 `[1, tokens]`, so a decode step moves
+/// four bytes per token over the bus.
 pub(crate) fn build_head(
     gb: &mut Gb,
     cur: synTensor,
@@ -1062,6 +1072,7 @@ pub(crate) fn build_head(
     tokens: usize,
     hidden: usize,
     vocab: usize,
+    ids_out: bool,
 ) -> Result<Out> {
     let (t, h, v) = (tokens as u64, hidden as u64, vocab as u64);
     let bf = SYN_TYPE_BF16;
@@ -1069,7 +1080,12 @@ pub(crate) fn build_head(
     let t_lm = gb.input("LM", &[v, h], m.lm_head)?;
     let t_nf = gb.mid("nf", &[h, t], bf)?;
     let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
-    let (t_logits, n_logits) = make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?;
+    let (t_logits, n_logits) = if ids_out {
+        let t = gb.scratch("LOGITS", &[v, t])?;
+        (t, CString::new("LOGITS").unwrap())
+    } else {
+        make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?
+    };
     // Diagnostic `RENG_TPC_OUT`: route the logits through a TPC identity
     // (add 0) so a TPC kernel, not the MME, is the output's last writer.
     let tpc_out = env_on("RENG_TPC_OUT");
@@ -1115,9 +1131,29 @@ pub(crate) fn build_head(
             0,
         )?;
     }
+    if !ids_out {
+        return Ok(Out {
+            name: n_logits,
+            sizes: vec![v, t],
+            kind: OutKind::Bf16,
+        });
+    }
+    let (t_ids, n_ids) = make_tensor(gb.graph, "IDS", &[1, t], SYN_TYPE_INT32, true)?;
+    let red = ReductionParams {
+        reduction_dimension: 0,
+    };
+    gb.node(
+        "argmax_fwd_bf16",
+        "argmax",
+        &[t_logits],
+        &[t_ids],
+        (&raw const red).cast::<c_void>(),
+        core::mem::size_of::<ReductionParams>() as u32,
+    )?;
     Ok(Out {
-        name: n_logits,
-        sizes: vec![v, t],
+        name: n_ids,
+        sizes: vec![1, t],
+        kind: OutKind::I32,
     })
 }
 
@@ -1215,7 +1251,7 @@ pub fn model_forward_bf16(
     assert_eq!(m.lm_head.len(), hidden * vocab);
     let last = m.layers.len() - 1;
     let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, last, None)?;
-    let out = build_head(&mut gb, cur, m, tokens, hidden, vocab)?;
+    let out = build_head(&mut gb, cur, m, tokens, hidden, vocab, false)?;
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
 
@@ -1257,6 +1293,7 @@ pub fn model_probe_bf16(
     let out = Out {
         name: n_probe,
         sizes: vec![h, t],
+        kind: OutKind::Bf16,
     };
     Runtime::new(gb, out)?.launch_and_read(tokens)
 }
