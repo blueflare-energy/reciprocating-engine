@@ -1,14 +1,22 @@
 //! Measure steady-state bf16 matmul throughput on the Gaudi2 MME and compare
 //! it to the roofline. Compile once, launch many.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-mme-bench`.
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-mme-bench -- [m] [k] [n] [iters]`
+//! (default 4096 x 4096 x 4096, 50 launches; the prefill shapes are
+//! `1024 2048 8192` and friends).
 
 use reng_synapse::MatmulHpu;
 use std::time::Instant;
 
 fn main() -> reng_core::Result<()> {
-    let (m, k, n) = (4096usize, 4096, 4096);
-    let iters = 50u32;
+    let arg = |i: usize, d: usize| {
+        std::env::args()
+            .nth(i)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or(d)
+    };
+    let (m, k, n) = (arg(1, 4096usize), arg(2, 4096usize), arg(3, 4096usize));
+    let iters = arg(4, 50usize) as u32;
     const CEILING_TFLOPS: f64 = 432.0; // Gaudi2 MME peak, bf16
 
     let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();

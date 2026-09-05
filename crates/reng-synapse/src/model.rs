@@ -949,22 +949,29 @@ pub(crate) fn build_layer_batched(
         none.1,
     )?;
     gb.node("reshape", &p("v_updates"), &[t_v], &[t_vu], none.0, none.1)?;
-    gb.node(
-        "scatter_nd_update_fwd_bf16",
-        &p("k_scatter"),
-        &[kci, sh.kidx, t_kru],
-        &[kco],
-        psc.0,
-        psc.1,
-    )?;
-    gb.node(
-        "scatter_nd_update_fwd_bf16",
-        &p("v_scatter"),
-        &[vci, sh.kidx, t_vu],
-        &[vco],
-        psc.0,
-        psc.1,
-    )?;
+    // Diagnostic `RENG_NO_SCATTER`: leave the cache stale (wrong results) to
+    // time the step without the two ScatterND nodes.
+    let (kco, vco) = if env_on("RENG_NO_SCATTER") {
+        (kci, vci)
+    } else {
+        gb.node(
+            "scatter_nd_update_fwd_bf16",
+            &p("k_scatter"),
+            &[kci, sh.kidx, t_kru],
+            &[kco],
+            psc.0,
+            psc.1,
+        )?;
+        gb.node(
+            "scatter_nd_update_fwd_bf16",
+            &p("v_scatter"),
+            &[vci, sh.kidx, t_vu],
+            &[vco],
+            psc.0,
+            psc.1,
+        )?;
+        (kco, vco)
+    };
     gb.node("batch_gemm", &p("qk"), &[t_qr, kco], &[t_sc], pgt.0, pgt.1)?;
     gb.node(
         "add_fwd_bf16",
