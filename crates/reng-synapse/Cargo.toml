@@ -71,3 +71,8 @@ required-features = ["link-synapse"]
 name = "reng-gemm-t-test"
 path = "src/bin/gemm_t_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-layer-test"
+path = "src/bin/layer_test.rs"
+required-features = ["link-synapse"]
