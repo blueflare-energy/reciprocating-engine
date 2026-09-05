@@ -219,7 +219,7 @@ impl Runtime {
     /// per-step inputs and output. The child must be dropped before the
     /// parent.
     #[allow(clippy::too_many_lines)]
-    pub fn new_with(gb: Gb, out: Out, parent: Option<&Runtime>) -> Result<Self> {
+    pub fn new_with(mut gb: Gb, out: Out, parent: Option<&Runtime>) -> Result<Self> {
         gb.serialize_if_requested()?;
         let mut recipe: synRecipeHandle = core::ptr::null_mut();
         syn!(synGraphCompile(
@@ -316,6 +316,12 @@ impl Runtime {
             dev_bufs.push(d);
             host_bufs.push(hb);
         }
+        // The f32 host copies of the inputs (the weights, mostly) are not
+        // needed once they are in the pinned staging buffers or bound to a
+        // parent: uploads are validated against the tensor sizes.
+        for d in &mut gb.data {
+            *d = Vec::new();
+        }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
             let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
             let d = if let Some(of) = &gb.scratch_alias[k] {
@@ -406,10 +412,49 @@ impl Runtime {
         self.addrs[name]
     }
 
+    /// Element count of input `idx`.
+    fn input_elems(&self, idx: usize) -> usize {
+        self.gb.sizes[idx].iter().product::<u64>() as usize
+    }
+
+    /// Copy `(src, dst, bytes)` ranges between device buffers and wait until
+    /// they have landed (stream sync plus a [`Runtime::fence`], since the
+    /// sync alone returns early on this stack).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a copy cannot be enqueued or the fence times out.
+    pub fn copy_d2d(&mut self, copies: &[(u64, u64, u64)]) -> Result<()> {
+        // Chunks keep the descriptor arrays alive until the sync below.
+        const CHUNK: usize = 4096;
+        let chunks: Vec<(Vec<u64>, Vec<u64>, Vec<u64>)> = copies
+            .chunks(CHUNK)
+            .map(|c| {
+                (
+                    c.iter().map(|x| x.0).collect(),
+                    c.iter().map(|x| x.2).collect(),
+                    c.iter().map(|x| x.1).collect(),
+                )
+            })
+            .collect();
+        for (src, size, dst) in &chunks {
+            syn!(synMemCopyAsyncMultiple(
+                self.stream,
+                src.as_ptr(),
+                size.as_ptr(),
+                dst.as_ptr(),
+                SYN_DRAM_TO_DRAM,
+                src.len() as u64
+            ));
+        }
+        syn!(synStreamSynchronize(self.stream));
+        self.fence()
+    }
+
     /// Replace input `idx`'s contents (bf16-converted, `data.len()` must equal
     /// the input's element count) ahead of the next launch.
     pub fn upload(&mut self, idx: usize, data: &[f32]) -> Result<()> {
-        assert_eq!(data.len(), self.gb.data[idx].len());
+        assert_eq!(data.len(), self.input_elems(idx));
         let hb = self.host_bufs[idx];
         assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
         // SAFETY: hb holds data.len() bf16 elements.
@@ -452,7 +497,7 @@ impl Runtime {
     /// Replace input `idx`'s contents with bf16 data already in device format
     /// (for the large mask patterns that need no conversion).
     pub fn upload_bf16(&mut self, idx: usize, data: &[u16]) -> Result<()> {
-        assert_eq!(data.len(), self.gb.data[idx].len());
+        assert_eq!(data.len(), self.input_elems(idx));
         let hb = self.host_bufs[idx];
         assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
         // SAFETY: hb holds data.len() bf16 elements.

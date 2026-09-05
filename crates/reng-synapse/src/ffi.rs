@@ -134,6 +134,14 @@ unsafe extern "C" {
         dst: u64,
         direction: c_int,
     ) -> synStatus;
+    pub fn synMemCopyAsyncMultiple(
+        streamHandle: synStreamHandle,
+        src: *const u64,
+        size: *const u64,
+        dst: *const u64,
+        direction: c_int,
+        numCopies: u64,
+    ) -> synStatus;
     pub fn synGraphCreate(pGraphHandle: *mut synGraphHandle, deviceType: c_int) -> synStatus;
     pub fn synGraphDestroy(graphHandle: synGraphHandle) -> synStatus;
     pub fn synRecipeDestroy(recipeHandle: synRecipeHandle) -> synStatus;

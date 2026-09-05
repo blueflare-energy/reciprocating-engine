@@ -149,7 +149,15 @@ fn main() -> reng_core::Result<()> {
 
     let t0 = Instant::now();
     let mut bm = BatchedModel::new(
-        &m, hidden, inter, vocab, batch, rows, capacity, &sin_cap, &cos_cap,
+        m.clone(),
+        hidden,
+        inter,
+        vocab,
+        batch,
+        rows,
+        capacity,
+        &sin_cap,
+        &cos_cap,
     )?;
     println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
 

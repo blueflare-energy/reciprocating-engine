@@ -66,12 +66,12 @@ against the `reng-ceiling` roofline:
 
 | Model | Decode b1 tok/s | Decode b8 tok/s | Decode b64 tok/s | Prefill 1024 tok/s |
 |---|---|---|---|---|
-| SmolLM2-135M | 787 (8.7%) | 5863 (8.8%) | 29413 (9.0%) | 128.5k (10.1%) |
+| SmolLM2-135M | 787 (8.7%) | 6731 (10.2%) | 40154 (12.3%) | 128.5k (10.1%) |
 | SmolLM2-360M | 608 (18.1%) | 4627 (18.2%) | 20687 (14.5%) | |
 | Qwen2.5-0.5B | 755 (30.5%) | 5271 (26.9%) | 29507 (20.7%) | |
 | Qwen2.5-1.5B | 405 (51.1%) | 2894 (46.1%) | 16535 (35.3%) | |
-| SmolLM2-1.7B | 370 (52.1%) | 2449 (45.6%) | 6506 (21.7%) | 30.6k (25.7%) |
-| Qwen2.5-3B | 245 (61.8%) | 1818 (57.6%) | 10730 (44.6%) | |
+| SmolLM2-1.7B | 370 (52.1%) | 3083 (57.4%) | 13752 (45.9%) | 30.6k (25.7%) |
+| Qwen2.5-3B | 245 (61.8%) | 1940 (61.5%) | 12895 (53.6%) | |
 | Qwen2.5-7B | 133 (76.6%) | 1013 (73.4%) | | |
 
 Decode percentages are against the HBM roofline, prefill against the MME
@@ -82,10 +82,14 @@ and the prefill-versus-context table (Chart 1) at
 [dev/sweep/prefill.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/prefill.md)
 after every merge.
 
-The KV cache (1024 positions here) is updated in place by a ScatterND node
-and the greedy token is an argmax on the device, so a decode step moves four
-bytes per sequence over the bus. The step is bound by per-node dispatch
-across the recipe, which is where the performance work continues.
+The KV cache is updated in place by a ScatterND node and the greedy token
+is an argmax on the device, so a decode step moves four bytes per sequence
+over the bus. Attention reads the whole cache every step, so the batched
+decoder compiles its recipes for the smallest bucket of positions (256,
+doubling) that holds the longest live sequence and grows on demand,
+recompiling and copying the used rows across. Single-sequence decode is
+bound by per-node dispatch across the recipe, which is where the
+performance work continues.
 
 ## Layout
 

@@ -1159,6 +1159,7 @@ pub(crate) fn build_head(
 
 /// Whole-model weights. All layers share `layers[0]`'s head counts, `eps`, and
 /// RoPE caches (`sin`/`cos`, `[tokens, head_dim]`).
+#[derive(Clone)]
 pub struct ModelWeights<'a> {
     pub layers: Vec<LayerWeights<'a>>,
     /// Final RMSNorm gain, length `hidden`.

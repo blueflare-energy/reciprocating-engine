@@ -538,7 +538,7 @@ impl<'a> Generator<'a> {
 /// prefilled one sequence at a time.
 #[cfg(feature = "link-synapse")]
 pub struct BatchedGenerator<'a> {
-    model: reng_synapse::BatchedModel,
+    model: reng_synapse::BatchedModel<'a>,
     w: &'a LlamaWeights,
     cfg: &'a LlamaConfig,
 }
@@ -559,9 +559,11 @@ impl<'a> BatchedGenerator<'a> {
         capacity: usize,
     ) -> Result<Self> {
         let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
-        let m = layer_views(w, cfg, &sin, &cos);
+        // The batched recipes take RoPE rows as per-step inputs, so the
+        // layer views carry no tables (they would have to outlive `sin`).
+        let m = layer_views(w, cfg, &[], &[]);
         let model = reng_synapse::BatchedModel::new(
-            &m,
+            m,
             cfg.hidden_size,
             cfg.intermediate_size,
             cfg.vocab_size,

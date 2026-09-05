@@ -28,7 +28,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one token per launch over a B-slot KV cache; the cache is updated in place
   by a ScatterND node and the greedy token is an argmax on the device.
 - Qwen2-style attention biases; sharded safetensors checkpoints; verified
-  models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B.
+  models: SmolLM2-135M/360M/1.7B, Qwen2.5-0.5B/1.5B/3B/7B.
+- Capacity buckets for batched decode: the recipes are compiled for the
+  smallest bucket of cache positions holding the longest live sequence and
+  regrown on demand (`RENG_MIN_CAP` sets the floor), since attention reads
+  the whole cache every step. SmolLM2-1.7B batch 64 goes from 22% to 46% of
+  the HBM ceiling with 160-token sequences.
 
 - Workspace scaffold with five crates: `reng-core`, `reng-hal`, `reng-ceiling`,
   `reng-cli`, `reng-synapse`.
