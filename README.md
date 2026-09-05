@@ -35,6 +35,16 @@ what the machine can actually do rather than to an arbitrary baseline.
   including silicon-stepping detection, with no dependency on the vendor
   userspace.
 - `reng`: a CLI that enumerates the accelerators on a host.
+- `reng-synapse`: a Llama-style decoder (RMSNorm, RoPE, grouped-query
+  attention with a causal mask, SwiGLU) compiled as one fused SynapseAI
+  recipe and launched once, with a readback protocol that survives the
+  driver's late-completing writes.
+- `reng-model`: loads a Hugging Face `config.json` plus `model.safetensors`
+  and runs prefill (`reng-prefill`) and greedy generation (`reng-generate`)
+  on the device. SmolLM2-135M matches the f32 transformers reference on
+  per-position argmax (cosine 1.000 on the last logits at 128 tokens); greedy
+  decoding matches token for token except at f32 near-ties, which bf16 cannot
+  resolve. `tools/oracle/` holds the reference scripts.
 
 ```console
 $ reng devices
@@ -43,6 +53,9 @@ INDEX  PCI              STEPPING
 1      0000:cd:00.0     A0
 ...
 ```
+
+Generation has no KV cache yet: each step re-runs prefill, so the loop is
+correct but slow. The cached decode path is next.
 
 ## Layout
 

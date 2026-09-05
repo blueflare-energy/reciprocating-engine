@@ -22,3 +22,8 @@ serde_json = { workspace = true }
 name = "reng-prefill"
 path = "src/bin/prefill.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-generate"
+path = "src/bin/generate.rs"
+required-features = ["link-synapse"]
