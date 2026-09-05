@@ -152,8 +152,16 @@ fn main() -> reng_core::Result<()> {
         None => a.n_new,
     };
 
+    let t_start = Instant::now();
     let cfg = LlamaConfig::load(Path::new(&a.dir))?;
     let w = load_weights(Path::new(&a.dir), &cfg)?;
+    let (mapped, owned) = w.footprint();
+    println!(
+        "loaded weights in {:.2}s (mapped {:.2} GB, owned {:.2} GB)",
+        t_start.elapsed().as_secs_f32(),
+        mapped as f64 / 1e9,
+        owned as f64 / 1e9
+    );
     let vocab = cfg.vocab_size;
     let mut ids = a.ids.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(n_new);
@@ -193,6 +201,12 @@ fn main() -> reng_core::Result<()> {
         };
         pending = ids.len();
         step_secs.push(t0.elapsed().as_secs_f32());
+        if step == 0 {
+            println!(
+                "first token {:.2}s after start",
+                t_start.elapsed().as_secs_f32()
+            );
+        }
         generated.push(last);
         match &reference {
             None => {

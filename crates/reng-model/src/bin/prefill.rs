@@ -66,8 +66,9 @@ fn main() -> reng_core::Result<()> {
     let t0 = Instant::now();
     let cfg = LlamaConfig::load(dir)?;
     let w = load_weights(dir, &cfg)?;
+    let (mapped, owned) = w.footprint();
     println!(
-        "loaded {} layers, hidden {}, inter {}, heads {}/{} kv, head_dim {}, vocab {} in {:.1}s",
+        "loaded {} layers, hidden {}, inter {}, heads {}/{} kv, head_dim {}, vocab {} in {:.2}s (mapped {:.2} GB, owned {:.2} GB)",
         cfg.num_hidden_layers,
         cfg.hidden_size,
         cfg.intermediate_size,
@@ -75,7 +76,9 @@ fn main() -> reng_core::Result<()> {
         cfg.n_kv_heads(),
         cfg.head_dim(),
         cfg.vocab_size,
-        t0.elapsed().as_secs_f32()
+        t0.elapsed().as_secs_f32(),
+        mapped as f64 / 1e9,
+        owned as f64 / 1e9
     );
 
     let t1 = Instant::now();

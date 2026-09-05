@@ -28,12 +28,23 @@
 //! table (`rope_local_base_freq`) while the full layers get `rope_theta`;
 //! and `tie_word_embeddings` defaults to true (the key is absent from the
 //! configs).
+//!
+//! The safetensors files are memory-mapped and never read into heap
+//! buffers: a bf16 tensor is a [`Bf16Slice`] viewing the checkpoint bytes
+//! in place (the maps stay alive for as long as any view does), so loading
+//! costs no copy and the file pages are shared with the page cache and
+//! reclaimable. Only derived data is owned: f32 and f16 checkpoints
+//! converted to bf16, the scaled Granite copies, and a tensor whose data
+//! offset is not 2-aligned (never seen; safetensors pads its header to 8
+//! bytes) or on a big-endian host.
 
+use memmap2::{Advice, Mmap};
 use reng_core::{Error, Result};
 use reng_synapse::{Activation, bf16_to_f32, f32_to_bf16, scale_bf16};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::Arc;
 
 fn default_theta() -> f32 {
     10000.0
@@ -379,7 +390,112 @@ impl LlamaConfig {
     }
 }
 
-/// One layer's weights in engine layout (`[in, out]` projections), owned.
+/// The bf16 elements of a weight tensor: a view into a memory-mapped
+/// safetensors file (a bf16 checkpoint, the common case: nothing is copied
+/// and the pages belong to the page cache) or an owned buffer (an f32 or
+/// f16 checkpoint converted at load, a scaled or otherwise derived copy,
+/// or the fallback for a view that cannot be taken). Dereferences to
+/// `[u16]`; cloning is cheap (the tied LM head shares the embedding view).
+#[derive(Clone)]
+pub enum Bf16Slice {
+    /// Heap data (shared, so that clones cost nothing).
+    Owned(Arc<Vec<u16>>),
+    /// `len` elements at byte `offset` of a mapped file. The offset is
+    /// 2-aligned (checked by [`Bf16Slice::mapped`]).
+    Mapped {
+        map: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl Bf16Slice {
+    /// A view of `len` bf16 elements at byte `offset` of `map` when the
+    /// elements can be read in place (the offset is 2-aligned and the host
+    /// is little-endian, as the file format is); otherwise a converted
+    /// copy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range lies outside the map.
+    #[must_use]
+    pub fn mapped(map: Arc<Mmap>, offset: usize, len: usize) -> Self {
+        let bytes = &map[offset..offset + len * 2];
+        if cfg!(target_endian = "little") && bytes.as_ptr().align_offset(align_of::<u16>()) == 0 {
+            return Self::Mapped { map, offset, len };
+        }
+        let v: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        Self::from(v)
+    }
+
+    /// Elements `start..start + len` as a slice of their own: a sub-view
+    /// of a mapped slice (no copy), a copy of an owned one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the range lies outside the slice.
+    #[must_use]
+    pub fn sub(&self, start: usize, len: usize) -> Self {
+        assert!(start + len <= self.len(), "sub-slice out of range");
+        match self {
+            Self::Owned(v) => Self::from(v[start..start + len].to_vec()),
+            Self::Mapped { map, offset, .. } => Self::Mapped {
+                map: Arc::clone(map),
+                offset: offset + start * 2,
+                len,
+            },
+        }
+    }
+
+    /// Whether the elements are read from a mapped file.
+    #[must_use]
+    pub fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped { .. })
+    }
+}
+
+impl From<Vec<u16>> for Bf16Slice {
+    fn from(v: Vec<u16>) -> Self {
+        Self::Owned(Arc::new(v))
+    }
+}
+
+impl std::ops::Deref for Bf16Slice {
+    type Target = [u16];
+
+    fn deref(&self) -> &[u16] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mapped { map, offset, len } => {
+                let bytes = &map[*offset..*offset + *len * 2];
+                // SAFETY: u16 has no invalid bit patterns and the map is
+                // read-only; `mapped` checked the 2-byte alignment, so the
+                // whole range is in the middle part.
+                let (head, mid, tail) = unsafe { bytes.align_to::<u16>() };
+                assert!(head.is_empty() && tail.is_empty());
+                mid
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Bf16Slice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(v) => write!(f, "Bf16Slice::Owned({} elements)", v.len()),
+            Self::Mapped { offset, len, .. } => {
+                write!(f, "Bf16Slice::Mapped({len} elements at byte {offset})")
+            }
+        }
+    }
+}
+
+/// One layer's weights: the projections bf16 in the checkpoint's
+/// `[out, in]` layout (views into the mapped files, or owned where
+/// derived), the norm gains and biases f32.
 pub struct LayerTensors {
     /// The layer's two RMSNorm gains: `input_layernorm` and
     /// `post_attention_layernorm` (pre-norm), `post_attention_layernorm`
@@ -394,10 +510,10 @@ pub struct LayerTensors {
     pub g_post_mlp: Vec<f32>,
     /// Projections as stored, bf16 `[out, in]`; `wo` (and `wd`) carry the
     /// config's `residual_multiplier` when it has one.
-    pub wq: Vec<u16>,
-    pub wk: Vec<u16>,
-    pub wv: Vec<u16>,
-    pub wo: Vec<u16>,
+    pub wq: Bf16Slice,
+    pub wk: Bf16Slice,
+    pub wv: Bf16Slice,
+    pub wo: Bf16Slice,
     /// Attention biases; empty when the checkpoint has none.
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
@@ -407,45 +523,96 @@ pub struct LayerTensors {
     /// head_dim`); empty when the checkpoint has none.
     pub qn: Vec<f32>,
     pub kn: Vec<f32>,
-    pub wg: Vec<u16>,
-    pub wu: Vec<u16>,
-    pub wd: Vec<u16>,
+    pub wg: Bf16Slice,
+    pub wu: Bf16Slice,
+    pub wd: Bf16Slice,
 }
 
 /// A whole model's weights on the host: the matrices bf16 in the
-/// checkpoint's `[out, in]` layout (the device format, uploaded as is),
-/// the norm gains and biases f32.
+/// checkpoint's `[out, in]` layout (the device format, uploaded as is;
+/// views into the memory-mapped checkpoint unless derived), the norm
+/// gains and biases f32. The mapped files live as long as their views.
 pub struct LlamaWeights {
     /// `[vocab, hidden]`, bf16, row per token id (never scaled).
-    pub embed: Vec<u16>,
+    pub embed: Bf16Slice,
     pub layers: Vec<LayerTensors>,
     pub final_gamma: Vec<f32>,
-    /// `[vocab, hidden]`, bf16 (a copy of the tied embeddings when the
+    /// `[vocab, hidden]`, bf16 (the tied embeddings' own view when the
     /// checkpoint has no head), divided by the config's `logits_scaling`
     /// when it has one.
-    pub lm_head: Vec<u16>,
+    pub lm_head: Bf16Slice,
 }
 
-/// A tensor as bf16 with its shape, converted from f32 or f16 checkpoints
-/// and copied verbatim from bf16 ones.
-fn tensor_bf16(st: &SafeTensors<'_>, name: &str) -> Result<(Vec<u16>, Vec<usize>)> {
-    let view = st
+impl LlamaWeights {
+    /// Every bf16 matrix of the model: the embedding table, the layers'
+    /// projections and the LM head.
+    fn matrices(&self) -> impl Iterator<Item = &Bf16Slice> {
+        let per_layer = self
+            .layers
+            .iter()
+            .flat_map(|l| [&l.wq, &l.wk, &l.wv, &l.wo, &l.wg, &l.wu, &l.wd]);
+        [&self.embed, &self.lm_head].into_iter().chain(per_layer)
+    }
+
+    /// Bytes of bf16 weights viewed in place in the mapped checkpoint
+    /// files and bytes held in owned buffers (converted, scaled or split
+    /// copies; a tied head counts once).
+    #[must_use]
+    pub fn footprint(&self) -> (usize, usize) {
+        let (mut mapped, mut owned) = (0, 0);
+        let mut seen: Vec<*const u16> = Vec::new();
+        for m in self.matrices() {
+            let p = m.as_ptr();
+            if seen.contains(&p) {
+                continue;
+            }
+            seen.push(p);
+            if m.is_mapped() {
+                mapped += m.len() * 2;
+            } else {
+                owned += m.len() * 2;
+            }
+        }
+        (mapped, owned)
+    }
+}
+
+/// One shard: its map (for the in-place bf16 views) and its parsed header.
+#[derive(Clone, Copy)]
+struct Src<'a> {
+    map: &'a Arc<Mmap>,
+    st: &'a SafeTensors<'a>,
+}
+
+/// A tensor as bf16 with its shape: a view into the mapped file for bf16
+/// checkpoints, a conversion for f32 and f16 ones.
+fn tensor_bf16(src: Src<'_>, name: &str) -> Result<(Bf16Slice, Vec<usize>)> {
+    let view = src
+        .st
         .tensor(name)
         .map_err(|e| Error::Other(format!("tensor {name}: {e}")))?;
     let data = view.data();
     let out = match view.dtype() {
-        Dtype::BF16 => data
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect(),
+        Dtype::BF16 => {
+            // `data` is a sub-slice of the map (`SafeTensors` borrows it).
+            let base = src.map.as_ptr() as usize;
+            let offset = data.as_ptr() as usize - base;
+            assert!(
+                offset <= src.map.len() && data.len() <= src.map.len() - offset,
+                "tensor {name}: data outside its shard"
+            );
+            Bf16Slice::mapped(Arc::clone(src.map), offset, data.len() / 2)
+        }
         Dtype::F32 => data
             .chunks_exact(4)
             .map(|b| f32_to_bf16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-            .collect(),
+            .collect::<Vec<u16>>()
+            .into(),
         Dtype::F16 => data
             .chunks_exact(2)
             .map(|b| f32_to_bf16(f16_to_f32(u16::from_le_bytes([b[0], b[1]]))))
-            .collect(),
+            .collect::<Vec<u16>>()
+            .into(),
         other => {
             return Err(Error::Other(format!(
                 "tensor {name}: unsupported dtype {other:?}"
@@ -455,8 +622,9 @@ fn tensor_bf16(st: &SafeTensors<'_>, name: &str) -> Result<(Vec<u16>, Vec<usize>
     Ok((out, view.shape().to_vec()))
 }
 
-fn tensor_f32(st: &SafeTensors<'_>, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-    let view = st
+fn tensor_f32(src: Src<'_>, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+    let view = src
+        .st
         .tensor(name)
         .map_err(|e| Error::Other(format!("tensor {name}: {e}")))?;
     let data = view.data();
@@ -511,11 +679,11 @@ fn f16_to_f32(h: u16) -> f32 {
 /// A 1-D tensor that a checkpoint may omit (attention biases, q/k norm
 /// gains): empty when absent, checked against the accepted lengths when
 /// present.
-fn optional_vec(st: &SafeTensors<'_>, name: &str, lens: &[usize]) -> Result<Vec<f32>> {
-    if st.tensor(name).is_err() {
+fn optional_vec(src: Src<'_>, name: &str, lens: &[usize]) -> Result<Vec<f32>> {
+    if src.st.tensor(name).is_err() {
         return Ok(Vec::new());
     }
-    let (v, shape) = tensor_f32(st, name)?;
+    let (v, shape) = tensor_f32(src, name)?;
     if shape.len() != 1 || !lens.contains(&shape[0]) {
         return Err(Error::Other(format!(
             "tensor {name}: shape {shape:?}, expected one of {lens:?}"
@@ -525,8 +693,8 @@ fn optional_vec(st: &SafeTensors<'_>, name: &str, lens: &[usize]) -> Result<Vec<
 }
 
 /// A `[out, in]` HF linear weight, shape-checked and kept in that layout.
-fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Result<Vec<u16>> {
-    let (v, shape) = tensor_bf16(st, name)?;
+fn linear(src: Src<'_>, name: &str, out_dim: usize, in_dim: usize) -> Result<Bf16Slice> {
+    let (v, shape) = tensor_bf16(src, name)?;
     if shape != [out_dim, in_dim] {
         return Err(Error::Other(format!(
             "tensor {name}: shape {shape:?}, expected [{out_dim}, {in_dim}]"
@@ -535,10 +703,35 @@ fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Re
     Ok(v)
 }
 
+/// Memory-map a checkpoint file read-only. A background thread asks the
+/// kernel to populate the whole mapping at once (`MADV_POPULATE_READ`;
+/// readahead from a cold page cache, page-table entries from a warm one),
+/// so that by the time the weights are copied to the device most of their
+/// pages are already mapped; where the kernel lacks the call the pages
+/// fault in on first touch instead.
+fn map_file(path: &Path) -> Result<Arc<Mmap>> {
+    let name = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let file = std::fs::File::open(path).map_err(|e| Error::Other(format!("{name}: {e}")))?;
+    // SAFETY: the map is read-only and private; a checkpoint file is not
+    // modified while a model is loaded from it (as with any loader that
+    // maps its files, a concurrent writer would corrupt the weights).
+    let map = unsafe { Mmap::map(&file) }.map_err(|e| Error::Other(format!("{name}: {e}")))?;
+    let map = Arc::new(map);
+    let prefault = Arc::clone(&map);
+    // A hint only: the result is ignored, the pages are read either way.
+    std::thread::spawn(move || {
+        let _ = prefault.advise(Advice::PopulateRead);
+    });
+    Ok(map)
+}
+
 /// The checkpoint's safetensors files, one or several (sharded checkpoints
-/// list their tensors in `model.safetensors.index.json`), all loaded.
+/// list their tensors in `model.safetensors.index.json`), all mapped.
 struct Shards {
-    files: Vec<Vec<u8>>,
+    files: Vec<Arc<Mmap>>,
     /// Tensor name to shard index; empty for a single-file checkpoint.
     index: std::collections::HashMap<String, usize>,
 }
@@ -547,10 +740,8 @@ impl Shards {
     fn open(dir: &Path) -> Result<Self> {
         let single = dir.join("model.safetensors");
         if single.exists() {
-            let bytes = std::fs::read(&single)
-                .map_err(|e| Error::Other(format!("model.safetensors: {e}")))?;
             return Ok(Self {
-                files: vec![bytes],
+                files: vec![map_file(&single)?],
                 index: std::collections::HashMap::new(),
             });
         }
@@ -571,9 +762,7 @@ impl Shards {
         names.dedup();
         let mut files = Vec::with_capacity(names.len());
         for name in &names {
-            files.push(
-                std::fs::read(dir.join(name)).map_err(|e| Error::Other(format!("{name}: {e}")))?,
-            );
+            files.push(map_file(&dir.join(name))?);
         }
         let index = map
             .iter()
@@ -585,29 +774,34 @@ impl Shards {
         Ok(Self { files, index })
     }
 
-    /// Parse every shard (borrowing the bytes).
+    /// Parse every shard's header (the tensor data stays in the maps).
     fn parse(&self) -> Result<Vec<SafeTensors<'_>>> {
         self.files
             .iter()
-            .map(|b| {
-                SafeTensors::deserialize(b).map_err(|e| Error::Other(format!("safetensors: {e}")))
+            .map(|m| {
+                SafeTensors::deserialize(m).map_err(|e| Error::Other(format!("safetensors: {e}")))
             })
             .collect()
     }
 
-    /// The parsed shard holding `name` (the only shard when unsharded).
-    fn shard<'a>(&self, parsed: &'a [SafeTensors<'a>], name: &str) -> &'a SafeTensors<'a> {
+    /// The shard holding `name` (the only shard when unsharded).
+    fn shard<'a>(&'a self, parsed: &'a [SafeTensors<'a>], name: &str) -> Src<'a> {
         let i = self.index.get(name).copied().unwrap_or(0);
-        &parsed[i]
+        Src {
+            map: &self.files[i],
+            st: &parsed[i],
+        }
     }
 }
 
 /// Load the checkpoint (`model.safetensors`, or its shards) from a model
-/// directory into engine layout. Granite's `residual_multiplier` is folded
-/// into `o_proj` and `down_proj` and `1/logits_scaling` into the LM head
-/// (scaled bf16 copies: one extra rounding per element, none for
-/// power-of-two scales). Gemma's norm gains get their `1 + w` offset here
-/// (exact in f32).
+/// directory: the files are memory-mapped and every bf16 matrix is a view
+/// of its file (see [`Bf16Slice`]), so the call returns at once and the
+/// weight bytes are first read when they are uploaded. Granite's
+/// `residual_multiplier` is folded into `o_proj` and `down_proj` and
+/// `1/logits_scaling` into the LM head (scaled bf16 copies: one extra
+/// rounding per element, none for power-of-two scales). Gemma's norm
+/// gains get their `1 + w` offset here (exact in f32).
 ///
 /// # Errors
 ///
@@ -650,26 +844,26 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             let n = p(name);
             Ok(plus_one(tensor_f32(st(&n), &n)?.0))
         };
-        let lin = |name: &str, o: usize, inp: usize| -> Result<Vec<u16>> {
+        let lin = |name: &str, o: usize, inp: usize| -> Result<Bf16Slice> {
             let n = p(name);
             linear(st(&n), &n, o, inp)
         };
         // Phi-3 stores q/k/v as one [q + k + v, hidden] matrix and gate/up
         // as one [2 * inter, hidden] matrix; in the [out, in] layout the
-        // parts are contiguous row blocks.
+        // parts are contiguous row blocks (sub-views of the one tensor).
         let has = |name: &str| -> bool {
             let n = p(name);
             shards.index.contains_key(&n)
                 || (shards.index.is_empty() && parsed[0].tensor(&n).is_ok())
         };
-        let split = |name: &str, rows: &[usize], inp: usize| -> Result<Vec<Vec<u16>>> {
+        let split = |name: &str, rows: &[usize], inp: usize| -> Result<Vec<Bf16Slice>> {
             let n = p(name);
             let total: usize = rows.iter().sum();
             let v = linear(st(&n), &n, total, inp)?;
             let mut out = Vec::with_capacity(rows.len());
             let mut at = 0;
             for &r in rows {
-                out.push(v[at * inp..(at + r) * inp].to_vec());
+                out.push(v.sub(at * inp, r * inp));
                 at += r;
             }
             Ok(out)
@@ -732,9 +926,9 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
         };
         // Granite: `x + branch * residual_multiplier` for both branches;
         // the scalar rides on the branches' output projections.
-        let residual = |w: Vec<u16>| -> Vec<u16> {
+        let residual = |w: Bf16Slice| -> Bf16Slice {
             match cfg.residual_multiplier {
-                Some(r) => scale_bf16(&w, r),
+                Some(r) => scale_bf16(&w, r).into(),
                 None => w,
             }
         };
@@ -781,7 +975,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     // Granite: `logits / logits_scaling`, folded into the head's own copy
     // so the embedding table stays as stored.
     let lm_head = match cfg.logits_scaling {
-        Some(s) => scale_bf16(&lm_head, 1.0 / s),
+        Some(s) => scale_bf16(&lm_head, 1.0 / s).into(),
         None => lm_head,
     };
     Ok(LlamaWeights {
@@ -1337,6 +1531,95 @@ mod tests {
         )
         .unwrap();
         assert!(gelu.activation().is_err());
+    }
+
+    /// A hand-built safetensors file: `a` (bf16 [2, 3]) at the 8-aligned
+    /// data start, then one u8 byte, then `c` (bf16 [2]) at an odd offset,
+    /// then `d` (f32 [2]).
+    fn write_checkpoint(path: &Path, a: &[u16], c: &[u16], d: &[f32]) {
+        let mut data = Vec::new();
+        for v in a {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        data.push(7);
+        for v in c {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let d_start = data.len();
+        for v in d {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut header = format!(
+            concat!(
+                "{{\"a\":{{\"dtype\":\"BF16\",\"shape\":[2,3],\"data_offsets\":[0,{a_end}]}},",
+                "\"b\":{{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[{a_end},{c_start}]}},",
+                "\"c\":{{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[{c_start},{c_end}]}},",
+                "\"d\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[{d_start},{d_end}]}}}}"
+            ),
+            a_end = a.len() * 2,
+            c_start = a.len() * 2 + 1,
+            c_end = d_start,
+            d_start = d_start,
+            d_end = data.len(),
+        );
+        while header.len() % 8 != 0 {
+            header.push(' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn mapped_views_sub_views_and_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let a: Vec<u16> = (0..6).map(|i| f32_to_bf16(i as f32 * 0.5)).collect();
+        let c = [f32_to_bf16(-1.0), f32_to_bf16(2.0)];
+        let d = [0.25f32, -8.0];
+        write_checkpoint(&path, &a, &c, &d);
+        let map = map_file(&path).unwrap();
+        let st = SafeTensors::deserialize(&map).unwrap();
+        let src = Src { map: &map, st: &st };
+
+        // An aligned bf16 tensor is a view of the map: same bytes, no copy.
+        let (va, shape) = tensor_bf16(src, "a").unwrap();
+        assert_eq!(shape, [2, 3]);
+        assert!(va.is_mapped());
+        assert_eq!(&va[..], &a[..]);
+        let in_map = map.as_ptr_range();
+        assert!(in_map.contains(&va.as_ptr().cast::<u8>()));
+        // Row blocks of a mapped tensor are views too; of an owned one, copies.
+        let row1 = va.sub(3, 3);
+        assert!(row1.is_mapped());
+        assert_eq!(&row1[..], &a[3..]);
+        assert_eq!(row1.as_ptr(), va[3..].as_ptr());
+        let owned = Bf16Slice::from(a.clone());
+        let part = owned.sub(1, 2);
+        assert!(!part.is_mapped());
+        assert_eq!(&part[..], &a[1..3]);
+        // A clone shares the data (a tied LM head costs nothing).
+        assert_eq!(va.clone().as_ptr(), va.as_ptr());
+        // An odd data offset cannot be viewed as u16: converted copy.
+        let (vc, shape) = tensor_bf16(src, "c").unwrap();
+        assert_eq!(shape, [2]);
+        assert!(!vc.is_mapped());
+        assert_eq!(&vc[..], &c[..]);
+        // f32 tensors are converted (and readable as f32 too).
+        let (vd, _) = tensor_bf16(src, "d").unwrap();
+        assert!(!vd.is_mapped());
+        assert_eq!(&vd[..], &[f32_to_bf16(0.25), f32_to_bf16(-8.0)]);
+        assert_eq!(tensor_f32(src, "d").unwrap().0, d);
+        assert_eq!(tensor_f32(src, "a").unwrap().0[3], 1.5);
+        // The views keep the map alive after the loader's handles go.
+        drop(st);
+        drop(map);
+        assert_eq!(&row1[..], &a[3..]);
+        assert_eq!(
+            format!("{va:?}"),
+            "Bf16Slice::Mapped(6 elements at byte 232)"
+        );
     }
 
     #[test]

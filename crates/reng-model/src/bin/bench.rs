@@ -81,6 +81,7 @@ fn median(v: &mut [f64]) -> f64 {
 }
 
 fn main() -> reng_core::Result<()> {
+    let t_start = Instant::now();
     let a = parse_args()?;
     let dir = Path::new(&a.dir);
     let cfg = LlamaConfig::load(dir)?;
@@ -91,7 +92,15 @@ fn main() -> reng_core::Result<()> {
         .file_name()
         .map_or_else(|| shape.name.clone(), |n| n.to_string_lossy().into_owned());
     let hw = HardwareSpec::gaudi2();
+    let t_load = Instant::now();
     let w = load_weights(dir, &cfg)?;
+    let load_s = t_load.elapsed().as_secs_f64();
+    let (mapped, owned) = w.footprint();
+    println!(
+        "loaded weights in {load_s:.2}s (mapped {:.2} GB, owned {:.2} GB)",
+        mapped as f64 / 1e9,
+        owned as f64 / 1e9
+    );
 
     // A synthetic prompt: the ids only need to be valid, throughput does not
     // depend on their values.
@@ -100,6 +109,14 @@ fn main() -> reng_core::Result<()> {
         .map(|i| (i * 7919 + 13) % vocab)
         .collect();
     let batch = a.batch.max(1);
+    // Seconds from process start to the first token of the first prompt
+    // (the launch cost: load, compile, upload, one prefill).
+    let mut first_token_s: Option<f64> = None;
+    let note_first = |first: &mut Option<f64>| {
+        if first.is_none() {
+            *first = Some(t_start.elapsed().as_secs_f64());
+        }
+    };
 
     let t0 = Instant::now();
     let (prefill_s, decode_s, step_ms) = if batch == 1 {
@@ -118,12 +135,14 @@ fn main() -> reng_core::Result<()> {
         // measure prefill as one fresh sequence.
         for _ in 0..a.warmup {
             g.feed(&prompt)?;
+            note_first(&mut first_token_s);
             g.feed(&prompt[..1])?;
             g.reset();
         }
         let t1 = Instant::now();
         let mut next = g.feed_id(&prompt)?;
         let prefill_s = t1.elapsed().as_secs_f64();
+        note_first(&mut first_token_s);
         // Decode: one token per step, greedy on the engine's own output
         // (argmax on the device).
         let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
@@ -154,6 +173,7 @@ fn main() -> reng_core::Result<()> {
         for _ in 0..a.warmup {
             for b in 0..batch {
                 g.prefill_id(b, &prompt)?;
+                note_first(&mut first_token_s);
             }
             g.step_ids(&next)?;
         }
@@ -161,6 +181,7 @@ fn main() -> reng_core::Result<()> {
         let t1 = Instant::now();
         for (b, n) in next.iter_mut().enumerate() {
             *n = g.prefill_id(b, &prompt)?;
+            note_first(&mut first_token_s);
         }
         let prefill_s = t1.elapsed().as_secs_f64() / batch as f64;
         let mut step_s: Vec<f64> = Vec::with_capacity(a.n_new);
@@ -178,6 +199,10 @@ fn main() -> reng_core::Result<()> {
     };
     let prefill_tps = a.prompt as f64 / prefill_s;
     let decode_tps = (batch * a.n_new) as f64 / decode_s;
+    println!(
+        "first token {:.2}s after start (weights loaded in {load_s:.2}s)",
+        first_token_s.unwrap_or(f64::NAN)
+    );
 
     let ctx = (a.prompt + a.n_new / 2) as u32;
     let c_pre = prefill_ceiling(

@@ -16,8 +16,12 @@ reng-core = { path = "../reng-core", version = "0.0.1" }
 reng-synapse = { path = "../reng-synapse", version = "0.0.1" }
 reng-ceiling = { path = "../reng-ceiling", version = "0.0.1" }
 safetensors = { workspace = true }
+memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [[bin]]
 name = "reng-prefill"

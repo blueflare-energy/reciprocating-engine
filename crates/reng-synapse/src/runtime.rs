@@ -164,6 +164,246 @@ fn launch_info(name: &CString, addr: u64, id: u64, sizes: &[u64]) -> synLaunchTe
     ti
 }
 
+/// The buffers of [`Runtime::fence`]: a device buffer a fresh pattern is
+/// copied into after the uploads, and the pinned host buffers the pattern
+/// goes out from and comes back into. Allocated on first use.
+struct Fence {
+    dev_buf: u64,
+    host_in: *mut c_void,
+    host_out: *mut c_void,
+    /// The last pattern written.
+    seq: u32,
+}
+
+impl Fence {
+    const WORDS: usize = 1024;
+
+    fn none() -> Self {
+        Self {
+            dev_buf: 0,
+            host_in: core::ptr::null_mut(),
+            host_out: core::ptr::null_mut(),
+            seq: 0,
+        }
+    }
+
+    /// Wait until every host-to-device copy enqueued on `stream` so far is
+    /// visible on the device (see [`Runtime::fence`]).
+    fn wait(&mut self, dev: synDeviceId, stream: synStreamHandle) -> Result<()> {
+        const WORDS: usize = Fence::WORDS;
+        if self.dev_buf == 0 {
+            let bytes = (WORDS * 4) as u64;
+            syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut self.dev_buf));
+            syn!(synHostMalloc(dev, bytes, 0, &mut self.host_in));
+            syn!(synHostMalloc(dev, bytes, 0, &mut self.host_out));
+        }
+        self.seq = self.seq.wrapping_add(1);
+        let pattern = self.seq | 0x5A00_0000;
+        // SAFETY: both fence buffers hold WORDS u32 values.
+        unsafe {
+            for j in 0..WORDS {
+                *self.host_in.cast::<u32>().add(j) = pattern;
+            }
+        }
+        syn!(synMemCopyAsync(
+            stream,
+            self.host_in as u64,
+            (WORDS * 4) as u64,
+            self.dev_buf,
+            SYN_HOST_TO_DRAM
+        ));
+        syn!(synStreamSynchronize(stream));
+        let started = Instant::now();
+        loop {
+            // SAFETY: as above.
+            unsafe {
+                for j in 0..WORDS {
+                    *self.host_out.cast::<u32>().add(j) = HOST_SENTINEL_D32;
+                }
+            }
+            syn!(synMemCopyAsync(
+                stream,
+                self.dev_buf,
+                (WORDS * 4) as u64,
+                self.host_out as u64,
+                SYN_DRAM_TO_HOST
+            ));
+            syn!(synStreamSynchronize(stream));
+            let mut pending = true;
+            let mut matched = false;
+            while pending {
+                // SAFETY: as above; the DMA writes each word exactly once.
+                let (p, m) = unsafe {
+                    let q = self.host_out.cast::<u32>();
+                    let mut p = false;
+                    let mut m = true;
+                    for j in 0..WORDS {
+                        let v = core::ptr::read_volatile(q.add(j));
+                        if v == HOST_SENTINEL_D32 {
+                            p = true;
+                        } else if v != pattern {
+                            m = false;
+                        }
+                    }
+                    (p, m)
+                };
+                pending = p;
+                matched = m;
+                if pending && started.elapsed() > READBACK_TIMEOUT {
+                    return Err(Error::Other(format!(
+                        "fence: copy did not land within {READBACK_TIMEOUT:?}"
+                    )));
+                }
+                std::hint::spin_loop();
+            }
+            if matched {
+                return Ok(());
+            }
+            if started.elapsed() > READBACK_TIMEOUT {
+                return Err(Error::Other(format!(
+                    "fence: uploads never became visible within {READBACK_TIMEOUT:?}"
+                )));
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    /// Release the buffers.
+    ///
+    /// # Safety
+    ///
+    /// No copy may be in flight on them.
+    unsafe fn free(&mut self, dev: synDeviceId) {
+        if self.dev_buf != 0 {
+            // SAFETY: allocated by `wait`, used by no pending copy.
+            unsafe {
+                synHostFree(dev, self.host_in, 0);
+                synHostFree(dev, self.host_out, 0);
+                synDeviceFree(dev, self.dev_buf, 0);
+            }
+            self.dev_buf = 0;
+        }
+    }
+}
+
+/// A ring of pinned host buffers the construction-time uploads are staged
+/// through: each input is copied into the next slot (in slot-sized pieces
+/// when larger) and DMA'd from there; reusing a slot first waits, through
+/// the fence, for every copy issued so far to land. Bounds the pinned
+/// memory of an upload to a few hundred megabytes whatever the model size,
+/// and replaces one pinned allocation per tensor with a handful.
+struct Staging {
+    slots: Vec<*mut c_void>,
+    slot_bytes: usize,
+    /// The next slot to use; equal to the slot count when the ring is full.
+    next: usize,
+}
+
+impl Staging {
+    /// Slot size cap and slot count cap: at most 1 GiB pinned.
+    const SLOT_BYTES: usize = 256 << 20;
+    const SLOTS: usize = 4;
+
+    /// A ring for `total` bytes of inputs the largest of which has `largest`
+    /// bytes (no ring when there is nothing to upload).
+    fn new(dev: synDeviceId, total: usize, largest: usize) -> Result<Self> {
+        let slot_bytes = largest.clamp(1, Self::SLOT_BYTES);
+        let n = if total == 0 {
+            0
+        } else {
+            total.div_ceil(slot_bytes).min(Self::SLOTS)
+        };
+        let mut slots = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut hb: *mut c_void = core::ptr::null_mut();
+            syn!(synHostMalloc(dev, slot_bytes as u64, 0, &mut hb));
+            slots.push(hb);
+        }
+        Ok(Self {
+            slots,
+            slot_bytes,
+            next: 0,
+        })
+    }
+
+    /// Copy `src` to device address `dst` through the ring.
+    fn upload(
+        &mut self,
+        dev: synDeviceId,
+        stream: synStreamHandle,
+        fence: &mut Fence,
+        src: &[u8],
+        dst: u64,
+    ) -> Result<()> {
+        for (i, piece) in src.chunks(self.slot_bytes).enumerate() {
+            if self.next == self.slots.len() {
+                fence.wait(dev, stream)?;
+                self.next = 0;
+            }
+            let hb = self.slots[self.next];
+            self.next += 1;
+            // SAFETY: the slot holds `slot_bytes` bytes and no copy reads it
+            // (every copy issued before the last fence has landed).
+            unsafe { copy_parallel(piece, hb.cast::<u8>()) };
+            syn!(synMemCopyAsync(
+                stream,
+                hb as u64,
+                piece.len() as u64,
+                dst + (i * self.slot_bytes) as u64,
+                SYN_HOST_TO_DRAM
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release the slots.
+    ///
+    /// # Safety
+    ///
+    /// No copy may be in flight from them.
+    unsafe fn free(&mut self, dev: synDeviceId) {
+        for hb in self.slots.drain(..) {
+            // SAFETY: allocated by `new`, used by no pending copy.
+            unsafe { synHostFree(dev, hb, 0) };
+        }
+    }
+}
+
+/// `memcpy` of `src` to `dst`, split over up to eight threads for sources
+/// of more than a few MB (one core moves a few GB/s, less when the source
+/// is a mapped file whose pages fault in; a model is tens of GB).
+///
+/// # Safety
+///
+/// `dst` must be valid for `src.len()` bytes of writes and not overlap `src`.
+unsafe fn copy_parallel(src: &[u8], dst: *mut u8) {
+    const PER_THREAD: usize = 8 << 20;
+    const THREADS: usize = 8;
+    let threads = (src.len() / PER_THREAD).clamp(1, THREADS);
+    if threads == 1 {
+        // SAFETY: the caller's contract.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+        return;
+    }
+    let chunk = src.len().div_ceil(threads);
+    let dst = dst as usize;
+    std::thread::scope(|s| {
+        for (i, part) in src.chunks(chunk).enumerate() {
+            s.spawn(move || {
+                // SAFETY: the parts are disjoint ranges of the caller's
+                // destination, offset like the source chunks.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        part.as_ptr(),
+                        (dst + i * chunk) as *mut u8,
+                        part.len(),
+                    );
+                }
+            });
+        }
+    });
+}
+
 /// A compiled recipe bound to device buffers for all of its persistent
 /// tensors. Inputs are uploaded once at construction; [`Runtime::upload`]
 /// replaces one input's contents between launches, and
@@ -183,21 +423,22 @@ pub(crate) struct Runtime<'a> {
     shapes: HashMap<String, Vec<u64>>,
     /// Whether this runtime acquired the device (else it borrows a parent's).
     owns_device: bool,
-    /// Pinned host staging buffer per uploaded input, by input index (null
-    /// for inputs bound to a parent's buffer).
+    /// Pinned host buffer per input for the per-step re-uploads
+    /// ([`Runtime::upload`] and friends), allocated on first use; the
+    /// construction-time upload goes through a small staging ring instead,
+    /// so the weights never hold pinned memory.
     host_bufs: Vec<*mut c_void>,
+    /// Whether each input has its own device buffer (else it is bound to
+    /// the parent's and cannot be re-uploaded here).
+    own_input: Vec<bool>,
     /// Device buffer per persistent tensor, by input then scratch index.
     dev_bufs: Vec<u64>,
     /// The device buffers this runtime allocated (freed on drop).
     owned: Vec<u64>,
     d_out: u64,
     h_out: *mut c_void,
-    /// The small fence buffer of [`Runtime::fence`] (device, host in, host
-    /// out) and the last pattern written to it.
-    fence_dev: u64,
-    fence_in: *mut c_void,
-    fence_out: *mut c_void,
-    fence_seq: u32,
+    /// The buffers of [`Runtime::fence`].
+    fence: Fence,
     /// Pinned buffer for [`Runtime::read_bf16_range`], grown on demand.
     h_aux: *mut c_void,
     aux_bytes: u64,
@@ -248,6 +489,7 @@ impl<'a> Runtime<'a> {
                 (dev, stream)
             }
         };
+        let t_device = t0.elapsed() - t_compile;
         // A tensor is shared with the parent when it has the same name AND
         // the same element count (a weight may be declared 4-D in one graph
         // and 5-D with a trailing 1 in another; the per-step inputs of a
@@ -265,53 +507,71 @@ impl<'a> Runtime<'a> {
         let n_scratch = gb.scratch_names.len();
         let mut dev_bufs: Vec<u64> = Vec::with_capacity(n_in + n_scratch);
         let mut owned: Vec<u64> = Vec::with_capacity(n_in + n_scratch);
-        let mut host_bufs: Vec<*mut c_void> = Vec::with_capacity(n_in);
+        let mut own_input: Vec<bool> = Vec::with_capacity(n_in);
         let mut infos: Vec<synLaunchTensorInfo> = Vec::with_capacity(n_in + n_scratch + 1);
         let mut addrs = HashMap::with_capacity(n_in + n_scratch + 1);
         let mut info_index = HashMap::with_capacity(n_in + n_scratch + 1);
         let mut shapes = HashMap::with_capacity(n_in + n_scratch + 1);
-        for (idx, data) in gb.data.iter().enumerate() {
-            let raw = gb.raw[idx].as_deref();
-            let bytes = raw.map_or((data.len() * 2) as u64, |r| r.len() as u64);
-            let mut hb: *mut c_void = core::ptr::null_mut();
-            let d = if let Some(d) = shared(&gb.names[idx], &gb.sizes[idx]) {
-                d
-            } else {
-                let mut d = 0u64;
-                syn!(synDeviceMalloc(dev, bytes, 0, 0, &mut d));
-                owned.push(d);
-                syn!(synHostMalloc(dev, bytes, 0, &mut hb));
-                // SAFETY: hb holds `bytes` bytes: the raw bytes, or
-                // data.len() bf16 elements.
-                unsafe {
-                    if let Some(r) = raw {
-                        core::ptr::copy_nonoverlapping(r.as_ptr(), hb.cast::<u8>(), r.len());
-                    } else {
-                        core::ptr::copy_nonoverlapping(data.as_ptr(), hb.cast::<u16>(), data.len());
+        // The bytes of input `idx` as the device wants them: the raw bytes,
+        // or the bf16 elements as is.
+        let input_bytes = |idx: usize| -> &[u8] {
+            match gb.raw[idx].as_deref() {
+                Some(r) => r,
+                None => {
+                    let data: &[u16] = &gb.data[idx];
+                    // SAFETY: a u16 slice is readable as twice as many bytes.
+                    unsafe {
+                        core::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 2)
                     }
                 }
-                syn!(synMemCopyAsync(
-                    stream,
-                    hb as u64,
-                    bytes,
-                    d,
-                    SYN_HOST_TO_DRAM
-                ));
+            }
+        };
+        // Every input with its own device buffer goes through a ring of a
+        // few pinned staging buffers sized for the largest of them, so the
+        // pinned memory of an upload stays bounded whatever the model size.
+        let (mut total, mut largest) = (0usize, 0usize);
+        for idx in 0..n_in {
+            if shared(&gb.names[idx], &gb.sizes[idx]).is_none() {
+                let n = input_bytes(idx).len();
+                total += n;
+                largest = largest.max(n);
+            }
+        }
+        let mut staging = Staging::new(dev, total, largest)?;
+        let mut fence = Fence::none();
+        for (idx, &id) in ids.iter().take(n_in).enumerate() {
+            let d = if let Some(d) = shared(&gb.names[idx], &gb.sizes[idx]) {
+                own_input.push(false);
+                d
+            } else {
+                let src = input_bytes(idx);
+                let mut d = 0u64;
+                syn!(synDeviceMalloc(dev, src.len() as u64, 0, 0, &mut d));
+                owned.push(d);
+                staging.upload(dev, stream, &mut fence, src, d)?;
+                own_input.push(true);
                 d
             };
             info_index.insert(gb.names[idx].to_str().unwrap().to_owned(), infos.len());
-            infos.push(launch_info(&gb.names[idx], d, ids[idx], &gb.sizes[idx]));
+            infos.push(launch_info(&gb.names[idx], d, id, &gb.sizes[idx]));
             addrs.insert(gb.names[idx].to_str().unwrap().to_owned(), d);
             shapes.insert(
                 gb.names[idx].to_str().unwrap().to_owned(),
                 gb.sizes[idx].clone(),
             );
             dev_bufs.push(d);
-            host_bufs.push(hb);
         }
-        // The f32 host copies of the inputs (the weights, mostly) are not
-        // needed once they are in the pinned staging buffers or bound to a
-        // parent: uploads are validated against the tensor sizes.
+        // Every staged copy must have landed before its slot is freed (the
+        // stream sync alone does not guarantee that on this stack).
+        if total > 0 {
+            fence.wait(dev, stream)?;
+        }
+        // SAFETY: no copy reads the ring any more.
+        unsafe { staging.free(dev) };
+        let host_bufs: Vec<*mut c_void> = vec![core::ptr::null_mut(); n_in];
+        // The host copies of the inputs (the weights, mostly) are not needed
+        // once they are on the device or bound to a parent: uploads are
+        // validated against the tensor sizes.
         for d in &mut gb.data {
             *d = std::borrow::Cow::Owned(Vec::new());
         }
@@ -372,11 +632,12 @@ impl<'a> Runtime<'a> {
         syn!(synStreamSynchronize(stream));
         if trace {
             eprintln!(
-                "runtime: compile {:.2} s, buffers + uploads {:.2} s ({} inputs, {} shared)",
+                "runtime: compile {:.2} s, device {:.2} s, buffers + uploads {:.2} s ({} inputs, {} shared)",
                 t_compile.as_secs_f64(),
-                (t0.elapsed() - t_compile).as_secs_f64(),
+                t_device.as_secs_f64(),
+                (t0.elapsed() - t_compile - t_device).as_secs_f64(),
                 n_in,
-                host_bufs.iter().filter(|h| h.is_null()).count()
+                own_input.iter().filter(|o| !**o).count()
             );
         }
         Ok(Self {
@@ -390,14 +651,12 @@ impl<'a> Runtime<'a> {
             addrs,
             shapes,
             host_bufs,
+            own_input,
             dev_bufs,
             owned,
             d_out,
             h_out,
-            fence_dev: 0,
-            fence_in: core::ptr::null_mut(),
-            fence_out: core::ptr::null_mut(),
-            fence_seq: 0,
+            fence,
             h_aux: core::ptr::null_mut(),
             aux_bytes: 0,
             out,
@@ -453,12 +712,33 @@ impl<'a> Runtime<'a> {
         self.fence()
     }
 
+    /// The pinned host buffer of `bytes` bytes input `idx` is re-uploaded
+    /// from, allocated on the first call.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input is bound to a parent's buffer.
+    fn host_buf(&mut self, idx: usize, bytes: usize) -> Result<*mut c_void> {
+        assert!(
+            self.own_input[idx],
+            "input {idx} is bound to a shared buffer"
+        );
+        if self.host_bufs[idx].is_null() {
+            syn!(synHostMalloc(
+                self.dev,
+                bytes as u64,
+                0,
+                &mut self.host_bufs[idx]
+            ));
+        }
+        Ok(self.host_bufs[idx])
+    }
+
     /// Replace input `idx`'s contents (bf16-converted, `data.len()` must equal
     /// the input's element count) ahead of the next launch.
     pub fn upload(&mut self, idx: usize, data: &[f32]) -> Result<()> {
         assert_eq!(data.len(), self.input_elems(idx));
-        let hb = self.host_bufs[idx];
-        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
+        let hb = self.host_buf(idx, data.len() * 2)?;
         // SAFETY: hb holds data.len() bf16 elements.
         unsafe {
             let pb = hb.cast::<u16>();
@@ -480,8 +760,7 @@ impl<'a> Runtime<'a> {
     pub fn upload_raw(&mut self, idx: usize, bytes: &[u8]) -> Result<()> {
         let expect = self.gb.raw[idx].as_ref().map_or(0, Vec::len);
         assert_eq!(bytes.len(), expect, "raw input {idx} size");
-        let hb = self.host_bufs[idx];
-        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
+        let hb = self.host_buf(idx, expect)?;
         // SAFETY: hb holds `expect` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), hb.cast::<u8>(), bytes.len());
@@ -500,8 +779,7 @@ impl<'a> Runtime<'a> {
     /// (for the large mask patterns that need no conversion).
     pub fn upload_bf16(&mut self, idx: usize, data: &[u16]) -> Result<()> {
         assert_eq!(data.len(), self.input_elems(idx));
-        let hb = self.host_bufs[idx];
-        assert!(!hb.is_null(), "input {idx} is bound to a shared buffer");
+        let hb = self.host_buf(idx, data.len() * 2)?;
         // SAFETY: hb holds data.len() bf16 elements.
         unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), hb.cast::<u16>(), data.len());
@@ -528,83 +806,8 @@ impl<'a> Runtime<'a> {
     ///
     /// Returns an error if the pattern never appears.
     pub fn fence(&mut self) -> Result<()> {
-        const WORDS: usize = 1024;
-        if self.fence_dev == 0 {
-            let bytes = (WORDS * 4) as u64;
-            syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut self.fence_dev));
-            syn!(synHostMalloc(self.dev, bytes, 0, &mut self.fence_in));
-            syn!(synHostMalloc(self.dev, bytes, 0, &mut self.fence_out));
-            self.owned.push(self.fence_dev);
-        }
-        self.fence_seq = self.fence_seq.wrapping_add(1);
-        let pattern = self.fence_seq | 0x5A00_0000;
-        // SAFETY: both fence buffers hold WORDS u32 values.
-        unsafe {
-            for j in 0..WORDS {
-                *self.fence_in.cast::<u32>().add(j) = pattern;
-            }
-        }
-        syn!(synMemCopyAsync(
-            self.stream,
-            self.fence_in as u64,
-            (WORDS * 4) as u64,
-            self.fence_dev,
-            SYN_HOST_TO_DRAM
-        ));
-        syn!(synStreamSynchronize(self.stream));
-        let started = Instant::now();
-        loop {
-            // SAFETY: as above.
-            unsafe {
-                for j in 0..WORDS {
-                    *self.fence_out.cast::<u32>().add(j) = HOST_SENTINEL_D32;
-                }
-            }
-            syn!(synMemCopyAsync(
-                self.stream,
-                self.fence_dev,
-                (WORDS * 4) as u64,
-                self.fence_out as u64,
-                SYN_DRAM_TO_HOST
-            ));
-            syn!(synStreamSynchronize(self.stream));
-            let mut pending = true;
-            let mut matched = false;
-            while pending {
-                // SAFETY: as above; the DMA writes each word exactly once.
-                let (p, m) = unsafe {
-                    let q = self.fence_out.cast::<u32>();
-                    let mut p = false;
-                    let mut m = true;
-                    for j in 0..WORDS {
-                        let v = core::ptr::read_volatile(q.add(j));
-                        if v == HOST_SENTINEL_D32 {
-                            p = true;
-                        } else if v != pattern {
-                            m = false;
-                        }
-                    }
-                    (p, m)
-                };
-                pending = p;
-                matched = m;
-                if pending && started.elapsed() > READBACK_TIMEOUT {
-                    return Err(Error::Other(format!(
-                        "fence: copy did not land within {READBACK_TIMEOUT:?}"
-                    )));
-                }
-                std::hint::spin_loop();
-            }
-            if matched {
-                return Ok(());
-            }
-            if started.elapsed() > READBACK_TIMEOUT {
-                return Err(Error::Other(format!(
-                    "fence: uploads never became visible within {READBACK_TIMEOUT:?}"
-                )));
-            }
-            std::thread::sleep(Duration::from_micros(50));
-        }
+        let (dev, stream) = (self.dev, self.stream);
+        self.fence.wait(dev, stream)
     }
 
     /// Index of the input named `name`.
@@ -1051,10 +1254,7 @@ impl Drop for Runtime<'_> {
                 }
             }
             synHostFree(self.dev, self.h_out, 0);
-            if !self.fence_in.is_null() {
-                synHostFree(self.dev, self.fence_in, 0);
-                synHostFree(self.dev, self.fence_out, 0);
-            }
+            self.fence.free(self.dev);
             if !self.h_aux.is_null() {
                 synHostFree(self.dev, self.h_aux, 0);
             }

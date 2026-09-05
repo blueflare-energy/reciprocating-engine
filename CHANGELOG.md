@@ -126,6 +126,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transposed B operands), and the upload is a memcpy into the pinned
   staging buffer. Half the host memory and most of the launch time of a
   model go away.
+- Zero-copy loading: the safetensors files are memory-mapped and every
+  bf16 matrix is a `Bf16Slice` view of its file (a sub-view for the
+  Phi-3 row-block splits, a shared view for a tied LM head); only
+  converted (f32/f16 checkpoints), scaled (Granite) or unaligned tensors
+  are copied. A background thread prefaults each map. The runtime
+  uploads through a ring of at most four 256 MiB pinned buffers, each
+  reuse fenced, instead of one pinned buffer per tensor kept for the
+  model's lifetime (per-step inputs get theirs on first re-upload), with
+  the copies into the ring split over threads. `reng-bench` and
+  `reng-generate` print the load time and the time to the first token;
+  `RENG_RECIPE_TRACE` shows the device acquire time separately.
+  DeepSeek-R1-Distill-Llama-8B (16 GB): weights loaded in 13.6 s before
+  and 0.8 s after, first token 24-26 s after start before and 7.2 s
+  after, peak resident set 32-33 GB before and 18.8 GB after (of which
+  15.4 GB are the mapped file pages, reclaimable by the kernel); results
+  bit-identical.
 - Compiled recipes are cached on disk (`$HOME/.cache/reng/recipes`, or
   `RENG_RECIPE_CACHE`; `0` disables) keyed by a digest of the graph
   structure, the SynapseAI version and the compiler's environment knobs,
