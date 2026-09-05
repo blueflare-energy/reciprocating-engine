@@ -3,7 +3,7 @@
 //! time, then advanced together for several steps; every sequence's step
 //! logits must match the CPU reference over that sequence alone.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps]`
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps] [batch]`
 
 use reng_synapse::{BatchedModel, LayerWeights, ModelWeights, model_forward_cpu};
 use std::time::Instant;
@@ -61,9 +61,12 @@ fn main() -> reng_core::Result<()> {
     let (vocab, n_layers, n_kv_heads) = (arg(5, 512usize), arg(6, 2usize), arg(7, 2usize));
     let capacity = arg(8, 512usize);
     let steps = arg(9, 6usize);
-    // Prompt lengths: one launch, two launches, exactly one full block.
-    let prompts = [40usize, rows + 44, rows];
-    let batch = prompts.len();
+    // Prompt lengths: one launch, two launches, exactly one full block;
+    // repeated cyclically up to `batch` sequences (10th arg, default 3).
+    let batch = arg(10, 3usize);
+    let prompts: Vec<usize> = (0..batch)
+        .map(|b| [40usize, rows + 44, rows][b % 3])
+        .collect();
     let longest = prompts.iter().max().copied().unwrap() + steps;
     assert!(
         longest <= capacity,
