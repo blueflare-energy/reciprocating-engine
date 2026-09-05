@@ -11,119 +11,119 @@
     "SmolLM2-135M": {
       "1": {
         "ok": true,
-        "tok_s": 780.9,
-        "step_ms": 1.28,
-        "pct": 8.68
+        "tok_s": 805.3,
+        "step_ms": 1.24,
+        "pct": 8.95
       },
       "8": {
         "ok": true,
-        "tok_s": 6782.5,
-        "step_ms": 1.18,
-        "pct": 10.23
+        "tok_s": 5746.0,
+        "step_ms": 1.19,
+        "pct": 8.66
       },
       "64": {
         "ok": true,
-        "tok_s": 39170.7,
+        "tok_s": 39237.0,
         "step_ms": 1.63,
-        "pct": 12.02
+        "pct": 12.04
       }
     },
     "SmolLM2-360M": {
       "1": {
         "ok": true,
-        "tok_s": 598.9,
-        "step_ms": 1.67,
-        "pct": 17.83
+        "tok_s": 579.5,
+        "step_ms": 1.72,
+        "pct": 17.25
       },
       "8": {
         "ok": true,
-        "tok_s": 5431.8,
-        "step_ms": 1.47,
-        "pct": 21.36
+        "tok_s": 5387.4,
+        "step_ms": 1.49,
+        "pct": 21.18
       },
       "64": {
         "ok": true,
-        "tok_s": 30205.9,
-        "step_ms": 2.11,
-        "pct": 21.21
+        "tok_s": 29962.6,
+        "step_ms": 2.14,
+        "pct": 21.04
       }
     },
     "Qwen2.5-0.5B": {
       "1": {
         "ok": true,
-        "tok_s": 749.8,
-        "step_ms": 1.33,
-        "pct": 30.29
+        "tok_s": 735.6,
+        "step_ms": 1.36,
+        "pct": 29.71
       },
       "8": {
         "ok": true,
-        "tok_s": 5722.3,
-        "step_ms": 1.41,
-        "pct": 29.26
+        "tok_s": 5783.9,
+        "step_ms": 1.38,
+        "pct": 29.57
       },
       "64": {
         "ok": true,
-        "tok_s": 36982.4,
-        "step_ms": 1.73,
-        "pct": 25.97
+        "tok_s": 36028.6,
+        "step_ms": 1.78,
+        "pct": 25.3
       }
     },
     "SmolLM2-1.7B": {
       "1": {
         "ok": true,
-        "tok_s": 385.3,
+        "tok_s": 386.2,
         "step_ms": 2.59,
-        "pct": 54.27
+        "pct": 54.39
       },
       "8": {
         "ok": true,
-        "tok_s": 3048.7,
-        "step_ms": 2.63,
-        "pct": 56.76
+        "tok_s": 3081.0,
+        "step_ms": 2.6,
+        "pct": 57.36
       },
       "64": {
         "ok": true,
-        "tok_s": 13971.2,
-        "step_ms": 4.58,
-        "pct": 46.64
+        "tok_s": 13986.6,
+        "step_ms": 4.57,
+        "pct": 46.69
       }
     },
     "Qwen2.5-1.5B": {
       "1": {
         "ok": true,
-        "tok_s": 398.4,
-        "step_ms": 2.51,
-        "pct": 50.27
+        "tok_s": 395.3,
+        "step_ms": 2.47,
+        "pct": 49.87
       },
       "8": {
         "ok": true,
-        "tok_s": 3175.4,
-        "step_ms": 2.52,
-        "pct": 50.55
+        "tok_s": 3088.7,
+        "step_ms": 2.6,
+        "pct": 49.17
       },
       "64": {
         "ok": true,
-        "tok_s": 20204.6,
-        "step_ms": 3.16,
-        "pct": 43.18
+        "tok_s": 19784.2,
+        "step_ms": 3.23,
+        "pct": 42.29
       }
     },
     "Qwen2.5-3B": {
       "1": {
         "ok": true,
-        "tok_s": 245.3,
-        "step_ms": 4.07,
-        "pct": 61.85
+        "tok_s": 245.1,
+        "step_ms": 4.08,
+        "pct": 61.79
       },
       "8": {
         "ok": true,
-        "tok_s": 1931.5,
-        "step_ms": 4.11,
-        "pct": 61.23
+        "tok_s": 1947.3,
+        "step_ms": 4.09,
+        "pct": 61.74
       },
       "64": {
         "ok": true,
-        "tok_s": 12903.0,
+        "tok_s": 12902.4,
         "step_ms": 4.96,
         "pct": 53.58
       }
