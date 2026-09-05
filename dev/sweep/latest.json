@@ -11,141 +11,141 @@
     "SmolLM2-135M": {
       "1": {
         "ok": true,
-        "tok_s": 806.4,
-        "step_ms": 1.24,
-        "pct": 8.96
+        "tok_s": 794.8,
+        "step_ms": 1.26,
+        "pct": 8.83
       },
       "8": {
         "ok": true,
-        "tok_s": 6767.8,
-        "step_ms": 1.18,
-        "pct": 10.2
+        "tok_s": 6849.1,
+        "step_ms": 1.17,
+        "pct": 10.33
       },
       "64": {
         "ok": true,
-        "tok_s": 40204.1,
-        "step_ms": 1.59,
-        "pct": 12.34
+        "tok_s": 39728.9,
+        "step_ms": 1.61,
+        "pct": 12.19
       }
     },
     "SmolLM2-360M": {
       "1": {
         "ok": true,
-        "tok_s": 613.9,
+        "tok_s": 614.3,
         "step_ms": 1.63,
-        "pct": 18.28
+        "pct": 18.29
       },
       "8": {
         "ok": true,
-        "tok_s": 5462.7,
-        "step_ms": 1.46,
-        "pct": 21.48
+        "tok_s": 5395.8,
+        "step_ms": 1.48,
+        "pct": 21.22
       },
       "64": {
         "ok": true,
-        "tok_s": 30605.1,
-        "step_ms": 2.09,
-        "pct": 21.49
+        "tok_s": 30459.7,
+        "step_ms": 2.1,
+        "pct": 21.39
       }
     },
     "Qwen2.5-0.5B": {
       "1": {
         "ok": true,
-        "tok_s": 752.5,
-        "step_ms": 1.33,
-        "pct": 30.4
+        "tok_s": 666.8,
+        "step_ms": 1.49,
+        "pct": 26.94
       },
       "8": {
         "ok": true,
-        "tok_s": 5809.0,
-        "step_ms": 1.38,
-        "pct": 29.7
+        "tok_s": 5849.8,
+        "step_ms": 1.37,
+        "pct": 29.91
       },
       "64": {
         "ok": true,
-        "tok_s": 35934.9,
-        "step_ms": 1.79,
-        "pct": 25.24
+        "tok_s": 36829.6,
+        "step_ms": 1.74,
+        "pct": 25.86
       }
     },
     "SmolLM2-1.7B": {
       "1": {
         "ok": true,
-        "tok_s": 386.2,
-        "step_ms": 2.59,
-        "pct": 54.4
+        "tok_s": 388.7,
+        "step_ms": 2.57,
+        "pct": 54.75
       },
       "8": {
         "ok": true,
-        "tok_s": 3085.1,
-        "step_ms": 2.59,
-        "pct": 57.44
+        "tok_s": 3079.4,
+        "step_ms": 2.6,
+        "pct": 57.33
       },
       "64": {
         "ok": true,
-        "tok_s": 13973.9,
-        "step_ms": 4.58,
-        "pct": 46.65
+        "tok_s": 14013.1,
+        "step_ms": 4.57,
+        "pct": 46.78
       }
     },
     "Qwen2.5-1.5B": {
       "1": {
         "ok": true,
-        "tok_s": 405.2,
-        "step_ms": 2.47,
-        "pct": 51.13
+        "tok_s": 405.8,
+        "step_ms": 2.46,
+        "pct": 51.21
       },
       "8": {
         "ok": true,
-        "tok_s": 3170.4,
-        "step_ms": 2.52,
-        "pct": 50.47
+        "tok_s": 3165.0,
+        "step_ms": 2.53,
+        "pct": 50.38
       },
       "64": {
         "ok": true,
-        "tok_s": 20329.7,
-        "step_ms": 3.15,
-        "pct": 43.45
+        "tok_s": 20133.6,
+        "step_ms": 3.18,
+        "pct": 43.03
       }
     },
     "Qwen2.5-3B": {
       "1": {
         "ok": true,
-        "tok_s": 244.4,
-        "step_ms": 4.1,
-        "pct": 61.61
+        "tok_s": 247.7,
+        "step_ms": 4.03,
+        "pct": 62.44
       },
       "8": {
         "ok": true,
-        "tok_s": 1958.9,
+        "tok_s": 1961.5,
         "step_ms": 4.08,
-        "pct": 62.1
+        "pct": 62.19
       },
       "64": {
         "ok": true,
-        "tok_s": 12862.5,
-        "step_ms": 4.97,
-        "pct": 53.41
+        "tok_s": 12914.8,
+        "step_ms": 4.95,
+        "pct": 53.63
       }
     },
     "TinyLlama-1.1B": {
       "1": {
         "ok": true,
-        "tok_s": 545.0,
-        "step_ms": 1.83,
-        "pct": 46.09
+        "tok_s": 560.9,
+        "step_ms": 1.78,
+        "pct": 47.44
       },
       "8": {
         "ok": true,
-        "tok_s": 4502.4,
-        "step_ms": 1.78,
-        "pct": 48.12
+        "tok_s": 4530.5,
+        "step_ms": 1.76,
+        "pct": 48.42
       },
       "64": {
         "ok": true,
-        "tok_s": 27133.4,
-        "step_ms": 2.35,
-        "pct": 39.39
+        "tok_s": 27860.1,
+        "step_ms": 2.3,
+        "pct": 40.45
       }
     }
   }
