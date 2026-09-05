@@ -37,7 +37,7 @@ fn parse_args() -> reng_core::Result<Args> {
         prompt: 128,
         n_new: 64,
         rows: 256,
-        decode_rows: 16,
+        decode_rows: 1,
         capacity: 1024,
         warmup: 4,
     };

@@ -22,7 +22,7 @@ use std::time::Instant;
 
 const DEFAULT_MARGIN: f32 = 0.5;
 const DEFAULT_ROWS: usize = 256;
-const DEFAULT_DECODE_ROWS: usize = 16;
+const DEFAULT_DECODE_ROWS: usize = 1;
 const DEFAULT_CAPACITY: usize = 1024;
 
 #[derive(serde::Deserialize)]

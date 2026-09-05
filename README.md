@@ -59,10 +59,10 @@ INDEX  PCI              STEPPING
 ```
 
 Generation compiles two recipes over the same weights and cache: a wide one
-for prompt blocks and a narrow one for decode steps. SmolLM2-135M at batch 1
-decodes at about 400 tok/s (2.5 ms per step, 4% of the HBM roofline); the
-step is dominated by per-node overhead across the 30-layer recipe, which is
-where the performance work against the ceiling starts.
+for prompt blocks and a one-row one for decode steps. SmolLM2-135M at batch 1
+decodes at about 730 tok/s (1.3 ms per step, 8% of the HBM roofline); the
+step is dominated by per-node dispatch across the 30-layer recipe, which is
+where the performance work against the ceiling continues.
 
 ## Layout
 
