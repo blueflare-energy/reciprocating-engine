@@ -4,7 +4,7 @@
 //! it goes into a model graph; every `reng-*-test` for a new guid uses it.
 
 use crate::ffi::SYN_TYPE_BF16;
-use crate::model::{Gb, make_tensor};
+use crate::model::Gb;
 use crate::runtime::{Out, OutKind, Runtime};
 use core::ffi::c_void;
 use reng_core::Result;
@@ -136,7 +136,7 @@ fn build_probe(
             tensors.push(gb.input(i.name, i.sizes, i.data)?);
         }
     }
-    let (t_out, n_out) = make_tensor(gb.graph, "OUT", out_sizes, out_dtype, true)?;
+    let (t_out, n_out) = gb.output("OUT", out_sizes, out_dtype)?;
     gb.node(guid, "probe", &tensors, &[t_out], params, params_size)?;
     let out = Out {
         name: n_out,

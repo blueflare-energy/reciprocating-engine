@@ -46,6 +46,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the natural weights (shared with the batched decode recipe) plus a
   transpose into the head layout instead of per-head batch_gemms, which
   the MME runs at N = head_dim.
+- Compiled recipes are cached on disk (`$HOME/.cache/reng/recipes`, or
+  `RENG_RECIPE_CACHE`; `0` disables) keyed by a digest of the graph
+  structure, the SynapseAI version and the compiler's environment knobs,
+  so a graph of a known shape loads instead of compiling.
 - The `bench` workflow runs the cache and batch tests and teacher-forced
   generation against the runner's HF references before recording numbers.
 - `reng-attn-bench` and `reng-scatter-bench` time attention gemm

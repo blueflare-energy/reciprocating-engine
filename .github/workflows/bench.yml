@@ -30,11 +30,19 @@ jobs:
   bench:
     name: gaudi2 throughput
     runs-on: [self-hosted, gaudi2]
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      # A cancelled job can leave its engine process holding the card.
+      - name: clean up
+        run: |
+          for pid in $(pgrep -u "$(id -u)" -f "[t]arget/release/reng-"); do
+            echo "killing leftover engine process $pid"
+            kill -9 "$pid" || true
+          done
+          sleep 2
       - name: build
         run: |
           cargo build --release --locked -p reng-model --features link-synapse --bin reng-bench --bin reng-generate

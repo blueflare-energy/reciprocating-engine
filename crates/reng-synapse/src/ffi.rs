@@ -146,6 +146,16 @@ unsafe extern "C" {
     pub fn synGraphCreate(pGraphHandle: *mut synGraphHandle, deviceType: c_int) -> synStatus;
     pub fn synGraphDestroy(graphHandle: synGraphHandle) -> synStatus;
     pub fn synRecipeDestroy(recipeHandle: synRecipeHandle) -> synStatus;
+    pub fn synRecipeSerialize(
+        recipeHandle: synRecipeHandle,
+        recipeFileName: *const c_char,
+    ) -> synStatus;
+    pub fn synRecipeDeSerialize(
+        pRecipeHandle: *mut synRecipeHandle,
+        recipeFileName: *const c_char,
+    ) -> synStatus;
+    pub fn synDriverGetVersion(pDriverVersion: *mut c_char, len: c_int) -> synStatus;
+    pub fn synTensorGetName(tensor: synTensor, size: u64, name: *mut c_char) -> synStatus;
     pub fn synSectionDestroy(sectionHandle: synSectionHandle) -> synStatus;
     pub fn synGraphCompile(
         pRecipeHandle: *mut synRecipeHandle,

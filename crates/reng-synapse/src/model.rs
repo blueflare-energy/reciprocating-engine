@@ -51,6 +51,9 @@ struct RmsNormParams {
     epsilon: f32,
     fused_gamma_beta: bool,
     use_stages: bool,
+    /// Explicit padding, zeroed: the raw bytes go into the recipe cache
+    /// key, and compiler-inserted padding would carry stack garbage.
+    _pad: [u8; 2],
     bwd_mode: i32,
 }
 
@@ -138,6 +141,11 @@ pub(crate) struct Gb {
     scratch_sections: std::collections::HashMap<String, synSectionHandle>,
     /// Node ids in creation order (a valid topological order for our graphs).
     node_ids: Vec<synNodeId>,
+    /// Running digest of the graph's structure (every tensor's name, sizes,
+    /// dtype and persistence, every node's guid, name, operands and params),
+    /// the key of the on-disk recipe cache (see `Runtime`).
+    digest: std::hash::DefaultHasher,
+    digest2: std::hash::DefaultHasher,
 }
 
 impl Gb {
@@ -161,12 +169,73 @@ impl Gb {
             scratch_alias: Vec::new(),
             scratch_sections: std::collections::HashMap::new(),
             node_ids: Vec::new(),
+            digest: std::hash::DefaultHasher::new(),
+            digest2: {
+                let mut h = std::hash::DefaultHasher::new();
+                std::hash::Hash::hash(&0x5eed_u64, &mut h);
+                h
+            },
         })
+    }
+
+    /// Fold `bytes` into the structural digest.
+    fn note(&mut self, bytes: &[u8]) {
+        use std::hash::Hash;
+        bytes.hash(&mut self.digest);
+        bytes.hash(&mut self.digest2);
+    }
+
+    /// Record a tensor's declaration in the digest: kind, name, sizes,
+    /// dtype and, for aliased scratch tensors, the tensor they alias.
+    fn note_tensor(
+        &mut self,
+        kind: &str,
+        name: &str,
+        sizes: &[u64],
+        dtype: core::ffi::c_int,
+        of: &str,
+    ) {
+        let mut b = Vec::new();
+        b.extend_from_slice(kind.as_bytes());
+        b.push(0);
+        b.extend_from_slice(name.as_bytes());
+        b.push(0);
+        for d in sizes {
+            b.extend_from_slice(&d.to_le_bytes());
+        }
+        b.extend_from_slice(&dtype.to_le_bytes());
+        b.extend_from_slice(of.as_bytes());
+        self.note(&b);
+    }
+
+    /// The structural digest as 32 hex digits. Two graphs with the same
+    /// digest compile to interchangeable recipes: the compiled program
+    /// depends on the structure only, never on the weights' values.
+    pub fn cache_key(&self) -> String {
+        use std::hash::Hasher;
+        format!(
+            "{:016x}{:016x}",
+            self.digest.finish(),
+            self.digest2.finish()
+        )
+    }
+
+    /// A persistent output tensor that is not an input (read back, or
+    /// written by the graph and read through [`Runtime::read_bf16_range`]).
+    pub fn output(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        dtype: core::ffi::c_int,
+    ) -> Result<(synTensor, CString)> {
+        self.note_tensor("out", name, sizes, dtype, "");
+        make_tensor(self.graph, name, sizes, dtype, true)
     }
 
     /// A persistent bf16 input tensor whose host data is uploaded at launch.
     pub fn input(&mut self, name: &str, sizes: &[u64], data: &[f32]) -> Result<synTensor> {
         debug_assert_eq!(sizes.iter().product::<u64>() as usize, data.len());
+        self.note_tensor("in", name, sizes, SYN_TYPE_BF16, "");
         let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
@@ -184,6 +253,7 @@ impl Gb {
         dtype: core::ffi::c_int,
         bytes: &[u8],
     ) -> Result<synTensor> {
+        self.note_tensor("in", name, sizes, dtype, "");
         let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
@@ -204,6 +274,7 @@ impl Gb {
         sizes: &[u64],
         dtype: core::ffi::c_int,
     ) -> Result<synTensor> {
+        self.note_tensor("scratch", name, sizes, dtype, "");
         let mut sec: synSectionHandle = core::ptr::null_mut();
         syn!(synSectionCreate(&mut sec, 0, self.graph));
         syn!(synSectionSetPersistent(sec, true));
@@ -227,6 +298,7 @@ impl Gb {
             .scratch_sections
             .get(of)
             .unwrap_or_else(|| panic!("no scratch tensor named {of}"));
+        self.note_tensor("alias", name, sizes, SYN_TYPE_BF16, of);
         let (t, cname) = make_tensor_in(self.graph, name, sizes, SYN_TYPE_BF16, sec)?;
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
@@ -242,6 +314,7 @@ impl Gb {
         if env_on("RENG_PERSIST_ALL") {
             return self.scratch_typed(name, sizes, dtype);
         }
+        self.note_tensor("mid", name, sizes, dtype, "");
         Ok(make_tensor(self.graph, name, sizes, dtype, false)?.0)
     }
 
@@ -257,6 +330,33 @@ impl Gb {
     ) -> Result<synNodeId> {
         let g = CString::new(guid).unwrap();
         let n = CString::new(name).unwrap();
+        // Digest: guid, name, operand tensor names, raw params.
+        let mut b = Vec::new();
+        b.extend_from_slice(guid.as_bytes());
+        b.push(0);
+        b.extend_from_slice(name.as_bytes());
+        b.push(0);
+        for (which, list) in [(b'i', ins), (b'o', outs)] {
+            for &t in list {
+                let mut buf = [0u8; 256];
+                syn!(synTensorGetName(
+                    t,
+                    buf.len() as u64,
+                    buf.as_mut_ptr().cast::<core::ffi::c_char>()
+                ));
+                let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+                b.push(which);
+                b.extend_from_slice(&buf[..end]);
+                b.push(0);
+            }
+        }
+        if params_size > 0 {
+            // SAFETY: the caller passes `params_size` readable bytes.
+            b.extend_from_slice(unsafe {
+                core::slice::from_raw_parts(params.cast::<u8>(), params_size as usize)
+            });
+        }
+        self.note(&b);
         let mut id: synNodeId = 0;
         syn!(synNodeCreateWithId(
             self.graph,
@@ -278,10 +378,11 @@ impl Gb {
 
     /// Diagnostic (`RENG_SERIALIZE`): an explicit control dependency from every
     /// node to the next one in creation order, forcing sequential execution.
-    pub fn serialize_if_requested(&self) -> Result<()> {
+    pub fn serialize_if_requested(&mut self) -> Result<()> {
         if !env_on("RENG_SERIALIZE") {
             return Ok(());
         }
+        self.note(b"RENG_SERIALIZE");
         for w in self.node_ids.windows(2) {
             syn!(synNodeDependencySet(self.graph, &w[0], &w[1], 1, 1));
         }
@@ -463,6 +564,7 @@ pub(crate) fn build_layer(
         epsilon: w.eps,
         fused_gamma_beta: false,
         use_stages: false,
+        _pad: [0; 2],
         bwd_mode: 0,
     };
     let rope = RopeParams { offset: 0, mode: 0 };
@@ -921,6 +1023,7 @@ pub(crate) fn build_layer_batched(
         epsilon: w.eps,
         fused_gamma_beta: false,
         use_stages: false,
+        _pad: [0; 2],
         bwd_mode: 0,
     };
     let rope = RopeParams { offset: 0, mode: 0 };
@@ -1178,7 +1281,7 @@ pub(crate) fn build_head(
         let t = gb.scratch("LOGITS", &[v, t])?;
         (t, CString::new("LOGITS").unwrap())
     } else {
-        make_tensor(gb.graph, "LOGITS", &[v, t], bf, true)?
+        gb.output("LOGITS", &[v, t], bf)?
     };
     // Diagnostic `RENG_TPC_OUT`: route the logits through a TPC identity
     // (add 0) so a TPC kernel, not the MME, is the output's last writer.
@@ -1192,6 +1295,7 @@ pub(crate) fn build_head(
         epsilon: m.layers[0].eps,
         fused_gamma_beta: false,
         use_stages: false,
+        _pad: [0; 2],
         bwd_mode: 0,
     };
     let gemm = synGEMMParams {
@@ -1232,7 +1336,7 @@ pub(crate) fn build_head(
             kind: OutKind::Bf16,
         });
     }
-    let (t_ids, n_ids) = make_tensor(gb.graph, "IDS", &[1, t], SYN_TYPE_INT32, true)?;
+    let (t_ids, n_ids) = gb.output("IDS", &[1, t], SYN_TYPE_INT32)?;
     let red = ReductionParams {
         reduction_dimension: 0,
     };
@@ -1376,7 +1480,7 @@ pub fn model_probe_bf16(
     // Build the stack, then expose the last layer's output through a TPC
     // identity into a dedicated persistent tensor that is read back.
     let (mut gb, cur) = build_stack(x, m, tokens, hidden, inter, causal, upto, None)?;
-    let (t_probe, n_probe) = make_tensor(gb.graph, "PROBE", &[h, t], SYN_TYPE_BF16, true)?;
+    let (t_probe, n_probe) = gb.output("PROBE", &[h, t], SYN_TYPE_BF16)?;
     let t_zero = gb.input("ZERO", &[h, t], &vec![0.0; hidden * tokens])?;
     gb.node(
         "add_fwd_bf16",

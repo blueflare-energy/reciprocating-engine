@@ -83,6 +83,11 @@ and the prefill-versus-context table (Chart 1) at
 [dev/sweep/prefill.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/prefill.md)
 after every merge.
 
+Compiled recipes are cached under `~/.cache/reng/recipes` (set
+`RENG_RECIPE_CACHE` to another directory or to `0` to disable), keyed by
+the graph's structure and the SynapseAI version, so a model at a known
+shape skips the graph compiler on later runs.
+
 The KV cache is updated in place by a ScatterND node and the greedy token
 is an argmax on the device, so a decode step moves four bytes per sequence
 over the bus. Attention reads the whole cache every step, so the batched

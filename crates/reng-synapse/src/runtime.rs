@@ -221,13 +221,10 @@ impl Runtime {
     #[allow(clippy::too_many_lines)]
     pub fn new_with(mut gb: Gb, out: Out, parent: Option<&Runtime>) -> Result<Self> {
         gb.serialize_if_requested()?;
-        let mut recipe: synRecipeHandle = core::ptr::null_mut();
-        syn!(synGraphCompile(
-            &mut recipe,
-            gb.graph,
-            CString::new("model").unwrap().as_ptr(),
-            core::ptr::null()
-        ));
+        let trace = env_on("RENG_RECIPE_TRACE");
+        let t0 = Instant::now();
+        let recipe = compile_cached(&gb)?;
+        let t_compile = t0.elapsed();
 
         // Tensor ids: inputs, then scratch, then the output.
         let mut name_ptrs: Vec<*const core::ffi::c_char> =
@@ -376,6 +373,15 @@ impl Runtime {
             syn!(synDeviceMalloc(dev, ws + slack, 0, 0, &mut dws));
         }
         syn!(synStreamSynchronize(stream));
+        if trace {
+            eprintln!(
+                "runtime: compile {:.2} s, buffers + uploads {:.2} s ({} inputs, {} shared)",
+                t_compile.as_secs_f64(),
+                (t0.elapsed() - t_compile).as_secs_f64(),
+                n_in,
+                host_bufs.iter().filter(|h| h.is_null()).count()
+            );
+        }
         Ok(Self {
             gb,
             dev,
@@ -921,6 +927,116 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+/// Bump when the cache file format or the key's meaning changes.
+const RECIPE_CACHE_VERSION: &str = "1";
+
+/// The recipe cache directory: `RENG_RECIPE_CACHE` (a path, or `0`/`off`
+/// to disable), else `$HOME/.cache/reng/recipes`.
+fn recipe_cache_dir() -> Option<std::path::PathBuf> {
+    match std::env::var("RENG_RECIPE_CACHE") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.is_empty() => None,
+        Ok(v) => Some(std::path::PathBuf::from(v)),
+        Err(_) => std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".cache/reng/recipes")),
+    }
+}
+
+/// Everything besides the graph that changes what the compiler emits:
+/// the SynapseAI version and the compiler's environment knobs.
+fn compiler_salt() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    RECIPE_CACHE_VERSION.hash(&mut h);
+    let mut ver = [0u8; 128];
+    // SAFETY: the buffer holds 128 bytes and the call writes at most that.
+    let st = unsafe { synDriverGetVersion(ver.as_mut_ptr().cast::<core::ffi::c_char>(), 128) };
+    if st == SYN_SUCCESS {
+        ver.hash(&mut h);
+    }
+    let mut knobs: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| {
+            [
+                "ENABLE_",
+                "DISABLE_",
+                "GC_",
+                "HABANA_",
+                "SRAM_",
+                "PIPELINE_",
+                "DEFAULT_PIPELINE",
+                "COMMON_DIM",
+                "TPC_",
+                "MME_",
+                "RUN_TPC",
+                "HL_",
+                "SDPA_",
+            ]
+            .iter()
+            .any(|p| k.starts_with(p))
+        })
+        .collect();
+    knobs.sort();
+    knobs.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Compile `gb`, or load the recipe a graph of the same structure compiled
+/// to before from the cache; a fresh compile is stored for next time. A
+/// cache file that fails to load is compiled over. `RENG_RECIPE_TRACE`
+/// reports hits and misses.
+fn compile_cached(gb: &Gb) -> Result<synRecipeHandle> {
+    let trace = env_on("RENG_RECIPE_TRACE");
+    let mut recipe: synRecipeHandle = core::ptr::null_mut();
+    let path = recipe_cache_dir()
+        .map(|d| d.join(format!("{}-{}.recipe", gb.cache_key(), compiler_salt())));
+    if let Some(p) = &path {
+        if p.is_file() {
+            let c = CString::new(p.to_string_lossy().as_bytes()).unwrap();
+            // SAFETY: valid pointers; a failure leaves `recipe` null.
+            let st = unsafe { synRecipeDeSerialize(&mut recipe, c.as_ptr()) };
+            if st == SYN_SUCCESS && !recipe.is_null() {
+                if trace {
+                    eprintln!("recipe cache: hit {}", p.display());
+                }
+                return Ok(recipe);
+            }
+            eprintln!(
+                "recipe cache: {} did not load (synStatus {st}), compiling",
+                p.display()
+            );
+            recipe = core::ptr::null_mut();
+        }
+    }
+    syn!(synGraphCompile(
+        &mut recipe,
+        gb.graph,
+        CString::new("model").unwrap().as_ptr(),
+        core::ptr::null()
+    ));
+    if let Some(p) = &path {
+        if let Some(dir) = p.parent() {
+            if std::fs::create_dir_all(dir).is_ok() {
+                let tmp = p.with_extension(format!("tmp{}", std::process::id()));
+                let c = CString::new(tmp.to_string_lossy().as_bytes()).unwrap();
+                // SAFETY: valid recipe and path.
+                let st = unsafe { synRecipeSerialize(recipe, c.as_ptr()) };
+                if st == SYN_SUCCESS && std::fs::rename(&tmp, p).is_ok() {
+                    if trace {
+                        eprintln!("recipe cache: stored {}", p.display());
+                    }
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!(
+                        "recipe cache: could not store {} (synStatus {st})",
+                        p.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(recipe)
 }
 
 impl Drop for Runtime {

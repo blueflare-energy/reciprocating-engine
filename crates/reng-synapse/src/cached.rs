@@ -100,7 +100,11 @@ impl CachedModel {
         assert_eq!(cos.len(), capacity * hd);
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
+        let t0 = Instant::now();
         let (gb, out) = Self::build(m, hidden, inter, vocab, rows, capacity, false)?;
+        if std::env::var("RENG_RECIPE_TRACE").is_ok() {
+            eprintln!("graph build: {:.2} s", t0.elapsed().as_secs_f64());
+        }
         let rt = Runtime::new(gb, out)?;
         let ix = Self::inputs(&rt);
         let dec = if decode_rows > 0 && decode_rows != rows {
