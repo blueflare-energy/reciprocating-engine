@@ -8,10 +8,23 @@ use reng_synapse::{
     model_probe_cpu,
 };
 
+/// Dense pseudo-random values in `(-scale, scale)` with no exact zeros and no
+/// periodic structure (xorshift64*). Earlier periodic generators produced
+/// weight/activation tiles of exact zeros in deep synthetic models, which
+/// behaved unlike real weights on the device.
 fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> {
-    let half = (modulo as f32 - 1.0) / 2.0;
+    let mut s: u64 =
+        0x9E37_79B9_7F4A_7C15 ^ ((mul as u64) << 40) ^ ((add as u64) << 20) ^ modulo as u64;
     (0..n)
-        .map(|j| ((((j * mul + add) % modulo) as f32) - half) / half * scale)
+        .map(|_| {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            let r = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            // Top 24 bits -> (0, 1), then map to (-1, 1) avoiding exactly 0.
+            let u = ((r >> 40) as f32 + 0.5) / 16_777_216.0;
+            (2.0 * u - 1.0) * scale
+        })
         .collect()
 }
 

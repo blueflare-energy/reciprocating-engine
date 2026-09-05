@@ -16,6 +16,7 @@ pub type synStreamHandle = *mut c_void;
 pub type synSectionHandle = *mut c_void;
 pub type synTensor = *mut c_void;
 pub type synEventHandle = *mut c_void;
+pub type synNodeId = u64;
 
 pub const SYN_SUCCESS: synStatus = 0;
 pub const SYN_DEVICE_GAUDI2: c_int = 4;
@@ -177,6 +178,27 @@ unsafe extern "C" {
         pName: *const c_char,
         inputLayouts: *const *const c_char,
         outputLayouts: *const *const c_char,
+    ) -> synStatus;
+    pub fn synNodeCreateWithId(
+        graphHandle: synGraphHandle,
+        pInputsTensorList: *const synTensor,
+        pOutputsTensorList: *const synTensor,
+        numberInputs: u32,
+        numberOutputs: u32,
+        pUserParams: *const c_void,
+        paramsSize: u32,
+        pGuid: *const c_char,
+        pName: *const c_char,
+        nodeUniqueId: *mut synNodeId,
+        inputLayouts: *const *const c_char,
+        outputLayouts: *const *const c_char,
+    ) -> synStatus;
+    pub fn synNodeDependencySet(
+        graphHandle: synGraphHandle,
+        pBlockingNodesIdList: *const synNodeId,
+        pBlockedNodesIdList: *const synNodeId,
+        numberblocking: u32,
+        numberblocked: u32,
     ) -> synStatus;
     pub fn synTensorRetrieveIds(
         pRecipeHandle: synRecipeHandle,
