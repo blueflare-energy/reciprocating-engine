@@ -6,7 +6,10 @@
 
 use reng_core::Result;
 
-/// Weights and inputs of one decoder layer, all row-major f32.
+/// Weights and inputs of one decoder layer. The projections are bf16 in
+/// the checkpoint's own `[out, in]` row-major layout (a HF `Linear`
+/// weight as stored), so a loaded checkpoint is borrowed, never copied
+/// or transposed; the small vectors are f32.
 #[derive(Clone, Copy)]
 pub struct LayerWeights<'a> {
     /// Number of query heads; `hidden % n_heads == 0`.
@@ -16,21 +19,22 @@ pub struct LayerWeights<'a> {
     /// RMSNorm gains, each length `hidden`.
     pub g1: &'a [f32],
     pub g2: &'a [f32],
-    /// Projections stored `[in, out]`: `wq`, `wo` are `hidden x hidden`;
-    /// `wk`, `wv` are `hidden x (n_kv_heads * head_dim)`.
-    pub wq: &'a [f32],
-    pub wk: &'a [f32],
-    pub wv: &'a [f32],
-    pub wo: &'a [f32],
+    /// Projections stored `[out, in]`, bf16: `wq`, `wo` are `hidden x
+    /// hidden`; `wk`, `wv` are `(n_kv_heads * head_dim) x hidden`.
+    pub wq: &'a [u16],
+    pub wk: &'a [u16],
+    pub wv: &'a [u16],
+    pub wo: &'a [u16],
     /// Attention biases (Qwen2-style), `hidden` for `bq` and `n_kv_heads *
     /// head_dim` for `bk`/`bv`; empty when the model has none.
     pub bq: &'a [f32],
     pub bk: &'a [f32],
     pub bv: &'a [f32],
-    /// MLP: `wg`, `wu` are `[hidden, inter]`; `wd` is `[inter, hidden]`.
-    pub wg: &'a [f32],
-    pub wu: &'a [f32],
-    pub wd: &'a [f32],
+    /// MLP, bf16 `[out, in]`: `wg`, `wu` are `[inter, hidden]`; `wd` is
+    /// `[hidden, inter]`.
+    pub wg: &'a [u16],
+    pub wu: &'a [u16],
+    pub wd: &'a [u16],
     /// RoPE caches `[tokens, head_dim]` (head_dim contiguous), shared by heads.
     pub sin: &'a [f32],
     pub cos: &'a [f32],

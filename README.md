@@ -83,7 +83,10 @@ and the prefill-versus-context table (Chart 1) at
 [dev/sweep/prefill.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/prefill.md)
 after every merge.
 
-Compiled recipes are cached under `~/.cache/reng/recipes` (set
+Weights are read from the safetensors file as bf16 in the checkpoint's own
+layout and uploaded as they are; loading a 3B model takes a few seconds
+and about 14 GB of host memory. Compiled recipes are cached under
+`~/.cache/reng/recipes` (set
 `RENG_RECIPE_CACHE` to another directory or to `0` to disable), keyed by
 the graph's structure and the SynapseAI version, so a model at a known
 shape skips the graph compiler on later runs.

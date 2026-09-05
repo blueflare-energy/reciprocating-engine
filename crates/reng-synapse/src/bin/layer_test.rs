@@ -5,7 +5,7 @@
 //!
 //! `cargo run -p reng-synapse --features link-synapse --bin reng-layer-test -- [tokens] [hidden] [inter] [n_heads] [n_kv_heads]`.
 
-use reng_synapse::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu};
+use reng_synapse::{LayerWeights, decoder_layer_bf16, decoder_layer_cpu, to_bf16};
 
 fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> {
     let half = (modulo as f32 - 1.0) / 2.0;
@@ -37,13 +37,13 @@ fn main() -> reng_core::Result<()> {
     let x = seq(tokens * hidden, 7, 3, 23, 1.0);
     let g1: Vec<f32> = (0..hidden).map(|i| 0.9 + ((i % 7) as f32) * 0.03).collect();
     let g2: Vec<f32> = (0..hidden).map(|i| 1.1 - ((i % 5) as f32) * 0.04).collect();
-    let wq = seq(hidden * hidden, 5, 1, 17, fan);
-    let wk = seq(hidden * kvd, 11, 4, 19, fan);
-    let wv = seq(hidden * kvd, 13, 2, 21, fan);
-    let wo = seq(hidden * hidden, 3, 5, 29, fan);
-    let wg = seq(hidden * inter, 17, 6, 31, fan);
-    let wu = seq(hidden * inter, 19, 7, 37, fan);
-    let wd = seq(inter * hidden, 23, 8, 41, fan_i);
+    let wq = to_bf16(&seq(hidden * hidden, 5, 1, 17, fan));
+    let wk = to_bf16(&seq(hidden * kvd, 11, 4, 19, fan));
+    let wv = to_bf16(&seq(hidden * kvd, 13, 2, 21, fan));
+    let wo = to_bf16(&seq(hidden * hidden, 3, 5, 29, fan));
+    let wg = to_bf16(&seq(hidden * inter, 17, 6, 31, fan));
+    let wu = to_bf16(&seq(hidden * inter, 19, 7, 37, fan));
+    let wd = to_bf16(&seq(inter * hidden, 23, 8, 41, fan_i));
     // RoPE caches are per position and per head_dim, shared across heads.
     let mut sin = vec![0.0f32; tokens * hd];
     let mut cos = vec![0.0f32; tokens * hd];

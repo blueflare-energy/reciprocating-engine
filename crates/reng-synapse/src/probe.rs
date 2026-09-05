@@ -125,7 +125,7 @@ fn build_probe(
     kind: OutKind,
     params: *const c_void,
     params_size: u32,
-) -> Result<Runtime> {
+) -> Result<Runtime<'static>> {
     let mut gb = Gb::new()?;
     let mut tensors = Vec::with_capacity(ins.len());
     for i in ins {

@@ -45,14 +45,14 @@ struct Inputs {
 pub struct BatchedModel<'a> {
     /// Prefill recipe for the current bucket (drops first: it borrows the
     /// decode runtime's device and weights).
-    pf: Runtime,
+    pf: Runtime<'a>,
     pf_ix: Inputs,
     /// Decode recipe for the current bucket when that is not `base`'s.
-    cur: Option<Runtime>,
+    cur: Option<Runtime<'a>>,
     ix: Inputs,
     /// The first decode recipe: owns the device and the weights every later
     /// recipe binds to.
-    base: Runtime,
+    base: Runtime<'a>,
     m: ModelWeights<'a>,
     batch: usize,
     rows: usize,
@@ -164,14 +164,14 @@ impl<'a> BatchedModel<'a> {
     /// `base`'s by name.
     #[allow(clippy::too_many_arguments)]
     fn build_decode(
-        m: &ModelWeights<'_>,
+        m: &ModelWeights<'a>,
         hidden: usize,
         inter: usize,
         vocab: usize,
         batch: usize,
         cap: usize,
         tag: &str,
-    ) -> Result<(Gb, Out)> {
+    ) -> Result<(Gb<'a>, Out)> {
         let l0 = &m.layers[0];
         let hd = hidden / l0.n_heads;
         let (h, hd64, keys, b) = (hidden as u64, hd as u64, cap as u64 + 1, batch as u64);
@@ -216,13 +216,13 @@ impl<'a> BatchedModel<'a> {
     }
 
     fn build_prefill(
-        m: &ModelWeights<'_>,
+        m: &ModelWeights<'a>,
         hidden: usize,
         inter: usize,
         vocab: usize,
         rows: usize,
         cap: usize,
-    ) -> Result<(Gb, Out)> {
+    ) -> Result<(Gb<'a>, Out)> {
         let hd = hidden / m.layers[0].n_heads;
         let groups = m.layers[0].n_kv_heads;
         let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, cap as u64 + 1);
@@ -253,7 +253,7 @@ impl<'a> BatchedModel<'a> {
         Ok((gb, out))
     }
 
-    fn decode_inputs(rt: &Runtime, tag: &str) -> Inputs {
+    fn decode_inputs(rt: &Runtime<'_>, tag: &str) -> Inputs {
         Inputs {
             x: rt.input_index(&format!("XB{tag}")),
             sin: rt.input_index(&format!("SINB{tag}")),
@@ -263,7 +263,7 @@ impl<'a> BatchedModel<'a> {
         }
     }
 
-    fn prefill_inputs(rt: &Runtime) -> Inputs {
+    fn prefill_inputs(rt: &Runtime<'_>) -> Inputs {
         Inputs {
             x: rt.input_index("X"),
             sin: rt.input_index("SIN"),
@@ -273,7 +273,7 @@ impl<'a> BatchedModel<'a> {
         }
     }
 
-    fn cache_slots(rt: &Runtime, layers: usize) -> Vec<(u64, u64)> {
+    fn cache_slots(rt: &Runtime<'_>, layers: usize) -> Vec<(u64, u64)> {
         (0..layers)
             .map(|li| {
                 let (kci, vci, _, _) = cache_names(li);
@@ -283,7 +283,7 @@ impl<'a> BatchedModel<'a> {
     }
 
     /// The decode runtime of the current bucket.
-    fn rt(&mut self) -> &mut Runtime {
+    fn rt(&mut self) -> &mut Runtime<'a> {
         match self.cur {
             Some(ref mut r) => r,
             None => &mut self.base,

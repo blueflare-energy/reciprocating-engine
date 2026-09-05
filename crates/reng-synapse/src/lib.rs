@@ -18,6 +18,13 @@ pub fn f32_to_bf16(x: f32) -> u16 {
     (bits.wrapping_add(round_bias) >> 16) as u16
 }
 
+/// Convert a slice to bf16 (round-to-nearest-even), the device's weight
+/// format.
+#[must_use]
+pub fn to_bf16(v: &[f32]) -> Vec<u16> {
+    v.iter().map(|&x| f32_to_bf16(x)).collect()
+}
+
 /// Convert bf16 bits to an `f32`.
 #[must_use]
 pub fn bf16_to_f32(x: u16) -> f32 {

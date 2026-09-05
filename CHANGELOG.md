@@ -46,6 +46,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the natural weights (shared with the batched decode recipe) plus a
   transpose into the head layout instead of per-head batch_gemms, which
   the MME runs at N = head_dim.
+- Weights stay bf16 in the checkpoint's own `[out, in]` layout from the
+  safetensors file to the device: the loader no longer converts to f32
+  or transposes, the graph borrows the slices (the gemms take them as
+  transposed B operands), and the upload is a memcpy into the pinned
+  staging buffer. Half the host memory and most of the launch time of a
+  model go away.
 - Compiled recipes are cached on disk (`$HOME/.cache/reng/recipes`, or
   `RENG_RECIPE_CACHE`; `0` disables) keyed by a digest of the graph
   structure, the SynapseAI version and the compiler's environment knobs,

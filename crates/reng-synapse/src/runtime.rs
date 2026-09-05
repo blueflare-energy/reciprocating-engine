@@ -168,8 +168,8 @@ fn launch_info(name: &CString, addr: u64, id: u64, sizes: &[u64]) -> synLaunchTe
 /// tensors. Inputs are uploaded once at construction; [`Runtime::upload`]
 /// replaces one input's contents between launches, and
 /// [`Runtime::copy_d2d`] moves bytes between device-resident tensors.
-pub(crate) struct Runtime {
-    gb: Gb,
+pub(crate) struct Runtime<'a> {
+    gb: Gb<'a>,
     dev: synDeviceId,
     stream: synStreamHandle,
     recipe: synRecipeHandle,
@@ -205,10 +205,10 @@ pub(crate) struct Runtime {
     dws: u64,
 }
 
-impl Runtime {
+impl<'a> Runtime<'a> {
     /// Compile `gb`, acquire a device, allocate every persistent tensor, and
     /// upload the inputs' host data.
-    pub fn new(gb: Gb, out: Out) -> Result<Self> {
+    pub fn new(gb: Gb<'a>, out: Out) -> Result<Self> {
         Self::new_with(gb, out, None)
     }
 
@@ -219,7 +219,7 @@ impl Runtime {
     /// per-step inputs and output. The child must be dropped before the
     /// parent.
     #[allow(clippy::too_many_lines)]
-    pub fn new_with(mut gb: Gb, out: Out, parent: Option<&Runtime>) -> Result<Self> {
+    pub fn new_with(mut gb: Gb<'a>, out: Out, parent: Option<&Runtime<'_>>) -> Result<Self> {
         gb.serialize_if_requested()?;
         let trace = env_on("RENG_RECIPE_TRACE");
         let t0 = Instant::now();
@@ -287,10 +287,7 @@ impl Runtime {
                     if let Some(r) = raw {
                         core::ptr::copy_nonoverlapping(r.as_ptr(), hb.cast::<u8>(), r.len());
                     } else {
-                        let pb = hb.cast::<u16>();
-                        for (j, &val) in data.iter().enumerate() {
-                            *pb.add(j) = f32_to_bf16(val);
-                        }
+                        core::ptr::copy_nonoverlapping(data.as_ptr(), hb.cast::<u16>(), data.len());
                     }
                 }
                 syn!(synMemCopyAsync(
@@ -316,7 +313,7 @@ impl Runtime {
         // needed once they are in the pinned staging buffers or bound to a
         // parent: uploads are validated against the tensor sizes.
         for d in &mut gb.data {
-            *d = Vec::new();
+            *d = std::borrow::Cow::Owned(Vec::new());
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
             let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
@@ -881,7 +878,7 @@ impl Runtime {
     }
 }
 
-impl Runtime {
+impl<'a> Runtime<'a> {
     /// Diagnostic: after a long settle, copy every scratch tensor down and
     /// print its zero fraction and largest magnitude, in creation order.
     fn dump_scratch(&self) -> Result<()> {
@@ -1039,7 +1036,7 @@ fn compile_cached(gb: &Gb) -> Result<synRecipeHandle> {
     Ok(recipe)
 }
 
-impl Drop for Runtime {
+impl Drop for Runtime<'_> {
     fn drop(&mut self) {
         unsafe {
             synStreamSynchronize(self.stream);

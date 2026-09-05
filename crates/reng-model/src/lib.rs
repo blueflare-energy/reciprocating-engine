@@ -10,7 +10,7 @@
 //! Qwen2-style attention biases are loaded when present (Llama has none).
 
 use reng_core::{Error, Result};
-use reng_synapse::bf16_to_f32;
+use reng_synapse::{bf16_to_f32, f32_to_bf16};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use std::path::Path;
@@ -63,27 +63,60 @@ impl LlamaConfig {
 pub struct LayerTensors {
     pub g1: Vec<f32>,
     pub g2: Vec<f32>,
-    pub wq: Vec<f32>,
-    pub wk: Vec<f32>,
-    pub wv: Vec<f32>,
-    pub wo: Vec<f32>,
+    /// Projections as stored, bf16 `[out, in]`.
+    pub wq: Vec<u16>,
+    pub wk: Vec<u16>,
+    pub wv: Vec<u16>,
+    pub wo: Vec<u16>,
     /// Attention biases; empty when the checkpoint has none.
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
     pub bv: Vec<f32>,
-    pub wg: Vec<f32>,
-    pub wu: Vec<f32>,
-    pub wd: Vec<f32>,
+    pub wg: Vec<u16>,
+    pub wu: Vec<u16>,
+    pub wd: Vec<u16>,
 }
 
-/// A whole model's weights, f32 on the host.
+/// A whole model's weights on the host: the matrices bf16 in the
+/// checkpoint's `[out, in]` layout (the device format, uploaded as is),
+/// the norm gains and biases f32.
 pub struct LlamaWeights {
-    /// `[vocab, hidden]`, row per token id.
-    pub embed: Vec<f32>,
+    /// `[vocab, hidden]`, bf16, row per token id.
+    pub embed: Vec<u16>,
     pub layers: Vec<LayerTensors>,
     pub final_gamma: Vec<f32>,
-    /// `[hidden, vocab]`.
-    pub lm_head: Vec<f32>,
+    /// `[vocab, hidden]`, bf16 (the tied embeddings themselves when the
+    /// checkpoint has no head).
+    pub lm_head: Vec<u16>,
+}
+
+/// A tensor as bf16 with its shape, converted from f32 or f16 checkpoints
+/// and copied verbatim from bf16 ones.
+fn tensor_bf16(st: &SafeTensors<'_>, name: &str) -> Result<(Vec<u16>, Vec<usize>)> {
+    let view = st
+        .tensor(name)
+        .map_err(|e| Error::Other(format!("tensor {name}: {e}")))?;
+    let data = view.data();
+    let out = match view.dtype() {
+        Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect(),
+        Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|b| f32_to_bf16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .collect(),
+        Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|b| f32_to_bf16(f16_to_f32(u16::from_le_bytes([b[0], b[1]]))))
+            .collect(),
+        other => {
+            return Err(Error::Other(format!(
+                "tensor {name}: unsupported dtype {other:?}"
+            )));
+        }
+    };
+    Ok((out, view.shape().to_vec()))
 }
 
 fn tensor_f32(st: &SafeTensors<'_>, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
@@ -140,16 +173,6 @@ fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// `[rows, cols]` row-major to `[cols, rows]`.
-fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = v[r * cols + c];
-        }
-    }
-    out
-}
-
 /// A 1-D tensor that a checkpoint may omit (attention biases): empty when
 /// absent, checked for length when present.
 fn optional_vec(st: &SafeTensors<'_>, name: &str, len: usize) -> Result<Vec<f32>> {
@@ -165,15 +188,15 @@ fn optional_vec(st: &SafeTensors<'_>, name: &str, len: usize) -> Result<Vec<f32>
     Ok(v)
 }
 
-/// A `[out, in]` HF linear weight as the engine's `[in, out]`.
-fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Result<Vec<f32>> {
-    let (v, shape) = tensor_f32(st, name)?;
+/// A `[out, in]` HF linear weight, shape-checked and kept in that layout.
+fn linear(st: &SafeTensors<'_>, name: &str, out_dim: usize, in_dim: usize) -> Result<Vec<u16>> {
+    let (v, shape) = tensor_bf16(st, name)?;
     if shape != [out_dim, in_dim] {
         return Err(Error::Other(format!(
             "tensor {name}: shape {shape:?}, expected [{out_dim}, {in_dim}]"
         )));
     }
-    Ok(transpose(&v, out_dim, in_dim))
+    Ok(v)
 }
 
 /// The checkpoint's safetensors files, one or several (sharded checkpoints
@@ -257,7 +280,8 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     let (h, i, v) = (cfg.hidden_size, cfg.intermediate_size, cfg.vocab_size);
     let kvd = cfg.n_kv_heads() * cfg.head_dim();
 
-    let (embed, eshape) = tensor_f32(st("model.embed_tokens.weight"), "model.embed_tokens.weight")?;
+    let (embed, eshape) =
+        tensor_bf16(st("model.embed_tokens.weight"), "model.embed_tokens.weight")?;
     if eshape != [v, h] {
         return Err(Error::Other(format!(
             "embed_tokens shape {eshape:?}, expected [{v}, {h}]"
@@ -270,7 +294,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             let n = p(name);
             Ok(tensor_f32(st(&n), &n)?.0)
         };
-        let lin = |name: &str, o: usize, inp: usize| -> Result<Vec<f32>> {
+        let lin = |name: &str, o: usize, inp: usize| -> Result<Vec<u16>> {
             let n = p(name);
             linear(st(&n), &n, o, inp)
         };
@@ -299,7 +323,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     let lm_head = if has_head {
         linear(st("lm_head.weight"), "lm_head.weight", v, h)?
     } else if cfg.tie_word_embeddings {
-        transpose(&embed, v, h)
+        embed.clone()
     } else {
         return Err(Error::Other(
             "lm_head.weight missing and embeddings are not tied".into(),
@@ -342,7 +366,11 @@ pub fn embed_tokens(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Vec<f32
     for &id in ids {
         let id = id as usize;
         assert!(id < cfg.vocab_size, "token id {id} out of range");
-        x.extend_from_slice(&w.embed[id * h..(id + 1) * h]);
+        x.extend(
+            w.embed[id * h..(id + 1) * h]
+                .iter()
+                .map(|&b| bf16_to_f32(b)),
+        );
     }
     x
 }
@@ -446,7 +474,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
 /// A model compiled once with a KV cache, fed token ids block by block.
 #[cfg(feature = "link-synapse")]
 pub struct Generator<'a> {
-    model: reng_synapse::CachedModel,
+    model: reng_synapse::CachedModel<'a>,
     w: &'a LlamaWeights,
     cfg: &'a LlamaConfig,
 }
@@ -468,7 +496,9 @@ impl<'a> Generator<'a> {
         capacity: usize,
     ) -> Result<Self> {
         let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
-        let m = layer_views(w, cfg, &sin, &cos);
+        // The cached recipes take RoPE rows as per-step inputs, so the layer
+        // views carry no tables (they would have to outlive `sin`).
+        let m = layer_views(w, cfg, &[], &[]);
         let model = reng_synapse::CachedModel::new(
             &m,
             cfg.hidden_size,
@@ -646,11 +676,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transpose_roundtrip() {
-        let v: Vec<f32> = (0..6).map(|x| x as f32).collect();
-        let t = transpose(&v, 2, 3);
-        assert_eq!(t, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
-        assert_eq!(transpose(&t, 3, 2), v);
+    fn bf16_roundtrip() {
+        // Small integers and powers of two are exact in bf16.
+        let v: Vec<f32> = vec![0.0, 1.0, -2.0, 0.5, 256.0, -0.125];
+        let b = reng_synapse::to_bf16(&v);
+        let back: Vec<f32> = b.iter().map(|&x| bf16_to_f32(x)).collect();
+        assert_eq!(back, v);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use reng_synapse::{
     LayerWeights, ModelWeights, model_forward_bf16, model_forward_cpu, model_probe_bf16,
-    model_probe_cpu,
+    model_probe_cpu, to_bf16,
 };
 
 /// Dense pseudo-random values in `(-scale, scale)` with no exact zeros and no
@@ -31,13 +31,13 @@ fn seq(n: usize, mul: usize, add: usize, modulo: usize, scale: f32) -> Vec<f32> 
 struct Owned {
     g1: Vec<f32>,
     g2: Vec<f32>,
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
-    wg: Vec<f32>,
-    wu: Vec<f32>,
-    wd: Vec<f32>,
+    wq: Vec<u16>,
+    wk: Vec<u16>,
+    wv: Vec<u16>,
+    wo: Vec<u16>,
+    wg: Vec<u16>,
+    wu: Vec<u16>,
+    wd: Vec<u16>,
 }
 
 fn main() -> reng_core::Result<()> {
@@ -80,13 +80,13 @@ fn main() -> reng_core::Result<()> {
             g2: (0..hidden)
                 .map(|i| 1.1 - (((i + 2 * l) % 5) as f32) * 0.04)
                 .collect(),
-            wq: seq(hidden * hidden, 5 + l, 1, 17, fan),
-            wk: seq(hidden * kvd, 11 + l, 4, 19, fan),
-            wv: seq(hidden * kvd, 13 + l, 2, 21, fan),
-            wo: seq(hidden * hidden, 3 + l, 5, 29, fan),
-            wg: seq(hidden * inter, 17 + l, 6, 31, fan),
-            wu: seq(hidden * inter, 19 + l, 7, 37, fan),
-            wd: seq(inter * hidden, 23 + l, 8, 41, fan_i),
+            wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
+            wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
+            wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
+            wo: to_bf16(&seq(hidden * hidden, 3 + l, 5, 29, fan)),
+            wg: to_bf16(&seq(hidden * inter, 17 + l, 6, 31, fan)),
+            wu: to_bf16(&seq(hidden * inter, 19 + l, 7, 37, fan)),
+            wd: to_bf16(&seq(inter * hidden, 23 + l, 8, 41, fan_i)),
         })
         .collect();
     let layers: Vec<LayerWeights<'_>> = owned
@@ -113,7 +113,7 @@ fn main() -> reng_core::Result<()> {
         })
         .collect();
     let final_gamma: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 3) as f32) * 0.05).collect();
-    let lm_head = seq(hidden * vocab, 29, 9, 43, fan);
+    let lm_head = to_bf16(&seq(hidden * vocab, 29, 9, 43, fan));
     let m = ModelWeights {
         layers,
         final_gamma: &final_gamma,

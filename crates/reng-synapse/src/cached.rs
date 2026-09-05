@@ -42,11 +42,11 @@ struct Inputs {
 
 /// A compiled decoder recipe with its resident weights and KV cache, plus an
 /// optional second recipe for small blocks (decode) that shares them.
-pub struct CachedModel {
+pub struct CachedModel<'a> {
     /// The decode recipe, if any; declared first so it drops before `rt`,
     /// whose device and buffers it borrows.
-    dec: Option<(Runtime, Inputs, usize)>,
-    rt: Runtime,
+    dec: Option<(Runtime<'a>, Inputs, usize)>,
+    rt: Runtime<'a>,
     ix: Inputs,
     rows: usize,
     capacity: usize,
@@ -65,7 +65,7 @@ pub struct CachedModel {
     flipped: bool,
 }
 
-impl CachedModel {
+impl<'a> CachedModel<'a> {
     /// Compile the recipe for blocks of `rows` positions over a cache of
     /// `capacity` positions and upload the weights. `sin`/`cos` are RoPE
     /// tables `[capacity, head_dim]`; the per-layer tables in `m` are unused.
@@ -83,7 +83,7 @@ impl CachedModel {
     /// or `rows` or `capacity` is zero.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        m: &ModelWeights<'_>,
+        m: &ModelWeights<'a>,
         hidden: usize,
         inter: usize,
         vocab: usize,
@@ -136,14 +136,14 @@ impl CachedModel {
     /// `inplace` selects the cache update form (see [`Shared::inplace`]).
     #[allow(clippy::too_many_arguments)]
     fn build(
-        m: &ModelWeights<'_>,
+        m: &ModelWeights<'a>,
         hidden: usize,
         inter: usize,
         vocab: usize,
         rows: usize,
         capacity: usize,
         inplace: bool,
-    ) -> Result<(Gb, crate::runtime::Out)> {
+    ) -> Result<(Gb<'a>, crate::runtime::Out)> {
         let hd = hidden / m.layers[0].n_heads;
         let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64 + 1);
         let mut gb = Gb::new()?;
@@ -175,7 +175,7 @@ impl CachedModel {
         Ok((gb, out))
     }
 
-    fn inputs(rt: &Runtime) -> Inputs {
+    fn inputs(rt: &Runtime<'_>) -> Inputs {
         Inputs {
             x: rt.input_index("X"),
             sin: rt.input_index("SIN"),

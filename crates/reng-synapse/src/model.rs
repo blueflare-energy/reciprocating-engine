@@ -30,6 +30,7 @@
 use crate::LayerWeights;
 use crate::ffi::*;
 use crate::runtime::{Out, OutKind, Runtime};
+use crate::{bf16_to_f32, f32_to_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::ffi::CString;
@@ -66,6 +67,14 @@ struct RopeParams {
 /// Additive attention-mask value for disallowed keys; `exp` of it underflows
 /// to exactly zero in bf16 softmax while staying representable.
 pub(crate) const MASK_NEG: f32 = -30000.0;
+
+/// `w * scale` in bf16: one rounding of the f32 product, as the device
+/// would see it.
+fn scale_bf16(w: &[u16], scale: f32) -> Vec<u16> {
+    w.iter()
+        .map(|&b| f32_to_bf16(bf16_to_f32(b) * scale))
+        .collect()
+}
 
 fn env_on(name: &str) -> bool {
     std::env::var(name).is_ok()
@@ -122,11 +131,13 @@ pub(crate) fn make_tensor_in(
 /// Accumulates a graph: persistent inputs (with their host data), persistent
 /// scratch tensors (device-resident, not read back), internal tensors, and
 /// nodes. Launch plumbing lives in [`Runtime`].
-pub(crate) struct Gb {
+pub(crate) struct Gb<'a> {
     pub graph: synGraphHandle,
     pub names: Vec<CString>,
     pub sizes: Vec<Vec<u64>>,
-    pub data: Vec<Vec<f32>>,
+    /// Host data per bf16 input: a checkpoint slice borrowed as is, or an
+    /// owned conversion (per-step inputs, scaled copies).
+    pub data: Vec<std::borrow::Cow<'a, [u16]>>,
     /// Raw device bytes for non-bf16 inputs (else `data` is converted).
     pub raw: Vec<Option<Vec<u8>>>,
     pub scratch_names: Vec<CString>,
@@ -148,7 +159,7 @@ pub(crate) struct Gb {
     digest2: std::hash::DefaultHasher,
 }
 
-impl Gb {
+impl<'a> Gb<'a> {
     pub fn new() -> Result<Self> {
         // A second graph in the same process finds the library initialised.
         let st = unsafe { synInitialize() };
@@ -232,14 +243,32 @@ impl Gb {
         make_tensor(self.graph, name, sizes, dtype, true)
     }
 
-    /// A persistent bf16 input tensor whose host data is uploaded at launch.
+    /// A persistent bf16 input tensor whose host data (converted from f32
+    /// here) is uploaded at launch.
     pub fn input(&mut self, name: &str, sizes: &[u64], data: &[f32]) -> Result<synTensor> {
-        debug_assert_eq!(sizes.iter().product::<u64>() as usize, data.len());
+        self.input_bf16(name, sizes, std::borrow::Cow::Owned(crate::to_bf16(data)))
+    }
+
+    /// A persistent bf16 input tensor from bf16 host data, borrowed when the
+    /// caller keeps it alive (checkpoint weights) so nothing is copied
+    /// before the upload.
+    pub fn input_bf16(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        data: std::borrow::Cow<'a, [u16]>,
+    ) -> Result<synTensor> {
+        assert_eq!(
+            sizes.iter().product::<u64>() as usize,
+            data.len(),
+            "input {name}: sizes {sizes:?} against {} elements",
+            data.len()
+        );
         self.note_tensor("in", name, sizes, SYN_TYPE_BF16, "");
         let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
-        self.data.push(data.to_vec());
+        self.data.push(data);
         self.raw.push(None);
         Ok(t)
     }
@@ -257,7 +286,7 @@ impl Gb {
         let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
-        self.data.push(Vec::new());
+        self.data.push(std::borrow::Cow::Owned(Vec::new()));
         self.raw.push(Some(bytes.to_vec()));
         Ok(t)
     }
@@ -455,11 +484,11 @@ struct ScatterNdUpdateParams {
 /// table, and the per-head outputs go through one transpose back to
 /// `[hidden, tokens]` for the output projection.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn build_layer(
-    gb: &mut Gb,
+pub(crate) fn build_layer<'a>(
+    gb: &mut Gb<'a>,
     li: usize,
     x: synTensor,
-    w: &LayerWeights<'_>,
+    w: &LayerWeights<'a>,
     sh: &Shared,
     tokens: usize,
     hidden: usize,
@@ -484,52 +513,54 @@ pub(crate) fn build_layer(
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
 
-    // Per-head weight blocks, `[hd, hidden, heads-in-group, groups]` on the
-    // device: block (j, g) is the columns of head `g * hpg + j`.
-    let blocks = |m: &[f32], cols: usize, per_group: usize| -> Vec<f32> {
-        let mut v = Vec::with_capacity(hidden * cols);
-        for g in 0..nkv {
-            for j in 0..per_group {
-                let head = g * per_group + j;
-                for r in 0..hidden {
-                    v.extend_from_slice(&m[r * cols + head * hd_us..r * cols + (head + 1) * hd_us]);
-                }
-            }
-        }
-        v
-    };
-    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
+    // Weights are the checkpoint's bf16 `[out, in]` matrices, borrowed:
+    // as the gemms' transposed B operand (`[K = in, N = out]`) they need
+    // no copy; the per-head form is a free reshape of the same matrix.
+    // Every MME node runs at the same rate whatever its N, except that a
+    // batch_gemm over per-head blocks runs each head as an N = hd gemm at
+    // a fraction of the rate (12% of a 1.7B prefill), so the plain form is
+    // the default and diagnostic `RENG_HEAD_BLOCKS` keeps the per-head one.
+    let head_blocks = env_on("RENG_HEAD_BLOCKS");
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
-    // The projections are plain gemms over the natural `[in, out]` weights
-    // (N = all heads at once; the same buffers the batched decode recipe
-    // binds by name) followed by a transpose into the head layout: a
-    // batch_gemm over per-head blocks runs each head as an N = hd gemm,
-    // which the MME executes at a fraction of its rate (12% of a 1.7B
-    // prefill; a wash for a 135M model). Diagnostic `RENG_HEAD_BLOCKS`
-    // keeps the per-head form.
-    let head_blocks = env_on("RENG_HEAD_BLOCKS");
+    let wq_scaled = scale_bf16(w.wq, w.scale);
     let (t_wq, t_wk, t_wv) = if head_blocks {
         (
-            gb.input(
+            gb.input_bf16(
                 &p("wq"),
-                &[hd, h, hpg, groups],
-                &blocks(&wq_scaled, hidden, hpg_us),
+                &[h, hd, hpg, groups],
+                std::borrow::Cow::Owned(wq_scaled),
             )?,
-            gb.input(&p("wk"), &[hd, h, 1, groups], &blocks(w.wk, nkv * hd_us, 1))?,
-            gb.input(&p("wv"), &[hd, h, 1, groups], &blocks(w.wv, nkv * hd_us, 1))?,
+            gb.input_bf16(
+                &p("wk"),
+                &[h, hd, 1, groups],
+                std::borrow::Cow::Borrowed(w.wk),
+            )?,
+            gb.input_bf16(
+                &p("wv"),
+                &[h, hd, 1, groups],
+                std::borrow::Cow::Borrowed(w.wv),
+            )?,
         )
     } else {
         (
-            gb.input(&p("wq2"), &[h, h], &wq_scaled)?,
-            gb.input(&p("wk2"), &[hd * groups, h], w.wk)?,
-            gb.input(&p("wv2"), &[hd * groups, h], w.wv)?,
+            gb.input_bf16(&p("wq2"), &[h, h], std::borrow::Cow::Owned(wq_scaled))?,
+            gb.input_bf16(
+                &p("wk2"),
+                &[h, hd * groups],
+                std::borrow::Cow::Borrowed(w.wk),
+            )?,
+            gb.input_bf16(
+                &p("wv2"),
+                &[h, hd * groups],
+                std::borrow::Cow::Borrowed(w.wv),
+            )?,
         )
     };
-    let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
-    let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
-    let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
-    let t_wd = gb.input(&p("wd"), &[h, i], w.wd)?;
+    let t_wo = gb.input_bf16(&p("wo"), &[h, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
+    let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
+    let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
 
     let t_n1 = gb.mid(&p("n1"), &[h, t], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, t], SYN_TYPE_F32)?;
@@ -627,24 +658,24 @@ pub(crate) fn build_layer(
             &p("q_proj"),
             &[t_n1_4, t_wq],
             &[t_q],
-            pg.0,
-            pg.1,
+            pgt.0,
+            pgt.1,
         )?;
         gb.node(
             "batch_gemm",
             &p("k_proj"),
             &[t_n1_4, t_wk],
             &[t_k],
-            pg.0,
-            pg.1,
+            pgt.0,
+            pgt.1,
         )?;
         gb.node(
             "batch_gemm",
             &p("v_proj"),
             &[t_n1_4, t_wv],
             &[t_v],
-            pg.0,
-            pg.1,
+            pgt.0,
+            pgt.1,
         )?;
     } else {
         // `[features, t]` is `[hd, heads, t]`; the head layout wants the
@@ -671,8 +702,8 @@ pub(crate) fn build_layer(
                 &p(&format!("{name}_proj")),
                 &[t_n1, wt],
                 &[flat],
-                pg.0,
-                pg.1,
+                pgt.0,
+                pgt.1,
             )?;
             gb.node(
                 "reshape",
@@ -848,7 +879,7 @@ pub(crate) fn build_layer(
         none.0,
         none.1,
     )?;
-    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pg.0, pg.1)?;
+    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pgt.0, pgt.1)?;
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
@@ -870,10 +901,10 @@ pub(crate) fn build_layer(
         &p("gate_proj"),
         &[t_n2, t_wg],
         &[t_gate],
-        pg.0,
-        pg.1,
+        pgt.0,
+        pgt.1,
     )?;
-    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pg.0, pg.1)?;
+    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pgt.0, pgt.1)?;
     gb.node(
         "sigmoid_fwd_bf16",
         &p("sig"),
@@ -903,8 +934,8 @@ pub(crate) fn build_layer(
         &p("down_proj"),
         &[t_gated, t_wd],
         &[t_down],
-        pg.0,
-        pg.1,
+        pgt.0,
+        pgt.1,
     )?;
     gb.node(
         "add_fwd_bf16",
@@ -944,11 +975,11 @@ pub(crate) struct SharedBatched {
 /// Weights carry the same names and element counts as in [`build_layer`],
 /// so a runtime can share them with a prefill recipe.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub(crate) fn build_layer_batched(
-    gb: &mut Gb,
+pub(crate) fn build_layer_batched<'a>(
+    gb: &mut Gb<'a>,
     li: usize,
     x: synTensor,
-    w: &LayerWeights<'_>,
+    w: &LayerWeights<'a>,
     sh: &SharedBatched,
     hidden: usize,
     inter: usize,
@@ -968,7 +999,6 @@ pub(crate) fn build_layer_batched(
     );
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
-    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
     let t_g1 = gb.input(&p("g1"), &[h], w.g1)?;
     let t_g2 = gb.input(&p("g2"), &[h], w.g2)?;
     // With one row per sequence the projections are plain gemms with
@@ -977,13 +1007,25 @@ pub(crate) fn build_layer_batched(
     // outermost), so the head layout is a free reshape. These weights are
     // laid out differently from the wide recipe's per-head blocks, so they
     // get their own names and buffers.
-    let t_wq = gb.input(&p("wq2"), &[h, h], &wq_scaled)?;
-    let t_wk = gb.input(&p("wk2"), &[hd * groups, h], w.wk)?;
-    let t_wv = gb.input(&p("wv2"), &[hd * groups, h], w.wv)?;
-    let t_wo = gb.input(&p("wo"), &[h, h], w.wo)?;
-    let t_wg = gb.input(&p("wg"), &[i, h], w.wg)?;
-    let t_wu = gb.input(&p("wu"), &[i, h], w.wu)?;
-    let t_wd = gb.input(&p("wd"), &[h, i], w.wd)?;
+    let t_wq = gb.input_bf16(
+        &p("wq2"),
+        &[h, h],
+        std::borrow::Cow::Owned(scale_bf16(w.wq, w.scale)),
+    )?;
+    let t_wk = gb.input_bf16(
+        &p("wk2"),
+        &[h, hd * groups],
+        std::borrow::Cow::Borrowed(w.wk),
+    )?;
+    let t_wv = gb.input_bf16(
+        &p("wv2"),
+        &[h, hd * groups],
+        std::borrow::Cow::Borrowed(w.wv),
+    )?;
+    let t_wo = gb.input_bf16(&p("wo"), &[h, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
+    let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
+    let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
 
     let t_n1 = gb.mid(&p("n1"), &[h, b], bf)?;
     let t_inv1 = gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32)?;
@@ -1071,9 +1113,9 @@ pub(crate) fn build_layer_batched(
         prm.0,
         prm.1,
     )?;
-    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q2], pg.0, pg.1)?;
-    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k2], pg.0, pg.1)?;
-    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v2], pg.0, pg.1)?;
+    gb.node("gemm", &p("q_proj"), &[t_n1, t_wq], &[t_q2], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("k_proj"), &[t_n1, t_wk], &[t_k2], pgt.0, pgt.1)?;
+    gb.node("gemm", &p("v_proj"), &[t_n1, t_wv], &[t_v2], pgt.0, pgt.1)?;
     gb.node("reshape", &p("q_5d"), &[t_q2], &[t_q], none.0, none.1)?;
     gb.node("reshape", &p("k_5d"), &[t_k2], &[t_k], none.0, none.1)?;
     gb.node("reshape", &p("v_5d"), &[t_v2], &[t_v], none.0, none.1)?;
@@ -1181,7 +1223,7 @@ pub(crate) fn build_layer_batched(
     )?;
     gb.node("batch_gemm", &p("av"), &[t_pr, vco], &[t_at], pg.0, pg.1)?;
     gb.node("reshape", &p("attn_2d"), &[t_at], &[t_attn], none.0, none.1)?;
-    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pg.0, pg.1)?;
+    gb.node("gemm", &p("o_proj"), &[t_attn, t_wo], &[t_o], pgt.0, pgt.1)?;
     gb.node(
         "add_fwd_bf16",
         &p("res1"),
@@ -1203,10 +1245,10 @@ pub(crate) fn build_layer_batched(
         &p("gate_proj"),
         &[t_n2, t_wg],
         &[t_gate],
-        pg.0,
-        pg.1,
+        pgt.0,
+        pgt.1,
     )?;
-    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pg.0, pg.1)?;
+    gb.node("gemm", &p("up_proj"), &[t_n2, t_wu], &[t_up], pgt.0, pgt.1)?;
     gb.node(
         "sigmoid_fwd_bf16",
         &p("sig"),
@@ -1236,8 +1278,8 @@ pub(crate) fn build_layer_batched(
         &p("down_proj"),
         &[t_gated, t_wd],
         &[t_down],
-        pg.0,
-        pg.1,
+        pgt.0,
+        pgt.1,
     )?;
     gb.node(
         "add_fwd_bf16",
@@ -1262,10 +1304,10 @@ struct ReductionParams {
 /// `LOGITS`, readable on demand) and an argmax over the vocabulary produces
 /// the read-back tensor `IDS`, int32 `[1, tokens]`, so a decode step moves
 /// four bytes per token over the bus.
-pub(crate) fn build_head(
-    gb: &mut Gb,
+pub(crate) fn build_head<'a>(
+    gb: &mut Gb<'a>,
     cur: synTensor,
-    m: &ModelWeights<'_>,
+    m: &ModelWeights<'a>,
     tokens: usize,
     hidden: usize,
     vocab: usize,
@@ -1274,7 +1316,7 @@ pub(crate) fn build_head(
     let (t, h, v) = (tokens as u64, hidden as u64, vocab as u64);
     let bf = SYN_TYPE_BF16;
     let t_gf = gb.input("GF", &[h], m.final_gamma)?;
-    let t_lm = gb.input("LM", &[v, h], m.lm_head)?;
+    let t_lm = gb.input_bf16("LM", &[h, v], std::borrow::Cow::Borrowed(m.lm_head))?;
     let t_nf = gb.mid("nf", &[h, t], bf)?;
     let t_invf = gb.mid("invf", &[1, t], SYN_TYPE_F32)?;
     let (t_logits, n_logits) = if ids_out {
@@ -1298,10 +1340,6 @@ pub(crate) fn build_head(
         _pad: [0; 2],
         bwd_mode: 0,
     };
-    let gemm = synGEMMParams {
-        transpose_a: false,
-        transpose_b: false,
-    };
     gb.node(
         "rms_norm_fwd_bf16",
         "final_norm",
@@ -1310,12 +1348,16 @@ pub(crate) fn build_head(
         (&raw const rms).cast::<c_void>(),
         core::mem::size_of::<RmsNormParams>() as u32,
     )?;
+    let gemm_bt = synGEMMParams {
+        transpose_a: false,
+        transpose_b: true,
+    };
     gb.node(
         "gemm",
         "lm_head",
         &[t_nf, t_lm],
         &[t_lg],
-        (&raw const gemm).cast::<c_void>(),
+        (&raw const gemm_bt).cast::<c_void>(),
         core::mem::size_of::<synGEMMParams>() as u32,
     )?;
     if tpc_out {
@@ -1362,8 +1404,9 @@ pub struct ModelWeights<'a> {
     pub layers: Vec<LayerWeights<'a>>,
     /// Final RMSNorm gain, length `hidden`.
     pub final_gamma: &'a [f32],
-    /// LM head stored `[hidden, vocab]`.
-    pub lm_head: &'a [f32],
+    /// LM head, bf16 `[vocab, hidden]` (the checkpoint's layout; tied
+    /// embeddings as they are).
+    pub lm_head: &'a [u16],
 }
 
 /// Build the shared inputs (activations, RoPE caches, causal mask) and the
@@ -1371,16 +1414,16 @@ pub struct ModelWeights<'a> {
 /// last layer's output tensor. `probe_out` makes layer `upto` write into that
 /// persistent tensor.
 #[allow(clippy::too_many_arguments)]
-fn build_stack(
+fn build_stack<'a>(
     x: &[f32],
-    m: &ModelWeights<'_>,
+    m: &ModelWeights<'a>,
     tokens: usize,
     hidden: usize,
     inter: usize,
     causal: bool,
     upto: usize,
     probe_out: Option<synTensor>,
-) -> Result<(Gb, synTensor)> {
+) -> Result<(Gb<'a>, synTensor)> {
     let l0 = &m.layers[0];
     let hd = hidden / l0.n_heads;
     assert_eq!(l0.sin.len(), tokens * hd);
@@ -1524,15 +1567,18 @@ pub fn layer_cpu(
         }
         o
     };
-    // a[tokens, kin] @ mtx[kin, kout] -> [tokens, kout]
-    let matmul = |a: &[f32], mtx: &[f32], kin: usize, kout: usize| -> Vec<f32> {
+    // a[tokens, kin] @ W^T for W stored [kout, kin] (bf16) -> [tokens, kout]
+    let matmul = |a: &[f32], mtx: &[u16], kin: usize, kout: usize| -> Vec<f32> {
+        let wf: Vec<f32> = mtx.iter().map(|&b| bf16_to_f32(b)).collect();
         let mut o = vec![0.0f32; tokens * kout];
         for tk in 0..tokens {
-            for p in 0..kin {
-                let av = a[tk * kin + p];
-                for c in 0..kout {
-                    o[tk * kout + c] += av * mtx[p * kout + c];
-                }
+            for c in 0..kout {
+                let row = &wf[c * kin..(c + 1) * kin];
+                o[tk * kout + c] = a[tk * kin..(tk + 1) * kin]
+                    .iter()
+                    .zip(row)
+                    .map(|(x, y)| x * y)
+                    .sum();
             }
         }
         o
@@ -1556,7 +1602,7 @@ pub fn layer_cpu(
     };
 
     let n1 = rmsnorm(x, w.g1);
-    let wq_scaled: Vec<f32> = w.wq.iter().map(|v| v * w.scale).collect();
+    let wq_scaled = scale_bf16(w.wq, w.scale);
     let bias = |mut m: Vec<f32>, b: &[f32], scale: f32| -> Vec<f32> {
         if !b.is_empty() {
             let cols = b.len();
@@ -1645,7 +1691,7 @@ pub fn model_forward_cpu(
         for p in 0..hidden {
             let nv = cur[b + p] * inv * m.final_gamma[p];
             for c in 0..vocab {
-                logits[tk * vocab + c] += nv * m.lm_head[p * vocab + c];
+                logits[tk * vocab + c] += nv * bf16_to_f32(m.lm_head[c * hidden + p]);
             }
         }
     }
