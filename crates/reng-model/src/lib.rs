@@ -31,9 +31,30 @@ pub struct LlamaConfig {
     pub rms_norm_eps: f32,
     #[serde(default = "default_theta")]
     pub rope_theta: f32,
+    /// HF `rope_scaling`; only the `llama3` type is applied (the others are
+    /// reported as unsupported by [`LlamaConfig::load`]).
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
     pub vocab_size: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+}
+
+/// The `rope_scaling` object of a HF config. Llama 3.1 style scaling
+/// rescales the low-frequency rotary dims (see [`rope_caches_scaled`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScaling {
+    /// `rope_type` (newer configs) or `type` (older ones).
+    #[serde(default, alias = "type")]
+    pub rope_type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f32>,
+    #[serde(default)]
+    pub low_freq_factor: Option<f32>,
+    #[serde(default)]
+    pub high_freq_factor: Option<f32>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
 }
 
 impl LlamaConfig {
@@ -45,7 +66,18 @@ impl LlamaConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| Error::Other(format!("config.json: {e}")))?;
-        serde_json::from_str(&text).map_err(|e| Error::Other(format!("config.json: {e}")))
+        let cfg: Self =
+            serde_json::from_str(&text).map_err(|e| Error::Other(format!("config.json: {e}")))?;
+        if let Some(t) = cfg
+            .rope_scaling
+            .as_ref()
+            .and_then(|s| s.rope_type.as_deref())
+        {
+            if t != "llama3" && t != "default" {
+                eprintln!("config.json: rope_scaling type {t} is not applied");
+            }
+        }
+        Ok(cfg)
     }
 
     #[must_use]
@@ -340,13 +372,57 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
 /// Rotate-half RoPE caches `[tokens, head_dim]` for positions `0..tokens`.
 #[must_use]
 pub fn rope_caches(tokens: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec<f32>) {
+    rope_caches_scaled(tokens, head_dim, theta, None)
+}
+
+/// Rotate-half RoPE caches `[tokens, head_dim]` with the config's
+/// `rope_scaling` applied: for the `llama3` type each inverse frequency
+/// whose wavelength exceeds `original_max_position_embeddings /
+/// low_freq_factor` is divided by `factor`, those below `original /
+/// high_freq_factor` are kept, and the band between is blended linearly
+/// (`transformers` `_compute_llama3_parameters`). Other types are
+/// ignored. Diagnostic `RENG_NO_ROPE_SCALING` ignores every type.
+///
+/// # Panics
+///
+/// Panics if a `llama3` scaling lacks one of its four parameters.
+#[must_use]
+pub fn rope_caches_scaled(
+    tokens: usize,
+    head_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScaling>,
+) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
+    let mut inv: Vec<f32> = (0..half)
+        .map(|i| theta.powf(-2.0 * (i as f32) / head_dim as f32))
+        .collect();
+    let llama3 = scaling.filter(|s| {
+        s.rope_type.as_deref() == Some("llama3") && std::env::var("RENG_NO_ROPE_SCALING").is_err()
+    });
+    if let Some(s) = llama3 {
+        let factor = s.factor.expect("rope_scaling.factor");
+        let low = s.low_freq_factor.expect("rope_scaling.low_freq_factor");
+        let high = s.high_freq_factor.expect("rope_scaling.high_freq_factor");
+        let orig = s
+            .original_max_position_embeddings
+            .expect("rope_scaling.original_max_position_embeddings") as f32;
+        let (low_wavelen, high_wavelen) = (orig / low, orig / high);
+        for f in &mut inv {
+            let wavelen = 2.0 * std::f32::consts::PI / *f;
+            if wavelen > low_wavelen {
+                *f /= factor;
+            } else if wavelen >= high_wavelen {
+                let smooth = (orig / wavelen - low) / (high - low);
+                *f = (1.0 - smooth) * *f / factor + smooth * *f;
+            }
+        }
+    }
     let mut sin = vec![0.0f32; tokens * head_dim];
     let mut cos = vec![0.0f32; tokens * head_dim];
     for p in 0..tokens {
         for d in 0..head_dim {
-            let inv_freq = theta.powf(-2.0 * ((d % half) as f32) / head_dim as f32);
-            let ang = p as f32 * inv_freq;
+            let ang = p as f32 * inv[d % half];
             sin[p * head_dim + d] = ang.sin();
             cos[p * head_dim + d] = ang.cos();
         }
@@ -455,7 +531,12 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     let tokens = real.max(MIN_PREFILL_TOKENS);
     let mut padded: Vec<u32> = ids.to_vec();
     padded.resize(tokens, 0);
-    let (sin, cos) = rope_caches(tokens, cfg.head_dim(), cfg.rope_theta);
+    let (sin, cos) = rope_caches_scaled(
+        tokens,
+        cfg.head_dim(),
+        cfg.rope_theta,
+        cfg.rope_scaling.as_ref(),
+    );
     let x = embed_tokens(w, cfg, &padded);
     let m = layer_views(w, cfg, &sin, &cos);
     let mut logits = reng_synapse::model_forward_bf16(
@@ -495,7 +576,12 @@ impl<'a> Generator<'a> {
         decode_rows: usize,
         capacity: usize,
     ) -> Result<Self> {
-        let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
+        let (sin, cos) = rope_caches_scaled(
+            capacity,
+            cfg.head_dim(),
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+        );
         // The cached recipes take RoPE rows as per-step inputs, so the layer
         // views carry no tables (they would have to outlive `sin`).
         let m = layer_views(w, cfg, &[], &[]);
@@ -588,7 +674,12 @@ impl<'a> BatchedGenerator<'a> {
         rows: usize,
         capacity: usize,
     ) -> Result<Self> {
-        let (sin, cos) = rope_caches(capacity, cfg.head_dim(), cfg.rope_theta);
+        let (sin, cos) = rope_caches_scaled(
+            capacity,
+            cfg.head_dim(),
+            cfg.rope_theta,
+            cfg.rope_scaling.as_ref(),
+        );
         // The batched recipes take RoPE rows as per-step inputs, so the
         // layer views carry no tables (they would have to outlive `sin`).
         let m = layer_views(w, cfg, &[], &[]);
@@ -674,6 +765,24 @@ impl<'a> BatchedGenerator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llama3_scaling_moves_only_low_frequencies() {
+        let s = RopeScaling {
+            rope_type: Some("llama3".into()),
+            factor: Some(8.0),
+            low_freq_factor: Some(1.0),
+            high_freq_factor: Some(4.0),
+            original_max_position_embeddings: Some(8192),
+        };
+        let (sin_a, _) = rope_caches_scaled(2, 128, 500000.0, None);
+        let (sin_b, _) = rope_caches_scaled(2, 128, 500000.0, Some(&s));
+        // Dim 0 (highest frequency) is untouched, the last pair is divided by 8.
+        assert_eq!(sin_a[128], sin_b[128]);
+        let ang_a = sin_a[128 + 63].asin();
+        let ang_b = sin_b[128 + 63].asin();
+        assert!((ang_a / ang_b - 8.0).abs() < 1e-3, "{ang_a} {ang_b}");
+    }
 
     #[test]
     fn bf16_roundtrip() {

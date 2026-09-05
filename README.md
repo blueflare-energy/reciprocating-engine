@@ -80,9 +80,7 @@ against the `reng-ceiling` roofline:
 
 Decode percentages are against the HBM roofline, prefill against the MME
 roofline. Every model is verified against a Hugging Face f32 reference
-before it is listed (8 greedy tokens, exact up to bf16 near-ties). The
-Llama-3.1 rope scaling of the 8B distill is not applied yet, so that row
-holds only for short contexts. The `bench` workflow regenerates the decode-versus-batch table
+before it is listed (8 greedy tokens, exact up to bf16 near-ties). The `bench` workflow regenerates the decode-versus-batch table
 (the plan's Chart 2) at
 [dev/sweep/latest.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/latest.md)
 and the prefill-versus-context table (Chart 1) at
