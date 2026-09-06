@@ -11,145 +11,113 @@
     "SmolLM2-135M": {
       "1": {
         "ok": false,
-        "log": "den 576, vocab 49152; compiled rows 256 / decode rows 1 / capacity 1024 in 3.13s (device decode loop)\nfirst token 3.15s after start (weights loaded in 0.02s)\nprefill 128 tokens: 0.0034s = 37999 tok/s  (ceiling 1153328 tok/s, HbmBandwidth) = 3.29%\ndecode 32 tokens x batch 1 at ctx ~144: 863.0 tok/s, mean step 1.16 ms  (ceiling 8998 tok/s, HbmBandwidth) = 9.59%\nwrote /tmp/sweep-SmolLM2-135M-b1.json\n"
+        "log": "ecode ids: 32 ids step by step, fnv1a64 18fad106a114d60a, first [198, 198, 3757, 216, 33, 30, 33, 30]\nfirst token 3.22s after start (weights loaded in 0.02s)\nprefill 128 tokens: 0.0035s = 36687 tok/s  (ceiling 1153328 tok/s, HbmBandwidth) = 3.18%\ndecode 32 tokens x batch 1 at ctx ~144: 853.1 tok/s, mean step 1.17 ms  (ceiling 8998 tok/s, HbmBandwidth) = 9.48%\nwrote /tmp/sweep-SmolLM2-135M-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 6686.3,
-        "step_ms": 1.2,
-        "pct": 10.08
+        "ok": false,
+        "log": "ds: 256 ids step by step, fnv1a64 2c4d842d0a9df455, first [198, 198, 198, 198, 198, 198, 198, 198]\nfirst token 3.19s after start (weights loaded in 0.02s)\nprefill 128 tokens: 0.0029s = 44081 tok/s  (ceiling 1153328 tok/s, HbmBandwidth) = 3.82%\ndecode 32 tokens x batch 8 at ctx ~144: 7356.6 tok/s, mean step 1.09 ms  (ceiling 66328 tok/s, HbmBandwidth) = 11.09%\nwrote /tmp/sweep-SmolLM2-135M-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 39004.5,
-        "step_ms": 1.64,
-        "pct": 11.97
+        "ok": false,
+        "log": "048 ids step by step, fnv1a64 7ff0bda994c2b5a5, first [198, 198, 198, 198, 198, 198, 198, 198]\nfirst token 3.83s after start (weights loaded in 0.02s)\nprefill 128 tokens: 0.0036s = 35358 tok/s  (ceiling 1153328 tok/s, HbmBandwidth) = 3.07%\ndecode 32 tokens x batch 64 at ctx ~144: 42215.9 tok/s, mean step 1.52 ms  (ceiling 325787 tok/s, HbmBandwidth) = 12.96%\nwrote /tmp/sweep-SmolLM2-135M-b64.json\n"
       }
     },
     "SmolLM2-360M": {
       "1": {
         "ok": false,
-        "log": "den 960, vocab 49152; compiled rows 256 / decode rows 1 / capacity 1024 in 8.39s (device decode loop)\nfirst token 8.43s after start (weights loaded in 0.03s)\nprefill 128 tokens: 0.0044s = 29280 tok/s  (ceiling 430320 tok/s, HbmBandwidth) = 6.80%\ndecode 32 tokens x batch 1 at ctx ~144: 645.6 tok/s, mean step 1.55 ms  (ceiling 3359 tok/s, HbmBandwidth) = 19.22%\nwrote /tmp/sweep-SmolLM2-360M-b1.json\n"
+        "log": "decode ids: 32 ids step by step, fnv1a64 ec5e68554e3de619, first [198, 198, 504, 216, 33, 41, 41, 32]\nfirst token 3.48s after start (weights loaded in 0.04s)\nprefill 128 tokens: 0.0048s = 26835 tok/s  (ceiling 430320 tok/s, HbmBandwidth) = 6.24%\ndecode 32 tokens x batch 1 at ctx ~144: 640.4 tok/s, mean step 1.56 ms  (ceiling 3359 tok/s, HbmBandwidth) = 19.07%\nwrote /tmp/sweep-SmolLM2-360M-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 5333.9,
-        "step_ms": 1.5,
-        "pct": 20.97
+        "ok": false,
+        "log": "ids: 256 ids step by step, fnv1a64 db0dca46be184965, first [198, 198, 198, 198, 198, 198, 198, 198]\nfirst token 3.44s after start (weights loaded in 0.04s)\nprefill 128 tokens: 0.0041s = 31423 tok/s  (ceiling 430320 tok/s, HbmBandwidth) = 7.30%\ndecode 32 tokens x batch 8 at ctx ~144: 5756.0 tok/s, mean step 1.39 ms  (ceiling 25431 tok/s, HbmBandwidth) = 22.63%\nwrote /tmp/sweep-SmolLM2-360M-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 30012.5,
-        "step_ms": 2.13,
-        "pct": 21.07
+        "ok": false,
+        "log": "2048 ids step by step, fnv1a64 6ac13b8e6557a825, first [198, 198, 198, 198, 198, 198, 198, 198]\nfirst token 4.16s after start (weights loaded in 0.04s)\nprefill 128 tokens: 0.0048s = 26652 tok/s  (ceiling 430320 tok/s, HbmBandwidth) = 6.19%\ndecode 32 tokens x batch 64 at ctx ~144: 32200.4 tok/s, mean step 1.99 ms  (ceiling 142415 tok/s, HbmBandwidth) = 22.61%\nwrote /tmp/sweep-SmolLM2-360M-b64.json\n"
       }
     },
     "Qwen2.5-0.5B": {
       "1": {
         "ok": false,
-        "log": "n 896, vocab 151936; compiled rows 256 / decode rows 1 / capacity 1024 in 3.73s (device decode loop)\nfirst token 3.79s after start (weights loaded in 0.05s)\nprefill 128 tokens: 0.0036s = 35178 tok/s  (ceiling 316929 tok/s, HbmBandwidth) = 11.10%\ndecode 32 tokens x batch 1 at ctx ~144: 799.1 tok/s, mean step 1.25 ms  (ceiling 2476 tok/s, HbmBandwidth) = 32.28%\nwrote /tmp/sweep-Qwen2.5-0.5B-b1.json\n"
+        "log": ")\ndecode ids: 32 ids step by step, fnv1a64 d7c8acf1a339f4b9, first [220, 16, 15, 15, 15, 15, 15, 15]\nfirst token 3.94s after start (weights loaded in 0.04s)\nprefill 128 tokens: 0.0038s = 33522 tok/s  (ceiling 316929 tok/s, HbmBandwidth) = 10.58%\ndecode 32 tokens x batch 1 at ctx ~144: 798.9 tok/s, mean step 1.25 ms  (ceiling 2476 tok/s, HbmBandwidth) = 32.27%\nwrote /tmp/sweep-Qwen2.5-0.5B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 5696.9,
-        "step_ms": 1.4,
-        "pct": 29.13
+        "ok": false,
+        "log": "ds: 256 ids step by step, fnv1a64 45e1e3a8947d08a5, first [220, 220, 220, 220, 220, 220, 220, 220]\nfirst token 3.98s after start (weights loaded in 0.06s)\nprefill 128 tokens: 0.0035s = 36557 tok/s  (ceiling 316929 tok/s, HbmBandwidth) = 11.53%\ndecode 32 tokens x batch 8 at ctx ~144: 6194.5 tok/s, mean step 1.29 ms  (ceiling 19559 tok/s, HbmBandwidth) = 31.67%\nwrote /tmp/sweep-Qwen2.5-0.5B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 34957.9,
-        "step_ms": 1.83,
-        "pct": 24.55
+        "ok": false,
+        "log": "2048 ids step by step, fnv1a64 77264b5555b94f25, first [220, 220, 220, 220, 220, 220, 220, 220]\nfirst token 4.56s after start (weights loaded in 0.04s)\nprefill 128 tokens: 0.0044s = 29015 tok/s  (ceiling 316929 tok/s, HbmBandwidth) = 9.15%\ndecode 32 tokens x batch 64 at ctx ~144: 38532.6 tok/s, mean step 1.66 ms  (ceiling 142394 tok/s, HbmBandwidth) = 27.06%\nwrote /tmp/sweep-Qwen2.5-0.5B-b64.json\n"
       }
     },
     "Qwen2.5-1.5B": {
       "1": {
         "ok": false,
-        "log": "n 1536, vocab 151936; compiled rows 256 / decode rows 1 / capacity 1024 in 6.25s (device decode loop)\nfirst token 6.45s after start (weights loaded in 0.19s)\nprefill 128 tokens: 0.0057s = 22397 tok/s  (ceiling 101462 tok/s, HbmBandwidth) = 22.07%\ndecode 32 tokens x batch 1 at ctx ~144: 420.4 tok/s, mean step 2.38 ms  (ceiling 793 tok/s, HbmBandwidth) = 53.05%\nwrote /tmp/sweep-Qwen2.5-1.5B-b1.json\n"
+        "log": "p)\ndecode ids: 32 ids step by step, fnv1a64 9cb70f1d7d73426e, first [428, 16, 15, 15, 15, 15, 15, 15]\nfirst token 4.71s after start (weights loaded in 0.13s)\nprefill 128 tokens: 0.0062s = 20790 tok/s  (ceiling 101462 tok/s, HbmBandwidth) = 20.49%\ndecode 32 tokens x batch 1 at ctx ~144: 426.3 tok/s, mean step 2.35 ms  (ceiling 793 tok/s, HbmBandwidth) = 53.79%\nwrote /tmp/sweep-Qwen2.5-1.5B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 3118.5,
-        "step_ms": 2.57,
-        "pct": 49.64
+        "ok": false,
+        "log": "ids: 256 ids step by step, fnv1a64 4ea9864bc4dea445, first [428, 428, 428, 428, 428, 428, 428, 428]\nfirst token 4.65s after start (weights loaded in 0.16s)\nprefill 128 tokens: 0.0061s = 21000 tok/s  (ceiling 101462 tok/s, HbmBandwidth) = 20.70%\ndecode 32 tokens x batch 8 at ctx ~144: 3288.4 tok/s, mean step 2.43 ms  (ceiling 6282 tok/s, HbmBandwidth) = 52.35%\nwrote /tmp/sweep-Qwen2.5-1.5B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 20025.1,
-        "step_ms": 3.19,
-        "pct": 42.8
+        "ok": false,
+        "log": "2048 ids step by step, fnv1a64 10bed4689b036425, first [428, 428, 428, 428, 428, 428, 428, 428]\nfirst token 4.67s after start (weights loaded in 0.13s)\nprefill 128 tokens: 0.0064s = 19986 tok/s  (ceiling 101462 tok/s, HbmBandwidth) = 19.70%\ndecode 32 tokens x batch 64 at ctx ~144: 21266.8 tok/s, mean step 3.01 ms  (ceiling 46787 tok/s, HbmBandwidth) = 45.45%\nwrote /tmp/sweep-Qwen2.5-1.5B-b64.json\n"
       }
     },
     "TinyLlama-1.1B": {
       "1": {
         "ok": false,
-        "log": "2048, vocab 32000; compiled rows 256 / decode rows 1 / capacity 1024 in 4.15s (device decode loop)\nfirst token 4.29s after start (weights loaded in 0.13s)\nprefill 128 tokens: 0.0051s = 25130 tok/s  (ceiling 151372 tok/s, HbmBandwidth) = 16.60%\ndecode 32 tokens x batch 1 at ctx ~144: 587.5 tok/s, mean step 1.70 ms  (ceiling 1182 tok/s, HbmBandwidth) = 49.69%\nwrote /tmp/sweep-TinyLlama-1.1B-b1.json\n"
+        "log": " by step, fnv1a64 ffd10d31d2cd9b21, first [29896, 29900, 29900, 29900, 29900, 29900, 29900, 29900]\nfirst token 4.38s after start (weights loaded in 0.12s)\nprefill 128 tokens: 0.0059s = 21566 tok/s  (ceiling 151372 tok/s, HbmBandwidth) = 14.25%\ndecode 32 tokens x batch 1 at ctx ~144: 581.7 tok/s, mean step 1.72 ms  (ceiling 1182 tok/s, HbmBandwidth) = 49.20%\nwrote /tmp/sweep-TinyLlama-1.1B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 4600.2,
-        "step_ms": 1.74,
-        "pct": 49.17
+        "ok": false,
+        "log": "by step, fnv1a64 6715914a75f51a65, first [29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896]\nfirst token 4.04s after start (weights loaded in 0.11s)\nprefill 128 tokens: 0.0053s = 24017 tok/s  (ceiling 151372 tok/s, HbmBandwidth) = 15.87%\ndecode 32 tokens x batch 8 at ctx ~144: 4779.2 tok/s, mean step 1.67 ms  (ceiling 9357 tok/s, HbmBandwidth) = 51.08%\nwrote /tmp/sweep-TinyLlama-1.1B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 27343.9,
-        "step_ms": 2.32,
-        "pct": 39.7
+        "ok": false,
+        "log": "tep, fnv1a64 68c74c7831c9f125, first [29896, 29896, 29896, 29896, 29896, 29896, 29896, 29896]\nfirst token 4.77s after start (weights loaded in 0.09s)\nprefill 128 tokens: 0.0060s = 21240 tok/s  (ceiling 151372 tok/s, HbmBandwidth) = 14.03%\ndecode 32 tokens x batch 64 at ctx ~144: 29250.5 tok/s, mean step 2.19 ms  (ceiling 68879 tok/s, HbmBandwidth) = 42.47%\nwrote /tmp/sweep-TinyLlama-1.1B-b64.json\n"
       }
     },
     "SmolLM2-1.7B": {
       "1": {
         "ok": false,
-        "log": "den 2048, vocab 49152; compiled rows 256 / decode rows 1 / capacity 1024 in 7.91s (device decode loop)\nfirst token 8.07s after start (weights loaded in 0.15s)\nprefill 128 tokens: 0.0087s = 14630 tok/s  (ceiling 90959 tok/s, HbmBandwidth) = 16.08%\ndecode 32 tokens x batch 1 at ctx ~144: 399.2 tok/s, mean step 2.50 ms  (ceiling 710 tok/s, HbmBandwidth) = 56.23%\nwrote /tmp/sweep-SmolLM2-1.7B-b1.json\n"
+        "log": "ode ids: 32 ids step by step, fnv1a64 a7c35111edf1f93f, first [269, 813, 309, 100, 309, 100, 269, 813]\nfirst token 4.55s after start (weights loaded in 0.15s)\nprefill 128 tokens: 0.0090s = 14206 tok/s  (ceiling 90959 tok/s, HbmBandwidth) = 15.62%\ndecode 32 tokens x batch 1 at ctx ~144: 397.0 tok/s, mean step 2.52 ms  (ceiling 710 tok/s, HbmBandwidth) = 55.92%\nwrote /tmp/sweep-SmolLM2-1.7B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 3061.2,
-        "step_ms": 2.61,
-        "pct": 56.99
+        "ok": false,
+        "log": " ids: 256 ids step by step, fnv1a64 5a7b66863477d855, first [269, 269, 269, 269, 269, 269, 269, 269]\nfirst token 4.51s after start (weights loaded in 0.15s)\nprefill 128 tokens: 0.0085s = 15067 tok/s  (ceiling 90959 tok/s, HbmBandwidth) = 16.57%\ndecode 32 tokens x batch 8 at ctx ~144: 3182.2 tok/s, mean step 2.51 ms  (ceiling 5371 tok/s, HbmBandwidth) = 59.24%\nwrote /tmp/sweep-SmolLM2-1.7B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 13853.2,
-        "step_ms": 4.62,
-        "pct": 46.25
+        "ok": false,
+        "log": " 2048 ids step by step, fnv1a64 ce33a6cc0b1dfea5, first [269, 269, 269, 269, 269, 269, 269, 269]\nfirst token 4.73s after start (weights loaded in 0.15s)\nprefill 128 tokens: 0.0090s = 14186 tok/s  (ceiling 90959 tok/s, HbmBandwidth) = 15.60%\ndecode 32 tokens x batch 64 at ctx ~144: 14449.4 tok/s, mean step 4.43 ms  (ceiling 29955 tok/s, HbmBandwidth) = 48.24%\nwrote /tmp/sweep-SmolLM2-1.7B-b64.json\n"
       }
     },
     "Qwen2.5-3B": {
       "1": {
         "ok": false,
-        "log": "dden 2048, vocab 151936; compiled rows 256 / decode rows 1 / capacity 1024 in 8.19s (device decode loop)\nfirst token 8.40s after start (weights loaded in 0.20s)\nprefill 128 tokens: 0.0088s = 14500 tok/s  (ceiling 50776 tok/s, HbmBandwidth) = 28.56%\ndecode 32 tokens x batch 1 at ctx ~144: 255.1 tok/s, mean step 3.92 ms  (ceiling 397 tok/s, HbmBandwidth) = 64.32%\nwrote /tmp/sweep-Qwen2.5-3B-b1.json\n"
+        "log": "loop)\ndecode ids: 32 ids step by step, fnv1a64 d7c8acf1a339f4b9, first [220, 16, 15, 15, 15, 15, 15, 15]\nfirst token 5.51s after start (weights loaded in 0.28s)\nprefill 128 tokens: 0.0090s = 14295 tok/s  (ceiling 50776 tok/s, HbmBandwidth) = 28.15%\ndecode 32 tokens x batch 1 at ctx ~144: 256.8 tok/s, mean step 3.89 ms  (ceiling 397 tok/s, HbmBandwidth) = 64.75%\nwrote /tmp/sweep-Qwen2.5-3B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 1940.4,
-        "step_ms": 4.12,
-        "pct": 61.52
+        "ok": false,
+        "log": "de ids: 256 ids step by step, fnv1a64 45e1e3a8947d08a5, first [220, 220, 220, 220, 220, 220, 220, 220]\nfirst token 5.52s after start (weights loaded in 0.27s)\nprefill 128 tokens: 0.0091s = 14042 tok/s  (ceiling 50776 tok/s, HbmBandwidth) = 27.66%\ndecode 32 tokens x batch 8 at ctx ~144: 2005.4 tok/s, mean step 3.99 ms  (ceiling 3154 tok/s, HbmBandwidth) = 63.58%\nwrote /tmp/sweep-Qwen2.5-3B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 12470.7,
-        "step_ms": 5.1,
-        "pct": 51.78
+        "ok": false,
+        "log": "s: 2048 ids step by step, fnv1a64 77264b5555b94f25, first [220, 220, 220, 220, 220, 220, 220, 220]\nfirst token 6.41s after start (weights loaded in 0.17s)\nprefill 128 tokens: 0.0098s = 13106 tok/s  (ceiling 50776 tok/s, HbmBandwidth) = 25.81%\ndecode 32 tokens x batch 64 at ctx ~144: 13361.5 tok/s, mean step 4.79 ms  (ceiling 24082 tok/s, HbmBandwidth) = 55.48%\nwrote /tmp/sweep-Qwen2.5-3B-b64.json\n"
       }
     },
     "Qwen2.5-7B": {
       "1": {
         "ok": false,
-        "log": "dden 3584, vocab 152064; compiled rows 256 / decode rows 1 / capacity 1024 in 9.88s (device decode loop)\nfirst token 10.43s after start (weights loaded in 0.53s)\nprefill 128 tokens: 0.0153s = 8362 tok/s  (ceiling 22166 tok/s, HbmBandwidth) = 37.73%\ndecode 32 tokens x batch 1 at ctx ~144: 139.0 tok/s, mean step 7.19 ms  (ceiling 173 tok/s, HbmBandwidth) = 80.26%\nwrote /tmp/sweep-Qwen2.5-7B-b1.json\n"
+        "log": "e loop)\ndecode ids: 32 ids step by step, fnv1a64 9c54663707f92a3a, first [16, 15, 15, 15, 15, 15, 15, 15]\nfirst token 8.40s after start (weights loaded in 0.38s)\nprefill 128 tokens: 0.0157s = 8163 tok/s  (ceiling 22166 tok/s, HbmBandwidth) = 36.83%\ndecode 32 tokens x batch 1 at ctx ~144: 139.4 tok/s, mean step 7.17 ms  (ceiling 173 tok/s, HbmBandwidth) = 80.52%\nwrote /tmp/sweep-Qwen2.5-7B-b1.json\n"
       },
       "8": {
-        "ok": true,
-        "tok_s": 1064.1,
-        "step_ms": 7.53,
-        "pct": 77.13
+        "ok": false,
+        "log": "oop)\ndecode ids: 256 ids step by step, fnv1a64 583be5e5bcf71465, first [16, 16, 16, 16, 16, 16, 16, 16]\nfirst token 7.94s after start (weights loaded in 0.54s)\nprefill 128 tokens: 0.0158s = 8113 tok/s  (ceiling 22166 tok/s, HbmBandwidth) = 36.60%\ndecode 32 tokens x batch 8 at ctx ~144: 1082.4 tok/s, mean step 7.39 ms  (ceiling 1380 tok/s, HbmBandwidth) = 78.45%\nwrote /tmp/sweep-Qwen2.5-7B-b8.json\n"
       },
       "64": {
-        "ok": true,
-        "tok_s": 7482.8,
-        "step_ms": 8.55,
-        "pct": 70.0
+        "ok": false,
+        "log": "\ndecode ids: 2048 ids step by step, fnv1a64 f3623cc9e7882d25, first [16, 16, 16, 16, 16, 16, 16, 16]\nfirst token 8.54s after start (weights loaded in 0.35s)\nprefill 128 tokens: 0.0159s = 8061 tok/s  (ceiling 22166 tok/s, HbmBandwidth) = 36.37%\ndecode 32 tokens x batch 64 at ctx ~144: 7664.1 tok/s, mean step 8.35 ms  (ceiling 10689 tok/s, HbmBandwidth) = 71.70%\nwrote /tmp/sweep-Qwen2.5-7B-b64.json\n"
       }
     }
   }
