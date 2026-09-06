@@ -127,8 +127,10 @@ token id and a position, gathers the embedding row, the RoPE rows and
 the mask row on the device and builds its own cache-write indices, and
 its argmax lands in an id ring that the next launch reads from, so
 `Generator::generate` enqueues every step back to back and reads all the
-ids once (`RENG_DEVICE_LOOP=0` restores the per-step uploads and
-readback). Attention reads the whole cache every step, so the batched
+ids once; the batched recipe does the same for `B` sequences at once
+from `B` ids and `B` positions per launch (`BatchedGenerator::generate`;
+`RENG_DEVICE_LOOP=0` restores the per-step uploads and readback on both
+paths). Attention reads the whole cache every step, so the batched
 decoder compiles its recipes for the smallest bucket of positions (256,
 doubling) that holds the longest live sequence and grows on demand,
 recompiling and copying the used rows across. Single-sequence decode is

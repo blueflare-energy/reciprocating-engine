@@ -1345,7 +1345,10 @@ impl<'a> Generator<'a> {
 }
 
 /// `B` sequences decoded in lockstep with a `B`-slot KV cache; prompts are
-/// prefilled one sequence at a time.
+/// prefilled one sequence at a time. Steps go through the device decode
+/// loop when it was built (see `reng_synapse::BatchedModel`), which
+/// gathers the `B` embeddings on the device and can run many greedy steps
+/// per readback ([`BatchedGenerator::generate`]).
 #[cfg(feature = "link-synapse")]
 pub struct BatchedGenerator<'a> {
     model: reng_synapse::BatchedModel<'a>,
@@ -1372,6 +1375,10 @@ impl<'a> BatchedGenerator<'a> {
         // The batched recipes take RoPE rows as per-step inputs, so the
         // layer views carry no tables (they would have to outlive `rope`).
         let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let embed = reng_synapse::EmbedTable {
+            rows: &w.embed,
+            scale: cfg.embed_scale(),
+        };
         let model = reng_synapse::BatchedModel::new(
             m,
             cfg.hidden_size,
@@ -1381,6 +1388,7 @@ impl<'a> BatchedGenerator<'a> {
             rows,
             capacity,
             &rope.tables(),
+            Some(&embed),
         )?;
         Ok(Self { model, w, cfg })
     }
@@ -1389,6 +1397,12 @@ impl<'a> BatchedGenerator<'a> {
     #[must_use]
     pub fn batch(&self) -> usize {
         self.model.batch()
+    }
+
+    /// Whether steps run through the device decode loop.
+    #[must_use]
+    pub fn device_loop(&self) -> bool {
+        self.model.has_loop()
     }
 
     /// Start sequence `b` afresh and feed it `ids`; returns the logits of
@@ -1420,6 +1434,9 @@ impl<'a> BatchedGenerator<'a> {
     /// Panics if `ids` is not one id per sequence.
     pub fn step(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         assert_eq!(ids.len(), self.model.batch());
+        if self.model.has_loop() {
+            return Ok(self.model.run_ids_logits(ids, 1)?.1);
+        }
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.step(&x)
     }
@@ -1445,8 +1462,44 @@ impl<'a> BatchedGenerator<'a> {
     /// Returns an error if a device run fails.
     pub fn step_ids(&mut self, ids: &[u32]) -> Result<Vec<u32>> {
         assert_eq!(ids.len(), self.model.batch());
+        if self.model.has_loop() {
+            return self.model.run_ids(ids, 1);
+        }
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.step_ids(&x)
+    }
+
+    /// Feed `seeds` (one id per sequence) and continue every sequence
+    /// greedily for `n` tokens in all: the returned `n * batch` ids are
+    /// step by step (`out[j * batch + b]` is sequence `b`'s argmax after
+    /// step `j`; the last step's ids are not appended). With the device
+    /// decode loop this is `n` launches and one readback; without it, `n`
+    /// calls of [`BatchedGenerator::step_ids`]. Every sequence advances
+    /// `n` positions whether or not it has finished: a caller that wants
+    /// to stop a sequence at EOS drops its later ids, or runs shorter runs
+    /// and restarts the slot with a new prefill.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seeds` is not one id per sequence, `n` is 0 or the run
+    /// would overflow the cache.
+    pub fn generate(&mut self, seeds: &[u32], n: usize) -> Result<Vec<u32>> {
+        assert!(n >= 1);
+        assert_eq!(seeds.len(), self.model.batch());
+        if self.model.has_loop() {
+            return self.model.run_ids(seeds, n);
+        }
+        let mut out = Vec::with_capacity(n * seeds.len());
+        let mut next = seeds.to_vec();
+        for _ in 0..n {
+            next = self.step_ids(&next)?;
+            out.extend_from_slice(&next);
+        }
+        Ok(out)
     }
 }
 

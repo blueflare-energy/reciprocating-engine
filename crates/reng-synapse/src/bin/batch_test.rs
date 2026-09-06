@@ -3,7 +3,7 @@
 //! time, then advanced together for several steps; every sequence's step
 //! logits must match the CPU reference over that sequence alone.
 //!
-//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps] [batch] [post_norm] [qk_norm]`
+//! `cargo run -p reng-synapse --features link-synapse --bin reng-batch-test -- [rows] [hidden] [inter] [n_heads] [vocab] [layers] [n_kv_heads] [capacity] [steps] [batch] [post_norm] [qk_norm] [loop_steps]`
 //!
 //! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
 //! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
@@ -12,9 +12,22 @@
 //! window of 100 positions on the even layers and a second RoPE table on
 //! the odd ones. With `RENG_TEST_BIAS` set the layers have Qwen2-style
 //! attention biases (the fused q/k/v projection).
+//! The embeddings are scaled by 2 on the device.
+//!
+//! The model gets a synthetic embedding table whose row `b * steps + s` is
+//! sequence `b`'s input row at its step `s`, so when the device decode
+//! loop is built (`RENG_DEVICE_LOOP` not off) the steps are fed as token
+//! ids through it, one launch at a time, and checked like the per-step
+//! path. Then `loop_steps` (default 4) greedy steps run as one device run
+//! from the argmax of every sequence's last step: each sequence's
+//! last-step logits are checked against the CPU reference over the
+//! sequence the loop produced, and a second pass over the same prompts
+//! feeds the same ids one launch at a time, which must reproduce the run's
+//! ids and last logits exactly.
 
 use reng_synapse::{
-    Activation, BatchedModel, LayerWeights, ModelWeights, RopeTables, model_forward_cpu, to_bf16,
+    Activation, BatchedModel, EmbedTable, LayerWeights, ModelWeights, RopeTables, bf16_to_f32,
+    model_forward_cpu, to_bf16,
 };
 use std::time::Instant;
 
@@ -83,6 +96,7 @@ fn main() -> reng_core::Result<()> {
     let batch = arg(10, 3usize);
     let post_norm = arg(11, 0usize) != 0;
     let qk_norm = arg(12, 0usize);
+    let loop_steps = arg(13, 4usize);
     let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
     // Qwen2-style attention biases (the fused q/k/v projection).
     let bias = std::env::var_os("RENG_TEST_BIAS").is_some();
@@ -91,8 +105,12 @@ fn main() -> reng_core::Result<()> {
         .collect();
     let longest = prompts.iter().max().copied().unwrap() + steps;
     assert!(
-        longest <= capacity,
-        "sequence {longest} exceeds capacity {capacity}"
+        longest + loop_steps <= capacity,
+        "sequence {longest} + {loop_steps} loop steps exceeds capacity {capacity}"
+    );
+    assert!(
+        batch * steps <= vocab,
+        "the step rows are fed as their own ids: batch {batch} x steps {steps} must fit vocab {vocab}"
     );
     let hd = hidden / n_heads;
     let kvd = n_kv_heads * hd;
@@ -124,9 +142,9 @@ fn main() -> reng_core::Result<()> {
         }
         (sin, cos)
     };
-    let (sin_seq, cos_seq) = rope(longest, 10000.0);
+    let (sin_seq, cos_seq) = rope(longest + loop_steps, 10000.0);
     let (sin_cap, cos_cap) = rope(capacity, 10000.0);
-    let (sinl_seq, cosl_seq) = rope(longest, 1000.0);
+    let (sinl_seq, cosl_seq) = rope(longest + loop_steps, 1000.0);
     let (sinl_cap, cosl_cap) = rope(capacity, 1000.0);
     let post_gain = |l: usize, k: usize| -> Vec<f32> {
         if gemma {
@@ -232,8 +250,42 @@ fn main() -> reng_core::Result<()> {
     let inputs: Vec<Vec<f32>> = (0..batch)
         .map(|b| seq(longest * hidden, 7 + b, 3 + 2 * b, 23, 1.0))
         .collect();
+    // The embedding table: row `b * steps + s` is sequence b's input row
+    // at step s (halved when the device scales by 2, an exact operation
+    // in bf16), the rest dense random rows for the ids the loop produces.
+    let embed_scale = if gemma { 2.0 } else { 1.0 };
+    let mut embed = to_bf16(&seq(vocab * hidden, 31, 11, 47, 1.0 / embed_scale));
+    for (b, &n) in prompts.iter().enumerate() {
+        for s in 0..steps {
+            let row = &inputs[b][(n + s) * hidden..(n + s + 1) * hidden];
+            let at = (b * steps + s) * hidden;
+            embed[at..at + hidden].copy_from_slice(&to_bf16(
+                &row.iter().map(|v| v / embed_scale).collect::<Vec<f32>>(),
+            ));
+        }
+    }
+    let table = EmbedTable {
+        rows: &embed,
+        scale: embed_scale,
+    };
+    // The row of the table for `id`, as the device feeds it.
+    let embed_row = |id: u32| -> Vec<f32> {
+        let id = id as usize;
+        embed[id * hidden..(id + 1) * hidden]
+            .iter()
+            .map(|&b| bf16_to_f32(b) * embed_scale)
+            .collect()
+    };
+    let argmax = |row: &[f32]| -> u32 {
+        row.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| {
+                if v > b.1 { (i, v) } else { b }
+            })
+            .0 as u32
+    };
     println!(
-        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}, bias={bias}"
+        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, loop_steps={loop_steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}, bias={bias}"
     );
 
     let t0 = Instant::now();
@@ -256,34 +308,106 @@ fn main() -> reng_core::Result<()> {
         rows,
         capacity,
         &rope_cap,
+        Some(&table),
     )?;
-    println!("compile + upload: {:.2}s", t0.elapsed().as_secs_f32());
+    println!(
+        "compile + upload: {:.2}s{}",
+        t0.elapsed().as_secs_f32(),
+        if bm.has_loop() {
+            " (device decode loop)"
+        } else {
+            ""
+        }
+    );
 
-    for (b, &n) in prompts.iter().enumerate() {
-        bm.reset(b);
+    // Prefill every sequence, then the batched steps: sequence b's next
+    // token is its input row at position pos, fed as that row's id through
+    // the loop (one launch at a time) or as the row itself.
+    let run_steps = |bm: &mut BatchedModel<'_>| -> reng_core::Result<Vec<Vec<f32>>> {
+        for (b, &n) in prompts.iter().enumerate() {
+            bm.reset(b);
+            let t1 = Instant::now();
+            bm.prefill(b, &inputs[b][..n * hidden])?;
+            println!(
+                "prefill sequence {b}: {n} tokens: {:.1} ms",
+                t1.elapsed().as_secs_f32() * 1000.0
+            );
+            assert_eq!(bm.position(b), n);
+        }
+        let mut step_logits: Vec<Vec<f32>> = vec![Vec::new(); batch];
+        for s in 0..steps {
+            let t1 = Instant::now();
+            let logits = if bm.has_loop() {
+                let ids: Vec<u32> = (0..batch).map(|b| (b * steps + s) as u32).collect();
+                bm.run_ids_logits(&ids, 1)?.1
+            } else {
+                let mut x = Vec::with_capacity(batch * hidden);
+                for (b, &n) in prompts.iter().enumerate() {
+                    let pos = n + s;
+                    x.extend_from_slice(&inputs[b][pos * hidden..(pos + 1) * hidden]);
+                }
+                bm.step(&x)?
+            };
+            println!(
+                "step {s}: {:.2} ms{}",
+                t1.elapsed().as_secs_f32() * 1000.0,
+                if bm.has_loop() {
+                    " (device loop, by id)"
+                } else {
+                    ""
+                }
+            );
+            for b in 0..batch {
+                step_logits[b].extend_from_slice(&logits[b * vocab..(b + 1) * vocab]);
+            }
+        }
+        for (b, &n) in prompts.iter().enumerate() {
+            assert_eq!(bm.position(b), n + steps);
+        }
+        Ok(step_logits)
+    };
+    let step_logits = run_steps(&mut bm)?;
+
+    // The device loop: `loop_steps` greedy steps for every sequence as one
+    // run, then the same ids one launch at a time over a fresh pass.
+    let loop_check = if bm.has_loop() && loop_steps > 0 {
+        let seeds: Vec<u32> = (0..batch)
+            .map(|b| argmax(&step_logits[b][(steps - 1) * vocab..]))
+            .collect();
         let t1 = Instant::now();
-        bm.prefill(b, &inputs[b][..n * hidden])?;
+        let (ids, last) = bm.run_ids_logits(&seeds, loop_steps)?;
         println!(
-            "prefill sequence {b}: {n} tokens: {:.1} ms",
+            "loop: {loop_steps} steps x {batch} sequences from seeds {seeds:?}: {:.1} ms, ids {ids:?}",
             t1.elapsed().as_secs_f32() * 1000.0
         );
-        assert_eq!(bm.position(b), n);
-    }
-    // Batched steps: sequence b's next token is its input row at position pos.
-    let mut step_logits: Vec<Vec<f32>> = vec![Vec::new(); batch];
-    for s in 0..steps {
-        let mut x = Vec::with_capacity(batch * hidden);
+        assert_eq!(ids.len(), loop_steps * batch);
+        assert_eq!(last.len(), batch * vocab);
         for (b, &n) in prompts.iter().enumerate() {
-            let pos = n + s;
-            x.extend_from_slice(&inputs[b][pos * hidden..(pos + 1) * hidden]);
+            assert_eq!(bm.position(b), n + steps + loop_steps);
         }
-        let t1 = Instant::now();
-        let logits = bm.step(&x)?;
-        println!("step {s}: {:.2} ms", t1.elapsed().as_secs_f32() * 1000.0);
-        for b in 0..batch {
-            step_logits[b].extend_from_slice(&logits[b * vocab..(b + 1) * vocab]);
+        let step_logits2 = run_steps(&mut bm)?;
+        assert!(
+            step_logits2 == step_logits,
+            "second pass of the prompts and steps differs"
+        );
+        let mut single: Vec<u32> = Vec::with_capacity(loop_steps * batch);
+        let mut next = seeds.clone();
+        let mut single_last = Vec::new();
+        for _ in 0..loop_steps {
+            let (out, logits) = bm.run_ids_logits(&next, 1)?;
+            single.extend_from_slice(&out);
+            next = out;
+            single_last = logits;
         }
-    }
+        let same = single == ids && single_last == last;
+        println!(
+            "loop: one launch at a time gives ids {single:?}: {}",
+            if same { "identical" } else { "DIFFERENT" }
+        );
+        Some((seeds, ids, last, same))
+    } else {
+        None
+    };
 
     let mut worst = 0.0f32;
     let mut agree = 0usize;
@@ -321,12 +445,49 @@ fn main() -> reng_core::Result<()> {
         "worst rel_L2={worst:.4}  top1_agree={agree}/{}",
         batch * steps
     );
-    if worst < 0.05 {
+    // The loop's last step of every sequence against the CPU reference
+    // over the sequence it produced (the seed and all but the last id
+    // appended to the prompt and steps).
+    let mut loop_ok = true;
+    if let Some((seeds, ids, last, same)) = loop_check {
+        let mut worst_last = 0.0f32;
+        let mut agree_loop = 0usize;
+        let mut consistent = true;
+        for (b, &n) in prompts.iter().enumerate() {
+            let mut x_ext = inputs[b][..(n + steps) * hidden].to_vec();
+            x_ext.extend(embed_row(seeds[b]));
+            for j in 0..loop_steps - 1 {
+                x_ext.extend(embed_row(ids[j * batch + b]));
+            }
+            let total = n + steps + loop_steps;
+            let cpu_ext = model_forward_cpu(&x_ext, &m, total, hidden, inter, vocab, true);
+            let cpu_last = &cpu_ext[(total - 1) * vocab..];
+            let last_b = &last[b * vocab..(b + 1) * vocab];
+            let rel_last = rel_l2(last_b, cpu_last);
+            worst_last = worst_last.max(rel_last);
+            let cpu_ids: Vec<u32> = (0..loop_steps)
+                .map(|k| argmax(&cpu_ext[(n + steps + k) * vocab..(n + steps + k + 1) * vocab]))
+                .collect();
+            let dev_ids: Vec<u32> = (0..loop_steps).map(|j| ids[j * batch + b]).collect();
+            agree_loop += dev_ids.iter().zip(&cpu_ids).filter(|(a, c)| a == c).count();
+            let self_consistent = dev_ids[loop_steps - 1] == argmax(last_b);
+            consistent &= self_consistent && last_b.iter().all(|v| v.is_finite());
+            println!(
+                "loop sequence {b}: last-step rel_L2={rel_last:.4}  ids {dev_ids:?} (cpu {cpu_ids:?})  last id is its logits' argmax: {self_consistent}"
+            );
+        }
+        println!(
+            "loop: worst last-step rel_L2={worst_last:.4}  top1_agree={agree_loop}/{}",
+            batch * loop_steps
+        );
+        loop_ok = same && consistent && worst_last < 0.05;
+    }
+    if worst < 0.05 && loop_ok {
         println!("PASS");
         Ok(())
     } else {
         Err(reng_core::Error::Other(format!(
-            "batched decode diverges: worst rel_L2 {worst}"
+            "batched decode diverges: worst rel_L2 {worst} loop_ok={loop_ok}"
         )))
     }
 }

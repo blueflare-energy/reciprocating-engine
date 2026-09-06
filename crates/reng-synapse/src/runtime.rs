@@ -1164,26 +1164,57 @@ impl<'a> Runtime<'a> {
 
     /// Enqueue a copy of `bytes` to device address `addr` (through a pinned
     /// buffer of this runtime); [`Runtime::fence`] waits until it is
-    /// visible. One copy at a time: the next call reuses the buffer.
+    /// visible. One call at a time: the next call reuses the buffer.
     ///
     /// # Errors
     ///
     /// Returns an error if the copy cannot be enqueued.
     pub fn upload_at(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {
-        let n = bytes.len() as u64;
-        Self::grow_pinned(self.dev, &mut self.h_up, &mut self.up_bytes, n)?;
-        // SAFETY: h_up holds at least n bytes and no copy reads it (the
-        // caller fenced the previous one).
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.h_up.cast::<u8>(), bytes.len())
-        };
-        syn!(synMemCopyAsync(
-            self.stream,
-            self.h_up as u64,
-            n,
-            addr,
-            SYN_HOST_TO_DRAM
-        ));
+        self.upload_at_multi(&[(addr, bytes)])
+    }
+
+    /// Enqueue one copy per `(addr, bytes)` part through the same pinned
+    /// buffer (each part at its own 128-byte aligned offset), so that one
+    /// [`Runtime::fence`] covers them all. One call at a time, as
+    /// [`Runtime::upload_at`]; empty parts are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a copy cannot be enqueued.
+    pub fn upload_at_multi(&mut self, parts: &[(u64, &[u8])]) -> Result<()> {
+        const ALIGN: usize = 128;
+        let total: usize = parts
+            .iter()
+            .map(|p| p.1.len().div_ceil(ALIGN) * ALIGN)
+            .sum();
+        if total == 0 {
+            return Ok(());
+        }
+        Self::grow_pinned(self.dev, &mut self.h_up, &mut self.up_bytes, total as u64)?;
+        let mut off = 0usize;
+        for &(addr, bytes) in parts {
+            if bytes.is_empty() {
+                continue;
+            }
+            // SAFETY: h_up holds `total` bytes, of which `off..off +
+            // bytes.len()` belong to this part, and no copy reads it (the
+            // caller fenced the previous call).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    self.h_up.cast::<u8>().add(off),
+                    bytes.len(),
+                );
+            }
+            syn!(synMemCopyAsync(
+                self.stream,
+                self.h_up as u64 + off as u64,
+                bytes.len() as u64,
+                addr,
+                SYN_HOST_TO_DRAM
+            ));
+            off += bytes.len().div_ceil(ALIGN) * ALIGN;
+        }
         Ok(())
     }
 
@@ -1217,23 +1248,55 @@ impl<'a> Runtime<'a> {
     ///
     /// Panics if `stride` is not a positive multiple of 4 or `n` is 0.
     pub fn read_i32_strided(&mut self, addr: u64, stride: usize, n: usize) -> Result<Vec<i32>> {
-        assert!(stride >= 4 && stride % 4 == 0 && n >= 1);
+        self.read_i32_rows(addr, stride, n, 1)
+    }
+
+    /// Like [`Runtime::read_i32_strided`] for rows of `words` int32 values
+    /// each: the first `words` words of each of `n` slots of `stride`
+    /// bytes, every one pre-filled with the sentinel and written once by a
+    /// launch; the result is the `n * words` values row by row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a copy fails or the slots never complete.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stride` is not a positive multiple of 4, `n` or `words`
+    /// is 0, or a row's words do not fit its slot.
+    pub fn read_i32_rows(
+        &mut self,
+        addr: u64,
+        stride: usize,
+        n: usize,
+        words: usize,
+    ) -> Result<Vec<i32>> {
+        assert!(stride >= 4 && stride % 4 == 0 && n >= 1 && words >= 1);
+        assert!(
+            words * 4 <= stride,
+            "{words} words do not fit a {stride}-byte slot"
+        );
         let bytes = (stride * n) as u64;
         Self::grow_pinned(self.dev, &mut self.h_ring, &mut self.ring_bytes, bytes)?;
         let (stream, h) = (self.stream, self.h_ring.cast::<u32>());
         let step = stride / 4;
         // SAFETY (all blocks below): h_ring holds `bytes` bytes, so word
-        // `j * step` is inside it for every j < n; the DMA writes each word
-        // exactly once per copy.
+        // `j * step + w` is inside it for every j < n and w < words; the
+        // DMA writes each word exactly once per copy.
         let picked = |pattern: u32| -> bool {
-            (0..n).any(|j| unsafe { core::ptr::read_volatile(h.add(j * step)) } == pattern)
+            (0..n).any(|j| {
+                (0..words)
+                    .any(|w| unsafe { core::ptr::read_volatile(h.add(j * step + w)) } == pattern)
+            })
         };
         let started = Instant::now();
         let mut polls = 0u32;
         loop {
             unsafe {
                 for j in 0..n {
-                    *h.add(j * step) = HOST_SENTINEL_D32;
+                    for w in 0..words {
+                        *h.add(j * step + w) = HOST_SENTINEL_D32;
+                    }
                 }
             }
             syn!(synMemCopyAsync(
@@ -1265,12 +1328,15 @@ impl<'a> Runtime<'a> {
         }
         if env_on("RENG_STEP_TRACE") {
             eprintln!(
-                "loop trace: readback of {n} ids {:.2} ms ({polls} polls)",
+                "loop trace: readback of {n} x {words} ids {:.2} ms ({polls} polls)",
                 started.elapsed().as_secs_f64() * 1e3
             );
         }
         Ok((0..n)
-            .map(|j| unsafe { core::ptr::read_volatile(h.add(j * step)) } as i32)
+            .flat_map(|j| {
+                (0..words)
+                    .map(move |w| unsafe { core::ptr::read_volatile(h.add(j * step + w)) } as i32)
+            })
             .collect())
     }
 }

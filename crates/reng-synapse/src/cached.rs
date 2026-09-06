@@ -50,8 +50,9 @@ use reng_core::Result;
 use std::time::Instant;
 
 /// Whether the device decode loop is built: `RENG_DEVICE_LOOP` set to
-/// anything but `0` or `off`, or unset.
-fn device_loop_enabled() -> bool {
+/// anything but `0` or `off`, or unset (the batched decoder reads the
+/// same switch).
+pub(crate) fn device_loop_enabled() -> bool {
     match std::env::var("RENG_DEVICE_LOOP") {
         Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("off")),
         Err(_) => true,
@@ -60,13 +61,13 @@ fn device_loop_enabled() -> bool {
 
 /// Bytes per slot of the loop's id ring and position table: one int32 on
 /// its own cache line, so the tensors of consecutive launches never share
-/// a line.
-const SLOT: usize = 128;
+/// a line (the batched loop's rows are whole multiples of it).
+pub(crate) const SLOT: usize = 128;
 
 /// `ns_GatherKernel::Params`: the FCD-first axis the indices select along.
 #[repr(C)]
-struct GatherParams {
-    axis: i32,
+pub(crate) struct GatherParams {
+    pub(crate) axis: i32,
 }
 
 /// The device decode loop's recipe and its per-launch state.

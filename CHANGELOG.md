@@ -223,6 +223,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   139); the decode step's device window is unchanged (2.37 ms on
   Qwen2.5-1.5B either way) and the saving is the 0.15 to 0.2 ms per step
   of launch and readback round trip.
+- Device-resident decode loop for the batched path (`BatchedModel`,
+  `BatchedGenerator::generate`, `reng-bench --batch`; the same
+  `RENG_DEVICE_LOOP` switch, on by default when the caller gives an
+  embedding table). The batched decode recipe's only per-launch inputs
+  are `B` int32 token ids and `B` int32 positions, one per slot: the `B`
+  embedding rows are one gather, the RoPE rows are gathers at the `B`
+  positions, each slot's mask row is a gather over the static pattern at
+  `[keys, B]` indices that a `sub_fwd_i32` shifts by that slot's own
+  position (the windowed and per-layer masks kept), and the ScatterND
+  quadruples `(b, g, 0, position_b)` are two int32 nodes. The ids and
+  positions are rebound per launch into an id ring and a position table
+  of one row of `B` int32s per launch, so `run_ids(ids, n)` uploads the
+  run's `n` position rows (and the seeds, unless the previous run left
+  them in place), enqueues `n` launches back to back and reads the
+  `n * B` ids once; a bucket growth recompiles the loop recipe like the
+  per-step one. The loop runs a fixed `n` for every slot; a sequence that
+  finishes early keeps advancing on its own output until the caller
+  resets its slot. `reng-batch-test` feeds its steps as ids through the
+  loop and checks a multi-step run against the CPU reference and against
+  one launch at a time (bucket growth inside a run included);
+  `reng-gather-test` pins down the batched kernel forms; `reng-bench`
+  prints a hash of the decode ids. BENCH_NUMBERS_TBD
 
 - Workspace scaffold with five crates: `reng-core`, `reng-hal`, `reng-ceiling`,
   `reng-cli`, `reng-synapse`.

@@ -9,7 +9,11 @@
 //! - `sub_fwd_i32`, `add_fwd_i32` and `mult_fwd_i32` with a broadcast
 //!   `[1]` operand (index arithmetic from a position tensor);
 //! - `cast_f32_to_bf16` rounding (round half to nearest even, as the
-//!   host's `f32_to_bf16`), for Gemma's embedding scale.
+//!   host's `f32_to_bf16`), for Gemma's embedding scale;
+//! - the batched loop's forms: a gather of `B` rows, `sub_fwd_i32` of a
+//!   `[keys, B]` tensor and a `[1, B]` one (the positions broadcast along
+//!   the keys), `mult_fwd_i32` of `[4, groups, B]` by `[1, 1, B]`, and the
+//!   element gather at `keys * B` indices (`B` mask rows at once).
 //!
 //! `cargo run -p reng-synapse --features link-synapse --bin reng-gather-test`
 
@@ -353,6 +357,214 @@ fn main() -> reng_core::Result<()> {
             }
             Err(e) => {
                 println!("cast_f32_to_bf16: rejected ({e})");
+                all = false;
+            }
+        }
+    }
+
+    // The batched loop's forms.
+    {
+        // `B` embedding rows at once.
+        let (fcd, n) = (128usize, 4096usize);
+        let idx = [3999i32, 0, 17, 2048, 4095, 1, 1, 300];
+        match gather_rows(fcd, n, &idx, 1) {
+            Ok(out) => {
+                let want =
+                    |r: usize, d: usize| bf16_to_f32(f32_to_bf16(r as f32 + d as f32 * 0.001));
+                let bad = (0..idx.len())
+                    .flat_map(|k| (0..fcd).map(move |d| (k, d)))
+                    .filter(|&(k, d)| (out[k * fcd + d] - want(idx[k] as usize, d)).abs() > 1e-6)
+                    .count();
+                all &= report(
+                    &format!("gather {} embedding rows", idx.len()),
+                    bad == 0,
+                    &format!("({bad} wrong of {})", out.len()),
+                );
+            }
+            Err(e) => {
+                println!("gather embedding rows: rejected ({e})");
+                all = false;
+            }
+        }
+
+        // `[keys, B] - [1, B]`: the mask index of every slot.
+        let (keys, nb) = (1025usize, 4usize);
+        let pos = [0i32, 7, 513, 1023];
+        let mut base: Vec<i32> = Vec::with_capacity(keys * nb);
+        for _ in 0..nb {
+            base.extend((0..keys).map(|k| (keys - 1 + k) as i32));
+        }
+        let (bb, pb) = (i32_bytes(&base), i32_bytes(&pos));
+        let idx = run_node_i32(
+            "sub_fwd_i32",
+            &[
+                NodeInput {
+                    name: "B",
+                    sizes: &[keys as u64, nb as u64],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &bb)),
+                },
+                NodeInput {
+                    name: "P",
+                    sizes: &[1, nb as u64],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &pb)),
+                },
+            ],
+            &[keys as u64, nb as u64],
+            core::ptr::null(),
+            0,
+        );
+        let idx = match idx {
+            Ok(out) => {
+                let bad = (0..nb * keys)
+                    .filter(|&j| out[j] != base[j] - pos[j / keys])
+                    .count();
+                all &= report(
+                    "sub_fwd_i32 [keys, B] - [1, B]",
+                    bad == 0,
+                    &format!("({bad} wrong; first {:?})", &out[..3]),
+                );
+                Some(out)
+            }
+            Err(e) => {
+                println!("sub_fwd_i32 [keys, B] - [1, B]: rejected ({e})");
+                all = false;
+                None
+            }
+        };
+        // The two-sided form (informational: the loop uses the one above).
+        let base1: Vec<i32> = (0..keys).map(|k| (keys - 1 + k) as i32).collect();
+        let b1 = i32_bytes(&base1);
+        match run_node_i32(
+            "sub_fwd_i32",
+            &[
+                NodeInput {
+                    name: "B",
+                    sizes: &[keys as u64, 1],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &b1)),
+                },
+                NodeInput {
+                    name: "P",
+                    sizes: &[1, nb as u64],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &pb)),
+                },
+            ],
+            &[keys as u64, nb as u64],
+            core::ptr::null(),
+            0,
+        ) {
+            Ok(out) => {
+                let bad = (0..nb * keys)
+                    .filter(|&j| out[j] != base1[j % keys] - pos[j / keys])
+                    .count();
+                report(
+                    "sub_fwd_i32 [keys, 1] - [1, B] (informational)",
+                    bad == 0,
+                    &format!("({bad} wrong)"),
+                );
+            }
+            Err(e) => println!("sub_fwd_i32 [keys, 1] - [1, B] (informational): rejected ({e})"),
+        }
+
+        // `B` mask rows from the pattern at the flattened `[keys * B]`
+        // indices.
+        if let Some(idx) = idx {
+            let neg = -30000.0f32;
+            let pattern: Vec<f32> = (0..2 * keys)
+                .map(|j| if j < keys { 0.0 } else { neg })
+                .collect();
+            let bytes = i32_bytes(&idx);
+            let gp = GatherParams { axis: 0 };
+            match run_node(
+                "gather_fwd_bf16",
+                &[
+                    NodeInput {
+                        name: "P",
+                        sizes: &[2 * keys as u64],
+                        data: &pattern,
+                        raw: None,
+                    },
+                    NodeInput {
+                        name: "I",
+                        sizes: &[(keys * nb) as u64],
+                        data: &[],
+                        raw: Some((SYN_TYPE_INT32, &bytes)),
+                    },
+                ],
+                &[(keys * nb) as u64],
+                (&raw const gp).cast::<c_void>(),
+                core::mem::size_of::<GatherParams>() as u32,
+            ) {
+                Ok(out) => {
+                    let bad = (0..nb * keys)
+                        .filter(|&j| {
+                            let (b, k) = (j / keys, j % keys);
+                            let want = if k as i32 <= pos[b] {
+                                0.0
+                            } else {
+                                bf16_to_f32(f32_to_bf16(neg))
+                            };
+                            out[j] != want
+                        })
+                        .count();
+                    all &= report(
+                        &format!("gather {nb} mask rows at once"),
+                        bad == 0,
+                        &format!("({bad} wrong)"),
+                    );
+                }
+                Err(e) => {
+                    println!("gather {nb} mask rows at once: rejected ({e})");
+                    all = false;
+                }
+            }
+        }
+
+        // `[4, groups, B] * [1, 1, B]`: the scatter quadruples' position.
+        let groups = 8usize;
+        let mut sel: Vec<i32> = Vec::new();
+        for _ in 0..nb {
+            for _ in 0..groups {
+                sel.extend_from_slice(&[0, 0, 0, 1]);
+            }
+        }
+        let posb = i32_bytes(&pos);
+        let selb = i32_bytes(&sel);
+        match run_node_i32(
+            "mult_fwd_i32",
+            &[
+                NodeInput {
+                    name: "S",
+                    sizes: &[4, groups as u64, nb as u64],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &selb)),
+                },
+                NodeInput {
+                    name: "P",
+                    sizes: &[1, 1, nb as u64],
+                    data: &[],
+                    raw: Some((SYN_TYPE_INT32, &posb)),
+                },
+            ],
+            &[4, groups as u64, nb as u64],
+            core::ptr::null(),
+            0,
+        ) {
+            Ok(out) => {
+                let bad = (0..4 * groups * nb)
+                    .filter(|&j| out[j] != sel[j] * pos[j / (4 * groups)])
+                    .count();
+                all &= report(
+                    "mult_fwd_i32 [4, g, B] x [1, 1, B]",
+                    bad == 0,
+                    &format!("({bad} wrong; first {:?})", &out[..8]),
+                );
+            }
+            Err(e) => {
+                println!("mult_fwd_i32 [4, g, B] x [1, 1, B]: rejected ({e})");
                 all = false;
             }
         }

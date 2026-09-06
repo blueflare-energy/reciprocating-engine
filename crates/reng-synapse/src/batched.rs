@@ -17,15 +17,45 @@
 //! the next bucket and the used cache rows are copied across. At batch 64
 //! on a 24-layer model the cache read is the step, so a 1024-position cache
 //! holding 160-token sequences costs four times what it should.
+//!
+//! Device-resident decode loop (`RENG_DEVICE_LOOP`, on by default when the
+//! caller gives an [`EmbedTable`]): the decode recipe then takes no
+//! per-step uploads. Its inputs are `B` int32 token ids and `B` int32
+//! positions, one per slot, and everything else is derived on the device
+//! as in the batch-1 loop of `cached.rs`, one column per slot: the `B`
+//! embedding rows are one `gather_fwd_bf16` over the bf16 table (the LM
+//! head's device copy when tied), the RoPE rows are gathers over the full
+//! `[head_dim, capacity]` tables at the `B` positions, a mask row per slot
+//! is a gather over the static pattern at `[keys, B]` indices that a
+//! `sub_fwd_i32` shifts by each slot's position (the windowed and
+//! per-layer masks keep their own patterns), and the ScatterND quadruples
+//! `(b, g, 0, position_b)` are the constant `(b, g, 0, 0)` plus
+//! `(0, 0, 0, 1)` times the position. The id and position inputs and the
+//! `IDS` output are rebound per launch (`Runtime::rebind`) into an id ring
+//! and a position table of one row of `B` int32s (whole cache lines) per
+//! launch: launch `j` of a run reads ring row `head + j` and writes row
+//! `head + j + 1`, and reads position row `j`, which the host fills with
+//! every slot's position plus `j` before the run (one small upload per run,
+//! together with the seed ids unless the previous run left them in row
+//! `head`). So [`BatchedModel::run_ids`] enqueues `n` launches back to
+//! back and reads the `n * B` ids once. The loop runs a fixed `n` for every
+//! slot: a sequence that finishes early (EOS) keeps advancing on its own
+//! output, and the caller drops its ids or restarts the slot with
+//! [`BatchedModel::reset`] and a new prefill.
 
+use crate::cached::{GatherParams, SLOT, device_loop_enabled};
 use crate::f32_to_bf16;
+use crate::ffi::{SYN_TYPE_BF16, SYN_TYPE_F32, synTensor};
 use crate::model::{
-    Gb, MASK_NEG, ModelWeights, RopeTables, Shared, SharedBatched, build_head, build_layer,
-    build_layer_batched, cache_names, common_window, fused_sdpa, uses_full_mask, uses_local_rope,
+    EmbedTable, Gb, MASK_NEG, ModelWeights, RopeTables, Shared, SharedBatched, build_head,
+    build_layer, build_layer_batched, cache_names, common_window, fused_sdpa, lm_head_input,
+    uses_full_mask, uses_local_rope,
 };
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::{Out, Runtime};
+use core::ffi::c_void;
 use reng_core::Result;
+use std::time::Instant;
 
 /// Smallest cache bucket (positions); `RENG_MIN_CAP` overrides it (a huge
 /// value disables bucketing, a tiny one exercises growth in tests).
@@ -45,6 +75,25 @@ struct Inputs {
     kidx: usize,
 }
 
+/// The device decode loop's per-run state; its recipe is the current
+/// bucket's decode runtime, its buffers belong to `base`.
+struct Loop {
+    /// `capacity + 1` rows of `stride` bytes: row `r` holds the `B` ids the
+    /// launch at ring step `r` consumes (written by the launch at `r - 1`,
+    /// or by the host).
+    ring: u64,
+    /// `capacity` rows of `stride` bytes: row `j` holds every slot's
+    /// position at launch `j` of the current run.
+    postab: u64,
+    /// Bytes per row: `B` int32s rounded up to whole cache lines.
+    stride: usize,
+    /// The ring row holding the ids the next run consumes.
+    head: usize,
+    /// The ids in row `head`, when the host knows them (the last run's
+    /// output or the last seed).
+    known: Option<Vec<u32>>,
+}
+
 /// A batched decode recipe with its resident weights, a `B`-slot KV cache,
 /// and a prefill recipe sharing the weights.
 pub struct BatchedModel<'a> {
@@ -54,11 +103,18 @@ pub struct BatchedModel<'a> {
     pf_ix: Inputs,
     /// Decode recipe for the current bucket when that is not `base`'s.
     cur: Option<Runtime<'a>>,
-    ix: Inputs,
+    /// The per-step inputs of the decode recipe; none with the device
+    /// loop, whose inputs are rebound per launch.
+    ix: Option<Inputs>,
     /// The first decode recipe: owns the device and the weights every later
     /// recipe binds to.
     base: Runtime<'a>,
     m: ModelWeights<'a>,
+    /// The embedding table of the device loop, kept for the recompiles.
+    embed: Option<EmbedTable<'a>>,
+    lp: Option<Loop>,
+    /// Name suffix of the current bucket's per-step or per-launch inputs.
+    tag: String,
     batch: usize,
     rows: usize,
     /// Configured capacity (positions): the hard limit and the RoPE table
@@ -103,6 +159,10 @@ impl<'a> BatchedModel<'a> {
     /// prefill recipe for blocks of `rows` positions sharing the weights.
     /// `rope` holds RoPE tables `[capacity, head_dim]` (the local pair only
     /// when a layer reads it); the layers' own RoPE slices are unused here.
+    /// With an `embed` table and `RENG_DEVICE_LOOP` not off, the decode
+    /// recipe is the device decode loop (see the module docs): steps then
+    /// go through [`BatchedModel::run_ids`] from token ids, and
+    /// [`BatchedModel::step`] from embeddings is unavailable.
     ///
     /// # Errors
     ///
@@ -122,6 +182,7 @@ impl<'a> BatchedModel<'a> {
         rows: usize,
         capacity: usize,
         rope: &RopeTables<'_>,
+        embed: Option<&EmbedTable<'a>>,
     ) -> Result<Self> {
         assert!(!m.layers.is_empty() && batch > 0 && rows > 0 && capacity > 0);
         let l0 = &m.layers[0];
@@ -139,10 +200,43 @@ impl<'a> BatchedModel<'a> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(MIN_BUCKET);
         let cap = bucket_for(1, min_cap, capacity);
+        let embed = match embed {
+            Some(e) if device_loop_enabled() => Some(*e),
+            _ => None,
+        };
 
-        let (gb, out) = Self::build_decode(&m, hidden, inter, vocab, batch, cap, "")?;
-        let base = Runtime::new(gb, out)?;
-        let ix = Self::decode_inputs(&base, "");
+        let t0 = Instant::now();
+        let (gb, out) = match &embed {
+            Some(e) => Self::build_decode_loop(&m, hidden, inter, vocab, batch, cap, "", rope, e)?,
+            None => Self::build_decode(&m, hidden, inter, vocab, batch, cap, "")?,
+        };
+        if std::env::var("RENG_RECIPE_TRACE").is_ok() {
+            eprintln!(
+                "{}graph build: {:.2} s",
+                if embed.is_some() { "loop " } else { "" },
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        let mut base = Runtime::new(gb, out)?;
+        let ix = if embed.is_some() {
+            None
+        } else {
+            Some(Self::decode_inputs(&base, ""))
+        };
+        let lp = if embed.is_some() {
+            let stride = (batch * 4).div_ceil(SLOT) * SLOT;
+            let ring = base.alloc(((capacity + 1) * stride) as u64)?;
+            let postab = base.alloc((capacity * stride) as u64)?;
+            Some(Loop {
+                ring,
+                postab,
+                stride,
+                head: 0,
+                known: None,
+            })
+        } else {
+            None
+        };
         let (gb, out) = Self::build_prefill(&m, hidden, inter, vocab, rows, cap)?;
         let pf = Runtime::new_with(gb, out, Some(&base))?;
         let pf_ix = Self::prefill_inputs(&pf);
@@ -156,6 +250,9 @@ impl<'a> BatchedModel<'a> {
             ix,
             base,
             m,
+            embed,
+            lp,
+            tag: String::new(),
             batch,
             rows,
             capacity,
@@ -256,6 +353,322 @@ impl<'a> BatchedModel<'a> {
             cur = build_layer_batched(&mut gb, li, cur, lw, &sh, hidden, inter)?;
         }
         let out = build_head(&mut gb, cur, m, batch, hidden, vocab, true, None)?;
+        Ok((gb, out))
+    }
+
+    /// The decode graph of the device loop for a `cap`-position bucket:
+    /// one position per slot per launch from `B` ids and `B` positions
+    /// (see the module docs). The per-launch tensors and the bucket-sized
+    /// constants carry `tag`; the tables (embeddings, RoPE, the scatter
+    /// constants) keep their names and are shared across buckets.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn build_decode_loop(
+        m: &ModelWeights<'a>,
+        hidden: usize,
+        inter: usize,
+        vocab: usize,
+        batch: usize,
+        cap: usize,
+        tag: &str,
+        rope: &RopeTables<'_>,
+        embed: &EmbedTable<'a>,
+    ) -> Result<(Gb<'a>, Out)> {
+        let l0 = &m.layers[0];
+        let hd = l0.head_dim;
+        let groups = l0.n_kv_heads;
+        let (h, v, hd64, keys, b, g64) = (
+            hidden as u64,
+            vocab as u64,
+            hd as u64,
+            cap as u64 + 1,
+            batch as u64,
+            groups as u64,
+        );
+        // The RoPE tables span the configured capacity, not the bucket.
+        let table_len = (rope.sin.len() / hd) as u64;
+        let bf = SYN_TYPE_BF16;
+        let none = (core::ptr::null::<c_void>(), 0u32);
+        let (rows_p, elems_p) = (GatherParams { axis: 1 }, GatherParams { axis: 0 });
+        let size = core::mem::size_of::<GatherParams>() as u32;
+        let (pg_rows, pg_elems) = (
+            ((&raw const rows_p).cast::<c_void>(), size),
+            ((&raw const elems_p).cast::<c_void>(), size),
+        );
+        let i32s =
+            |vals: &[i32]| -> Vec<u8> { vals.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let mut gb = Gb::new()?;
+        // Per-launch tensors: bound to a ring row and a position table row
+        // before every launch; their own buffers are never used.
+        let t_ids_in = gb.input_raw(
+            &format!("IDS_IN{tag}"),
+            &[b],
+            SYN_TYPE_INT32,
+            &vec![0u8; 4 * batch],
+        )?;
+        let t_pos = gb.input_raw(
+            &format!("POS{tag}"),
+            &[b],
+            SYN_TYPE_INT32,
+            &vec![0u8; 4 * batch],
+        )?;
+
+        // The embedding rows of the ids, `[hidden, B]`: gathered from the
+        // head's weights when the embeddings are tied (one device copy),
+        // else from the table's own upload; scaled in f32 and rounded like
+        // the host gather when the model scales its embeddings.
+        assert_eq!(embed.rows.len(), hidden * vocab, "embedding table size");
+        let tied = embed.rows.as_ptr() == m.lm_head.as_ptr() && embed.rows.len() == m.lm_head.len();
+        let t_lm = if tied {
+            Some(lm_head_input(&mut gb, m, hidden, vocab)?)
+        } else {
+            None
+        };
+        let t_emb = match t_lm {
+            Some(t) => t,
+            None => gb.input_bf16("EMB", &[h, v], std::borrow::Cow::Borrowed(embed.rows))?,
+        };
+        let t_rows = gb.mid("emb_rows", &[h, b], bf)?;
+        gb.node(
+            "gather_fwd_bf16",
+            "embed",
+            &[t_emb, t_ids_in],
+            &[t_rows],
+            pg_rows.0,
+            pg_rows.1,
+        )?;
+        let t_x = if embed.scale == 1.0 {
+            t_rows
+        } else {
+            let t_scale = gb.input_raw(
+                "EMB_SCALE",
+                &[1, 1],
+                SYN_TYPE_F32,
+                &embed.scale.to_le_bytes(),
+            )?;
+            let t_rf = gb.mid("emb_f32", &[h, b], SYN_TYPE_F32)?;
+            let t_sf = gb.mid("emb_scaled", &[h, b], SYN_TYPE_F32)?;
+            let t_xs = gb.mid("emb_bf16", &[h, b], bf)?;
+            gb.node(
+                "cast_bf16_to_f32",
+                "emb_cast",
+                &[t_rows],
+                &[t_rf],
+                none.0,
+                none.1,
+            )?;
+            gb.node(
+                "mult_fwd_f32",
+                "emb_scale",
+                &[t_rf, t_scale],
+                &[t_sf],
+                none.0,
+                none.1,
+            )?;
+            gb.node(
+                "cast_f32_to_bf16",
+                "emb_round",
+                &[t_sf],
+                &[t_xs],
+                none.0,
+                none.1,
+            )?;
+            t_xs
+        };
+
+        // RoPE rows of the `B` positions out of the full tables, as the
+        // batched layers read them: `[hd, 1, 1, 1, B]`.
+        let rope_rows = |gb: &mut Gb<'a>, name: &str, table: &[f32]| -> Result<synTensor> {
+            let t_tab = gb.input(&format!("{name}T"), &[hd64, table_len], table)?;
+            let t_2d = gb.mid(&format!("{name}_rows"), &[hd64, b], bf)?;
+            let t_5d = gb.mid(&format!("{name}_5d"), &[hd64, 1, 1, 1, b], bf)?;
+            gb.node(
+                "gather_fwd_bf16",
+                &format!("rope_{name}"),
+                &[t_tab, t_pos],
+                &[t_2d],
+                pg_rows.0,
+                pg_rows.1,
+            )?;
+            gb.node(
+                "reshape",
+                &format!("{name}_reshape"),
+                &[t_2d],
+                &[t_5d],
+                none.0,
+                none.1,
+            )?;
+            Ok(t_5d)
+        };
+        let t_sin = rope_rows(&mut gb, "SIN", rope.sin)?;
+        let t_cos = rope_rows(&mut gb, "COS", rope.cos)?;
+        let (t_sin_local, t_cos_local) = if uses_local_rope(&m.layers) {
+            (
+                Some(rope_rows(&mut gb, "SINL", rope.sin_local)?),
+                Some(rope_rows(&mut gb, "COSL", rope.cos_local)?),
+            )
+        } else {
+            (None, None)
+        };
+
+        // A mask row per slot is a window of `keys` elements into a static
+        // pattern, gathered at `base - position_b` (see `cached.rs`: the
+        // causal pattern is `[0; keys] ++ [NEG; keys]` read from `keys - 1
+        // - p`, the windowed one `[NEG; keys] ++ [0; w] ++ [NEG; keys]` from
+        // `keys - 1 + w - p`). The `[keys, B]` index tensor is the base
+        // vector, replicated per slot, minus the positions broadcast along
+        // the keys; the gather takes it flattened.
+        let neg = f32_to_bf16(MASK_NEG);
+        let keys_us = cap + 1;
+        let t_pos2 = gb.mid("pos_2d", &[1, b], SYN_TYPE_INT32)?;
+        gb.node(
+            "reshape",
+            "pos_reshape2",
+            &[t_pos],
+            &[t_pos2],
+            none.0,
+            none.1,
+        )?;
+        let mask_rows =
+            |gb: &mut Gb<'a>, name: &str, pattern: Vec<u16>, first: usize| -> Result<synTensor> {
+                let t_pat = gb.input_bf16(
+                    &format!("{name}P{tag}"),
+                    &[pattern.len() as u64],
+                    std::borrow::Cow::Owned(pattern),
+                )?;
+                let mut base: Vec<i32> = Vec::with_capacity(keys_us * batch);
+                for _ in 0..batch {
+                    base.extend((0..keys_us).map(|k| (first + k) as i32));
+                }
+                let t_base = gb.input_raw(
+                    &format!("{name}I{tag}"),
+                    &[keys, b],
+                    SYN_TYPE_INT32,
+                    &i32s(&base),
+                )?;
+                let t_idx = gb.mid(&format!("{name}_idx"), &[keys, b], SYN_TYPE_INT32)?;
+                let t_flat = gb.mid(&format!("{name}_flat"), &[keys * b], SYN_TYPE_INT32)?;
+                let t_rows = gb.mid(&format!("{name}_rows"), &[keys * b], bf)?;
+                let t_5d = gb.mid(&format!("{name}_5d"), &[keys, 1, 1, 1, b], bf)?;
+                gb.node(
+                    "sub_fwd_i32",
+                    &format!("{name}_index"),
+                    &[t_base, t_pos2],
+                    &[t_idx],
+                    none.0,
+                    none.1,
+                )?;
+                gb.node(
+                    "reshape",
+                    &format!("{name}_flatten"),
+                    &[t_idx],
+                    &[t_flat],
+                    none.0,
+                    none.1,
+                )?;
+                gb.node(
+                    "gather_fwd_bf16",
+                    &format!("{name}_gather"),
+                    &[t_pat, t_flat],
+                    &[t_rows],
+                    pg_elems.0,
+                    pg_elems.1,
+                )?;
+                gb.node(
+                    "reshape",
+                    &format!("{name}_reshape"),
+                    &[t_rows],
+                    &[t_5d],
+                    none.0,
+                    none.1,
+                )?;
+                Ok(t_5d)
+            };
+        let t_mask = if uses_full_mask(&m.layers) {
+            let mut pat = vec![0u16; 2 * keys_us];
+            pat[keys_us..].fill(neg);
+            Some(mask_rows(&mut gb, "MASK", pat, keys_us - 1)?)
+        } else {
+            None
+        };
+        let t_mask_window = match common_window(&m.layers) {
+            Some(w) => {
+                let mut pat = vec![neg; 2 * keys_us + w];
+                pat[keys_us..keys_us + w].fill(0);
+                Some(mask_rows(&mut gb, "MASKW", pat, keys_us - 1 + w)?)
+            }
+            None => None,
+        };
+
+        // ScatterND quadruples (b, g, 0, position_b) for update g + groups
+        // * b: a constant `(b, g, 0, 0)` plus `(0, 0, 0, 1)` times the
+        // slot's position, then flattened to the `[4, groups * B]` the
+        // layers take.
+        let (mut kbase, mut ksel) = (
+            Vec::with_capacity(4 * groups * batch),
+            Vec::with_capacity(4 * groups * batch),
+        );
+        for bi in 0..batch {
+            for g in 0..groups {
+                kbase.extend_from_slice(&[bi as i32, g as i32, 0, 0]);
+                ksel.extend_from_slice(&[0, 0, 0, 1]);
+            }
+        }
+        let t_kbase = gb.input_raw("KBASE", &[4, g64, b], SYN_TYPE_INT32, &i32s(&kbase))?;
+        let t_ksel = gb.input_raw("KSEL", &[4, g64, b], SYN_TYPE_INT32, &i32s(&ksel))?;
+        let t_pos3 = gb.mid("pos_3d", &[1, 1, b], SYN_TYPE_INT32)?;
+        let t_kp = gb.mid("kidx_pos", &[4, g64, b], SYN_TYPE_INT32)?;
+        let t_k3 = gb.mid("kidx_3d", &[4, g64, b], SYN_TYPE_INT32)?;
+        let t_kidx = gb.mid("kidx", &[4, g64 * b], SYN_TYPE_INT32)?;
+        gb.node(
+            "reshape",
+            "pos_reshape3",
+            &[t_pos],
+            &[t_pos3],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "mult_fwd_i32",
+            "kidx_scale",
+            &[t_ksel, t_pos3],
+            &[t_kp],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "add_fwd_i32",
+            "kidx_add",
+            &[t_kbase, t_kp],
+            &[t_k3],
+            none.0,
+            none.1,
+        )?;
+        gb.node(
+            "reshape",
+            "kidx_reshape",
+            &[t_k3],
+            &[t_kidx],
+            none.0,
+            none.1,
+        )?;
+
+        let sh = SharedBatched {
+            sin: t_sin,
+            cos: t_cos,
+            sin_local: t_sin_local,
+            cos_local: t_cos_local,
+            mask: t_mask,
+            mask_window: t_mask_window,
+            kidx: t_kidx,
+            capacity: cap,
+            batch,
+            sdpa: fused_sdpa(false),
+        };
+        let mut cur = t_x;
+        for (li, lw) in m.layers.iter().enumerate() {
+            cur = build_layer_batched(&mut gb, li, cur, lw, &sh, hidden, inter)?;
+        }
+        let out = build_head(&mut gb, cur, m, batch, hidden, vocab, true, t_lm)?;
         Ok((gb, out))
     }
 
@@ -386,6 +799,13 @@ impl<'a> BatchedModel<'a> {
         self.cap
     }
 
+    /// Whether the decode recipe is the device decode loop (see
+    /// [`BatchedModel::new`]).
+    #[must_use]
+    pub fn has_loop(&self) -> bool {
+        self.lp.is_some()
+    }
+
     /// Bytes of one sequence's slot in one cache buffer of `cap` positions.
     fn slot_bytes(&self, cap: usize) -> u64 {
         (self.head_dim * (cap + 1) * self.n_kv * 2) as u64
@@ -406,15 +826,36 @@ impl<'a> BatchedModel<'a> {
         }
         let cap = bucket_for(need, self.min_cap, self.capacity);
         let tag = format!("_{cap}");
-        let (gb, out) = Self::build_decode(
-            &self.m,
-            self.hidden,
-            self.inter,
-            self.vocab,
-            self.batch,
-            cap,
-            &tag,
-        )?;
+        let (gb, out) = match &self.embed {
+            Some(e) => {
+                let rope = RopeTables {
+                    sin: &self.sin,
+                    cos: &self.cos,
+                    sin_local: &self.sin_local,
+                    cos_local: &self.cos_local,
+                };
+                Self::build_decode_loop(
+                    &self.m,
+                    self.hidden,
+                    self.inter,
+                    self.vocab,
+                    self.batch,
+                    cap,
+                    &tag,
+                    &rope,
+                    e,
+                )?
+            }
+            None => Self::build_decode(
+                &self.m,
+                self.hidden,
+                self.inter,
+                self.vocab,
+                self.batch,
+                cap,
+                &tag,
+            )?,
+        };
         let mut rt = Runtime::new_with(gb, out, Some(&self.base))?;
         let slots = Self::cache_slots(&rt, self.m.layers.len());
         // Per layer, buffer, sequence and group: the rows written so far.
@@ -442,13 +883,18 @@ impl<'a> BatchedModel<'a> {
             Self::build_prefill(&self.m, self.hidden, self.inter, self.vocab, self.rows, cap)?;
         let pf = Runtime::new_with(gb, out, Some(&rt))?;
         self.pf_ix = Self::prefill_inputs(&pf);
-        self.ix = Self::decode_inputs(&rt, &tag);
+        self.ix = if self.embed.is_some() {
+            None
+        } else {
+            Some(Self::decode_inputs(&rt, &tag))
+        };
         // The old prefill recipe goes before the old decode recipe it binds
         // to; `base` stays for the weights.
         self.pf = pf;
         self.cur = Some(rt);
         self.slots = slots;
         self.cap = cap;
+        self.tag = tag;
         Ok(())
     }
 
@@ -575,6 +1021,141 @@ impl<'a> BatchedModel<'a> {
         Ok(last)
     }
 
+    /// Device decode loop: feed token `ids[b]` to every sequence `b` at its
+    /// position and run `n` steps back to back, each consuming the greedy
+    /// ids the previous one produced; returns the `n * B` ids step by step
+    /// (`ids[j * B + b]` is sequence `b`'s id after step `j`; the last
+    /// step's ids have not been fed yet). One readback for the whole run.
+    /// Every sequence advances `n` positions: a finished one keeps going on
+    /// its own output until the caller resets it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails or a launch never
+    /// completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the loop was not built, `ids` is not one id per sequence,
+    /// `n` is 0, or the run would overflow the cache.
+    pub fn run_ids(&mut self, ids: &[u32], n: usize) -> Result<Vec<u32>> {
+        Ok(self.loop_steps(ids, n, false)?.0)
+    }
+
+    /// Like [`BatchedModel::run_ids`], also returning the last step's
+    /// logits `[B, vocab]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`BatchedModel::run_ids`].
+    pub fn run_ids_logits(&mut self, ids: &[u32], n: usize) -> Result<(Vec<u32>, Vec<f32>)> {
+        self.loop_steps(ids, n, true)
+    }
+
+    fn loop_steps(
+        &mut self,
+        seeds: &[u32],
+        n: usize,
+        want_logits: bool,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let nb = self.batch;
+        assert!(n >= 1);
+        assert_eq!(seeds.len(), nb, "one seed id per sequence");
+        for &id in seeds {
+            assert!((id as usize) < self.vocab, "token id {id} out of range");
+        }
+        let furthest = self.pos.iter().copied().max().unwrap_or(0);
+        assert!(
+            furthest + n <= self.capacity,
+            "cache overflow at {furthest}+{n} of {}",
+            self.capacity
+        );
+        self.ensure(furthest + n)?;
+        let trace = std::env::var("RENG_STEP_TRACE").is_ok();
+        let t0 = Instant::now();
+        let (ring, postab, stride, head, resident) = {
+            let lp = self.lp.as_mut().expect("device decode loop not built");
+            // A run needs `n + 1` ring rows from `head`: wrap when they are
+            // not there (the seed is then uploaded again).
+            if lp.head + n > self.capacity {
+                lp.head = 0;
+                lp.known = None;
+            }
+            let resident = lp.known.as_deref() == Some(seeds);
+            (lp.ring, lp.postab, lp.stride, lp.head, resident)
+        };
+        // Position table rows for the run: every slot's position plus the
+        // launch number.
+        let mut tab = vec![0u8; n * stride];
+        for j in 0..n {
+            for (b, &p) in self.pos.iter().enumerate() {
+                let at = j * stride + b * 4;
+                tab[at..at + 4].copy_from_slice(&((p + j) as i32).to_le_bytes());
+            }
+        }
+        let seed_bytes: Vec<u8> = seeds
+            .iter()
+            .flat_map(|&id| (id as i32).to_le_bytes())
+            .collect();
+        let row = |r: usize| (r * stride) as u64;
+        let (n_in, n_pos) = (format!("IDS_IN{}", self.tag), format!("POS{}", self.tag));
+        let rt = match self.cur {
+            Some(ref mut r) => r,
+            None => &mut self.base,
+        };
+        // The seed goes into the head row unless the last run left those
+        // very ids there; the positions go in either way.
+        let mut parts: Vec<(u64, &[u8])> = vec![(postab, &tab)];
+        if !resident {
+            parts.push((ring + row(head), &seed_bytes));
+        }
+        rt.upload_at_multi(&parts)?;
+        rt.fence()?;
+        let t_seed = t0.elapsed();
+        let first_out = ring + row(head + 1);
+        rt.fill_sentinel_d32(first_out, n * stride / 4)?;
+        let t_fill = t0.elapsed() - t_seed;
+        for j in 0..n {
+            rt.rebind(&n_in, ring + row(head + j));
+            rt.rebind("IDS", ring + row(head + j + 1));
+            rt.rebind(&n_pos, postab + row(j));
+            rt.launch_only()?;
+        }
+        let t_launch = t0.elapsed() - t_seed - t_fill;
+        let ids: Vec<u32> = rt
+            .read_i32_rows(first_out, stride, n, nb)?
+            .into_iter()
+            .map(|i| i as u32)
+            .collect();
+        let t_read = t0.elapsed() - t_seed - t_fill - t_launch;
+        let logits = if want_logits {
+            rt.read_bf16_range("LOGITS", 0, nb)?
+        } else {
+            Vec::new()
+        };
+        let lp = self.lp.as_mut().expect("checked above");
+        lp.head = head + n;
+        lp.known = Some(ids[(n - 1) * nb..].to_vec());
+        if trace {
+            eprintln!(
+                "loop trace: {n} steps x {nb} sequences from ring row {head}: {} {:.2} ms, sentinel fill {:.2} ms, launches {:.2} ms, wait+readback {:.2} ms",
+                if resident {
+                    "positions uploaded, seed resident"
+                } else {
+                    "positions and seed uploaded"
+                },
+                t_seed.as_secs_f64() * 1e3,
+                t_fill.as_secs_f64() * 1e3,
+                t_launch.as_secs_f64() * 1e3,
+                t_read.as_secs_f64() * 1e3
+            );
+        }
+        for p in &mut self.pos {
+            *p += n;
+        }
+        Ok((ids, logits))
+    }
+
     /// Advance every sequence by one token: `x` is `[B, hidden]` (one
     /// embedding per sequence) and the result is logits `[B, vocab]`.
     ///
@@ -584,7 +1165,9 @@ impl<'a> BatchedModel<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `x` is not `B` rows or a sequence would overflow the cache.
+    /// Panics if `x` is not `B` rows, a sequence would overflow the cache,
+    /// or the decode recipe is the device decode loop (which takes ids:
+    /// [`BatchedModel::run_ids`]).
     pub fn step(&mut self, x: &[f32]) -> Result<Vec<f32>> {
         self.step_rows(x, true)
     }
@@ -606,6 +1189,9 @@ impl<'a> BatchedModel<'a> {
         let furthest = self.pos.iter().copied().max().unwrap_or(0);
         assert!(furthest < self.capacity, "cache overflow");
         self.ensure(furthest + 1)?;
+        let ix = self
+            .ix
+            .expect("the device decode loop takes token ids: use run_ids");
         let c = self.cap;
         let neg = f32_to_bf16(MASK_NEG);
         let keys = c + 1;
@@ -636,7 +1222,6 @@ impl<'a> BatchedModel<'a> {
                 }
             }
         }
-        let ix = self.ix;
         let sb = rope_rows(&self.sin);
         let cb = rope_rows(&self.cos);
         let local = ix
