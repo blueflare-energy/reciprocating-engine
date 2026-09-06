@@ -40,10 +40,14 @@
 //! it), and one left behind by an earlier run whose pid was reused is
 //! detected and removed rather than joined.
 //!
+//! `RENG_FP8` and `--fp8` are refused here rather than ignored: a shard's
+//! `o` and `down` weights are strided column windows the quantizer does
+//! not take.
+//!
 //! Worker (spawned by the coordinator; the same binary):
 //! `reng-tp --rank r --world n --module m --dir DIR <the coordinator's arguments>`
 
-use reng_model::{LlamaConfig, TpGenerator, load_weights};
+use reng_model::{LlamaConfig, TpGenerator, fp8_switch, load_weights};
 use reng_synapse::hccl::{
     EXIT_ACQUIRE, Group, Rank, abort_and_die, catch_signals, default_ifname, interrupted,
 };
@@ -124,9 +128,35 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+/// `reng-tp` does not take the fp8 switch, so it refuses to start with it
+/// on rather than run bf16 weights under a switch the operator believes is
+/// on (the principle `reng_model::layer_views` enforces for the other
+/// binaries). A shard's `o` and `down` weights are strided column windows
+/// the quantizer does not take, and `LlamaWeights::shard` drops any codes
+/// the full model carried, so there is nothing to fall back to.
+fn refuse_fp8(raw: &[String]) {
+    let flag = raw.iter().any(|a| a == "--fp8");
+    match fp8_switch(std::env::var("RENG_FP8").ok().as_deref(), flag) {
+        Ok(None) => {}
+        Ok(Some(cfg)) => {
+            eprintln!(
+                "reng-tp: the fp8 switch is on ({cfg}) but reng-tp cannot quantize a \
+                 tensor-parallel shard (its o and down weights are strided column windows). \
+                 Unset RENG_FP8 / drop --fp8, or run the single-card binaries."
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("reng-tp: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse() -> Opts {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    refuse_fp8(&raw);
     let mut o = Opts {
         dir: String::new(),
         n_new: 0,

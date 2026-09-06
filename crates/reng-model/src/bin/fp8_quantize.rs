@@ -30,6 +30,12 @@ fn parse_args() -> Result<Args> {
     if argv.is_empty() {
         return Err(Error::Other(USAGE.into()));
     }
+    if argv[0].starts_with('-') {
+        return Err(Error::Other(format!(
+            "the model directory comes first, not {:?}\n{USAGE}",
+            argv[0]
+        )));
+    }
     let mut a = Args {
         dir: argv[0].clone(),
         fp8: Fp8Config::default(),
@@ -37,9 +43,20 @@ fn parse_args() -> Result<Args> {
         layers: 1,
     };
     // The switch reads the environment first, so `RENG_FP8=e5m2` works
-    // here as it does for the device binaries; `--fp8 <spec>` overrides it.
-    if let Some(c) = fp8_switch(std::env::var("RENG_FP8").ok().as_deref(), true)? {
-        a.fp8 = c;
+    // here as it does for the device binaries; `--fp8 <spec>` overrides
+    // it. An off value (`0`, `off`, `false`, `no`) means the same here as
+    // everywhere else, and this binary has nothing else to do, so it says
+    // so instead of quantizing with the defaults.
+    let env = std::env::var("RENG_FP8").ok();
+    match fp8_switch(env.as_deref(), true)? {
+        Some(c) => a.fp8 = c,
+        None => {
+            return Err(Error::Other(format!(
+                "RENG_FP8={} turns the fp8 switch off and reng-fp8-quantize does nothing else; \
+                 unset it or pass --fp8 <spec>",
+                env.unwrap_or_default()
+            )));
+        }
     }
     let mut i = 1;
     while i < argv.len() {

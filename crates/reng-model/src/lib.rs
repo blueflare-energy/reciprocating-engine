@@ -1164,8 +1164,10 @@ impl LlamaWeights {
             final_gamma: self.final_gamma.clone(),
             lm_head: self.lm_head.clone(),
             // A shard's `o` and `down` weights are strided column windows,
-            // which the quantizer does not take; quantize before sharding
-            // or gather the windows first.
+            // which the quantizer does not take, and a full model's codes
+            // are not a shard's; either way the shard starts unquantized.
+            // `RENG_SHARD_GATHER=1` makes the windows contiguous, which is
+            // what `quantize_fp8` needs.
             fp8: None,
         }
     }
@@ -1764,7 +1766,9 @@ pub struct Fp8Report {
     pub fp8_bytes: usize,
     pub scale_bytes: usize,
     /// Mean and maximum relative error of the round trip over the sampled
-    /// rows (up to [`FP8_ERROR_ROWS`] rows per matrix).
+    /// rows (up to [`FP8_ERROR_ROWS`] rows per matrix). `mean_rel` is the
+    /// unweighted mean of those rows' own means, so it is a sample of the
+    /// per-weight error, not the exact mean over every weight.
     pub mean_rel: f32,
     pub max_rel: f32,
     /// Seconds the pass took.
@@ -1823,7 +1827,9 @@ impl LlamaWeights {
                 if pitch != 0 {
                     return Err(Error::Other(format!(
                         "layer {li} {name}: fp8 does not take the strided column window of a \
-                         tensor-parallel shard; quantize before sharding"
+                         tensor-parallel shard; set RENG_SHARD_GATHER=1 so the shard owns a \
+                         contiguous copy of its window (quantizing before the shard does not \
+                         help: LlamaWeights::shard drops the codes)"
                     )));
                 }
                 if w.len() != rows * cols {
@@ -4074,7 +4080,11 @@ mod tests {
 
     /// The device side is not wired, and the switch says so instead of
     /// quietly running the bf16 weights. `layer_views` refuses before any
-    /// SynapseAI call, so this test never touches a card.
+    /// SynapseAI call, so this test never touches a card, but it does need
+    /// the feature that compiles `layer_views` at all: hosted CI runs
+    /// without `--features link-synapse` and skips this one, so the queued
+    /// `fp8-switch-refuses-until-wired` check on the box is the guard's
+    /// only end-to-end run.
     #[cfg(feature = "link-synapse")]
     #[test]
     fn fp8_weights_are_refused_until_the_gemm_form_is_wired() {
@@ -4098,6 +4108,9 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("strided column window"), "{err}");
+        // The advice has to be advice that works: quantizing before the
+        // shard does not survive `shard`, which sets `fp8: None`.
+        assert!(err.contains("RENG_SHARD_GATHER"), "{err}");
     }
 
     #[test]
