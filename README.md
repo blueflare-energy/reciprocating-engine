@@ -9,8 +9,8 @@
 ![coverage](.github/badges/coverage.svg)
 ![code quality](.github/badges/quality.svg)
 
-An open inference engine built from the ground up for Intel Gaudi2 (HL-225)
-accelerators, written in Rust.
+An open inference engine for Intel Gaudi2 (HL-225) accelerators, written in
+Rust.
 
 > Status: early. The hardware abstraction layer and tooling are taking shape
 > first; the compute and serving paths are under active development. Interfaces
@@ -18,16 +18,15 @@ accelerators, written in Rust.
 
 ## Why
 
-Gaudi2 is fast silicon with a comparatively thin open software surface. Most
-inference stacks target it through large vendor frameworks. Reciprocating
-Engine takes the opposite approach: a small, auditable Rust codebase that talks
-to the accelerator directly, so every layer from device discovery to the
-compute graph is readable, measurable, and tunable.
+Gaudi2 has a comparatively thin open software surface. Most inference stacks
+target it through large vendor frameworks. Reciprocating Engine is a small,
+auditable Rust codebase that talks to the accelerator directly, so every layer
+from device discovery to the compute graph is readable, measurable and tunable.
 
-The project is benchmark-driven. Every model and batch shape we run is measured
+The project is benchmark-driven. Every model and batch shape is measured
 against a hardware ceiling derived from first principles (memory bandwidth,
-compute throughput, interconnect), so performance work is always relative to
-what the machine can actually do rather than to an arbitrary baseline.
+compute throughput, interconnect), so performance work is relative to that
+ceiling rather than to an arbitrary baseline.
 
 ## What works today
 
@@ -44,11 +43,7 @@ what the machine can actually do rather than to an arbitrary baseline.
   and runs prefill (`reng-prefill`) and greedy generation (`reng-generate`)
   on the device. Generation compiles the model once with a KV cache and
   launches the recipe once per token; keys and values stay in HBM and only
-  the new token's logits cross the bus. SmolLM2-135M matches the f32
-  transformers reference on per-position argmax (cosine 1.000 on the last
-  logits at 128 tokens) and greedy decoding matches token for token except
-  at f32 near-ties, which bf16 cannot resolve. `tools/oracle/` holds the
-  reference scripts.
+  the new token's logits cross the bus.
 
 ```console
 $ reng devices
@@ -58,8 +53,10 @@ INDEX  PCI              STEPPING
 ...
 ```
 
+## Benchmarks
+
 Generation compiles two recipes over the same weights and cache: a wide one
-for prompt blocks and a one-row one for decode steps; `--batch` decodes
+for prompt blocks and a one-row one for decode steps. `--batch` decodes
 several sequences in lockstep over a multi-slot cache. Measured on one card
 (bf16, 128-token prompt, `tools/oracle` references match), percentages
 against the `reng-ceiling` roofline:
@@ -97,65 +94,28 @@ against the `reng-ceiling` roofline:
 
 Decode percentages are against the HBM roofline, prefill against the MME
 roofline. Every model is verified against a Hugging Face f32 reference
-before it is listed (8 greedy tokens, exact up to bf16 near-ties). The `bench` workflow regenerates the decode-versus-batch table
-(the plan's Chart 2) at
-[dev/sweep/latest.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/latest.md)
-and the prefill-versus-context table (Chart 1) at
-[dev/sweep/prefill.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/prefill.md)
-after every merge.
+before it is listed (8 greedy tokens, exact up to bf16 near-ties).
+SmolLM2-135M matches the f32 transformers reference on per-position argmax
+(cosine 1.000 on the last logits at 128 tokens), and greedy decoding matches
+token for token except at f32 near-ties, which bf16 cannot resolve.
+`tools/oracle/` holds the reference scripts.
 
-The safetensors files are memory-mapped and the bf16 weights are uploaded
-from the maps in the checkpoint's own layout, through a bounded ring of
-pinned buffers, so a model is never copied on the host: an 8B model
-reaches its first token about 7 s after launch, with the mapped file
-pages (reclaimable by the kernel) as most of its resident set. Compiled
-recipes are cached under
-`~/.cache/reng/recipes` (set
-`RENG_RECIPE_CACHE` to another directory or to `0` to disable), keyed by
-the graph's structure and the SynapseAI version, so a model at a known
-shape skips the graph compiler on later runs.
+After every merge, the `bench` workflow regenerates two tables:
 
-The KV cache is updated in place by a ScatterND node and the greedy token
-is an argmax on the device, so a decode step moves four bytes per sequence
-over the bus. Attention is four nodes per layer (two `batch_gemm`s, the
-mask add and the softmax) in the prefill and batched decode recipes and
-the fused `sdpa_recomp_fwd_bf16` kernel over the same tensors in the
-single-sequence decode recipe, where it is never slower and up to 2%
-faster; `RENG_SDPA=1` fuses every recipe and `RENG_SDPA=0` none.
-Single-sequence decode goes further: the one-row recipe takes only a
-token id and a position, gathers the embedding row, the RoPE rows and
-the mask row on the device and builds its own cache-write indices, and
-its argmax lands in an id ring that the next launch reads from, so
-`Generator::generate` enqueues every step back to back and reads all the
-ids once; the batched recipe does the same for `B` sequences at once
-from `B` ids and `B` positions per launch (`BatchedGenerator::generate`;
-`RENG_DEVICE_LOOP=0` restores the per-step uploads and readback on both
-paths). Attention reads the whole cache every step, so the batched
-decoder compiles its recipes for the smallest bucket of positions (256,
-doubling) that holds the longest live sequence and grows on demand,
-recompiling and copying the used rows across. Single-sequence decode is
-bound by per-node dispatch across the recipe, which is where the
-performance work continues.
-
-Every model above fits one card (Qwen2.5-32B occupies 65 GB of the
-96 GB). Larger models will run across cards: the HCCL bindings and a
-two-process all-reduce probe (`reng-hccl-test`) are in the tree and pass
-on this box (about 62 us per small all-reduce chained on one stream,
-48 us with events between streams; the box needs the kernel option
-`iommu=pt`, without which the scheduler's completion counters never
-reach the host), and `LlamaConfig::shard` / `LlamaWeights::shard` give a
-card its Megatron slice of the weights. The tensor-parallel decode
-path itself is the next piece of work.
+- decode versus batch (the plan's Chart 2):
+  [dev/sweep/latest.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/latest.md)
+- prefill versus context (Chart 1):
+  [dev/sweep/prefill.md](https://blueflare-energy.github.io/reciprocating-engine/dev/sweep/prefill.md)
 
 ## Layout
 
-| Path        | Purpose                                                        |
-|-------------|----------------------------------------------------------------|
-| `crates/`   | The Rust workspace (one crate per layer).                      |
-| `tools/`    | Repository tooling (badge generation, helpers).                |
-| `vendor/`   | Vendored upstream driver sources, unmodified. See its README.  |
-| `patches/`  | Our driver patches as a standalone series. See its README.     |
-| `.github/`  | CI, and the rendered status badges it commits.                 |
+| Path       | Purpose                                                              |
+|------------|----------------------------------------------------------------------|
+| `crates/`  | The Rust workspace (one crate per layer).                            |
+| `tools/`   | Repository tooling (badge generation, helpers).                      |
+| `vendor/`  | Vendored upstream driver sources, unmodified. See its README.        |
+| `patches/` | The project's driver patches as a standalone series. See its README. |
+| `.github/` | CI, and the rendered status badges it commits.                       |
 
 ## Build
 
@@ -173,6 +133,57 @@ to main and appends the result to the
 [benchmark history](https://blueflare-energy.github.io/reciprocating-engine/dev/bench/)
 (prefill and decode tok/s, and each as a percentage of the roofline ceiling
 from `reng-ceiling`).
+
+## How it works
+
+The safetensors files are memory-mapped and the bf16 weights are uploaded
+from the maps in the checkpoint's own layout, through a bounded ring of
+pinned buffers, so a model is never copied on the host. An 8B model
+reaches its first token about 7 s after launch, with the mapped file
+pages (reclaimable by the kernel) as most of its resident set. Compiled
+recipes are cached under `~/.cache/reng/recipes`, keyed by the graph's
+structure and the SynapseAI version, so a model at a known shape skips
+the graph compiler on later runs. Set `RENG_RECIPE_CACHE` to another
+directory, or to `0` to disable the cache.
+
+The decode path, one mechanism per item:
+
+- The KV cache is updated in place by a ScatterND node and the greedy
+  token is an argmax on the device, so a decode step moves four bytes per
+  sequence over the bus.
+- Attention is four nodes per layer (two `batch_gemm`s, the mask add and
+  the softmax) in the prefill and batched decode recipes. The
+  single-sequence decode recipe uses the fused `sdpa_recomp_fwd_bf16`
+  kernel over the same tensors, where it is never slower and up to 2%
+  faster. `RENG_SDPA=1` fuses every recipe and `RENG_SDPA=0` none.
+- The one-row recipe takes only a token id and a position. It gathers the
+  embedding row, the RoPE rows and the mask row on the device, builds its
+  own cache-write indices, and lands its argmax in an id ring that the
+  next launch reads from. `Generator::generate` therefore enqueues every
+  step back to back and reads all the ids once.
+- The batched recipe does the same for `B` sequences at once from `B` ids
+  and `B` positions per launch (`BatchedGenerator::generate`).
+  `RENG_DEVICE_LOOP=0` restores the per-step uploads and readback on both
+  paths.
+- Attention reads the whole cache every step, so the batched decoder
+  compiles its recipes for the smallest bucket of positions (256,
+  doubling) that holds the longest live sequence and grows on demand,
+  recompiling and copying the used rows across.
+
+Single-sequence decode is bound by per-node dispatch across the recipe,
+which is where the performance work continues.
+
+## Multi-card
+
+Every model in the benchmark table fits one card (Qwen2.5-32B occupies
+65 GB of the 96 GB). Larger models will run across cards. The HCCL
+bindings and a two-process all-reduce probe (`reng-hccl-test`) are in the
+tree and pass on this box: about 62 us per small all-reduce chained on
+one stream, 48 us with events between streams. The box needs the kernel
+option `iommu=pt`; without it the scheduler's completion counters never
+reach the host. `LlamaConfig::shard` / `LlamaWeights::shard` give a card
+its Megatron slice of the weights. The tensor-parallel decode path itself
+is the next piece of work.
 
 ## License
 
