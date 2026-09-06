@@ -42,10 +42,12 @@ ceiling rather than to an arbitrary baseline.
 - `reng-fp8`: host-side FP8 quantization of a `[out, in]` weight matrix to
   E4M3 or E5M2 codes with per-output-channel absmax scales, round to
   nearest even and saturation. Bit-exact against PyTorch's own
-  `float8_e4m3fn` and `float8_e5m2` casts; `reng-fp8-quantize` reports what
-  a checkpoint costs in fp8. The device gemm form is not wired yet, so the
-  `--fp8` switch is off by default and refuses to run rather than fall back
-  to bf16 silently.
+  `float8_e4m3fn` and `float8_e5m2` casts except where they disagree by
+  design: torch's range runs past Gaudi's, so an out-of-range value becomes
+  the largest finite code here and a reserved one there.
+  `reng-fp8-quantize` reports what a checkpoint costs in fp8. The device
+  gemm form is not wired yet, so the `--fp8` switch is off by default and
+  refuses to run rather than fall back to bf16 silently.
 - `reng-model`: loads a Hugging Face `config.json` plus `model.safetensors`
   and runs prefill (`reng-prefill`) and greedy generation (`reng-generate`)
   on the device. Generation compiles the model once with a KV cache and

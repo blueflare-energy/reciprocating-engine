@@ -168,6 +168,19 @@ fn codes_match_the_torch_cast() {
     }
 }
 
+/// Torch keeps going where Gaudi's finite range stops (448 against 240
+/// for E4M3, 57344 x 2 against 57344 for E5M2), so an out-of-range value
+/// is the one place the two encoders differ: this asserts that the
+/// substitution is exactly the largest finite code of the right sign, and
+/// byte equality everywhere else.
+///
+/// The clip *target* is not evidence this test provides: the fixture
+/// generator applies the same clip rule the encoder does, so on the
+/// saturating bytes the fixture is not an independent oracle. That 240 and
+/// 57344 are what the device cast returns comes from the device probe
+/// `cast-hf8-raw-p3` (`fp8-research.md` 4.1: 256/256 bit-exact, 250 and
+/// 300 both `0x77`), and the queued `cast-clip-e4m3` check re-runs it on
+/// the card.
 #[test]
 fn the_only_divergence_from_torch_is_the_saturation() {
     let mut checked = 0;

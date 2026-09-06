@@ -245,8 +245,13 @@ pub enum Scaling {
     /// One power-of-16 factor for the whole matrix, expressed as an
     /// exponent bias out of [`Fp8Format::hw_exponent_biases`] and applied
     /// by the MME descriptor for free.
+    ///
+    /// E5M2 has only its default bias 15 in that set, so this scheme is
+    /// the identity there (scale 1, codes as [`Scaling::Unit`] writes
+    /// them): a hardware-aligned scale is an E4M3 mechanism.
     HwExpBias,
     /// No scaling: the codes are the encoding of the weights themselves.
+    /// A backoff has nothing to act on here and is ignored.
     Unit,
 }
 
@@ -497,9 +502,14 @@ pub fn quantize(
 /// [`quantize`] with an explicit backoff: the scales stretch the channel's
 /// absmax to `max_finite * backoff` instead of to `max_finite`.
 ///
+/// The backoff acts on [`Scaling::PerChannel`] (it divides every scale)
+/// and on [`Scaling::HwExpBias`] (it can push the choice one bias
+/// coarser); [`Scaling::Unit`] has no scale to apply it to and ignores it.
+///
 /// The rows are quantized in parallel over up to eight threads for a
 /// matrix big enough to pay for them (two passes over the weights: the
-/// absmax of every row, then the encoding).
+/// absmax of every row, then the encoding). The last thread takes the
+/// ragged remainder when the row count does not divide.
 ///
 /// # Panics
 ///
@@ -818,6 +828,56 @@ mod tests {
         let mut codes = vec![0u8; rows * cols];
         encode_range(&w, cols, &scales, Fp8Format::E4M3, &mut codes);
         assert_eq!(par.codes, codes);
+    }
+
+    /// The same, with a row count the eight-way split does not divide:
+    /// the last chunk is short, so `part.len() / cols` and the
+    /// `w[r0 * cols..(r0 + n) * cols]` slicing have to carry it. Every
+    /// roster shape is a multiple of 8, so nothing else exercises this.
+    #[test]
+    fn the_parallel_path_carries_a_ragged_last_chunk() {
+        // An odd row count over a matrix just big enough to be split, so
+        // the last chunk is one row shorter than the others.
+        let rows = 67;
+        let cols = 16 * 1024;
+        let w: Vec<u16> = (0..rows * cols)
+            .map(|i| b((((i * 7919) % 2003) as f32 - 1000.0) / 977.0))
+            .collect();
+        let threads = split(rows, cols);
+        assert!(threads > 1, "the parallel path was not taken");
+        assert_ne!(rows % threads, 0, "the last chunk is not ragged");
+        for scaling in [Scaling::PerChannel, Scaling::HwExpBias, Scaling::Unit] {
+            let par = quantize(&w, rows, cols, Fp8Format::E4M3, scaling);
+            let mut absmax = vec![0.0f32; rows];
+            absmax_range(&w, cols, &mut absmax);
+            assert_eq!(absmax, row_absmax(&w, rows, cols), "{scaling:?}");
+            let mut codes = vec![0u8; rows * cols];
+            encode_range(&w, cols, &par.scales, Fp8Format::E4M3, &mut codes);
+            assert_eq!(par.codes, codes, "{scaling:?}");
+            // The last row is the one a bad chunk boundary loses.
+            assert!(
+                par.codes[(rows - 1) * cols..].iter().any(|&c| c != 0),
+                "{scaling:?}: the last row was never encoded"
+            );
+        }
+    }
+
+    /// E5M2's only hardware exponent bias is its default, so the
+    /// hardware-aligned scheme has nothing to choose and degrades to unit
+    /// scaling. `RENG_FP8=e5m2:hw` therefore quantizes exactly as
+    /// `RENG_FP8=e5m2:unit` does; the docs say so, and this pins it.
+    #[test]
+    fn the_hardware_bias_scheme_is_the_identity_for_e5m2() {
+        let rows = 4;
+        let cols = 32;
+        let w: Vec<u16> = (0..rows * cols)
+            .map(|i| b((((i * 37) % 101) as f32 - 50.0) / 13.0))
+            .collect();
+        let hw = quantize(&w, rows, cols, Fp8Format::E5M2, Scaling::HwExpBias);
+        let unit = quantize(&w, rows, cols, Fp8Format::E5M2, Scaling::Unit);
+        assert_eq!(hw.exp_bias, Fp8Format::E5M2.exponent_bias());
+        assert_eq!(hw.scales, vec![1.0f32; rows]);
+        assert_eq!(hw.codes, unit.codes);
     }
 
     #[test]

@@ -650,8 +650,10 @@ impl Store {
         Ok(d)
     }
 
-    /// A new zeroed device buffer of `bytes` bytes.
+    /// A new zeroed device buffer of `bytes` bytes (rounded up to a whole
+    /// 4-byte word, which is the granularity `synMemsetD32Async` zeroes at).
     pub fn alloc_zeroed(&mut self, bytes: u64) -> Result<u64> {
+        let bytes = bytes.next_multiple_of(4);
         let mut d = 0u64;
         syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut d));
         self.owned.push(d);
@@ -924,7 +926,12 @@ impl<'a> Runtime<'a> {
             *d = std::borrow::Cow::Owned(Vec::new());
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
+            // Rounded up to a whole `synMemsetD32Async` word, so the zero
+            // fill below covers the last element of a buffer whose byte
+            // count is not a multiple of 4 (an fp8 or bf16 tensor with a
+            // ragged element count).
             let bytes = sizes.iter().product::<u64>() * gb.scratch_elem[k] as u64;
+            let bytes = bytes.next_multiple_of(4);
             let d = if let Some(of) = &gb.scratch_alias[k] {
                 // The output side of an in-place update: same memory.
                 addrs[of.as_str()]
@@ -1489,6 +1496,8 @@ impl<'a> Runtime<'a> {
     ///
     /// Returns an error if the allocation or the clearing fails.
     pub fn alloc(&mut self, bytes: u64) -> Result<u64> {
+        // Rounded up to a whole memset word (see `alloc_zeroed`).
+        let bytes = bytes.next_multiple_of(4);
         let mut d = 0u64;
         syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut d));
         self.owned.push(d);
@@ -1705,8 +1714,8 @@ impl<'a> Runtime<'a> {
         let n_in = self.gb.names.len();
         for (k, sizes) in self.gb.scratch_sizes.iter().enumerate() {
             let elems = sizes.iter().product::<u64>() as usize;
-            let f32s = self.gb.scratch_elem[k] == 4;
-            let bytes = (elems * self.gb.scratch_elem[k]) as u64;
+            let elem = self.gb.scratch_elem[k];
+            let bytes = (elems * elem) as u64;
             let mut hb: *mut c_void = core::ptr::null_mut();
             syn!(synHostMalloc(self.dev, bytes, 0, &mut hb));
             syn!(synMemCopyAsync(
@@ -1718,13 +1727,18 @@ impl<'a> Runtime<'a> {
             ));
             syn!(synStreamSynchronize(self.stream));
             let (mut zeros, mut max) = (0usize, 0.0f32);
-            // SAFETY: hb holds `elems` elements of the recorded dtype.
+            // SAFETY: hb holds `elems` elements of `elem` bytes each, and
+            // each arm below reads exactly that width (1 for the fp8
+            // formats, 2 for bf16, 4 for f32 and int32).
             unsafe {
                 for j in 0..elems {
-                    let v = if f32s {
-                        *hb.cast::<f32>().add(j)
-                    } else {
-                        bf16_to_f32(*hb.cast::<u16>().add(j))
+                    let v = match elem {
+                        4 => *hb.cast::<f32>().add(j),
+                        2 => bf16_to_f32(*hb.cast::<u16>().add(j)),
+                        // One byte: an fp8 code. Its magnitude needs the
+                        // format, which the scratch record does not carry,
+                        // so report the code as the number it is.
+                        _ => f32::from(*hb.cast::<u8>().add(j)),
                     };
                     if v == 0.0 {
                         zeros += 1;

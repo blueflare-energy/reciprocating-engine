@@ -529,7 +529,14 @@ fn set_fp8_quant_metadata(t: synTensor, dtype: core::ffi::c_int, exp_bias: u32) 
         scale: 1.0,
         expBias: exp_bias,
     };
-    let meta = synFpQuantMetadata {
+    // SAFETY (of the pointers, not of a block): `param` and `meta` are
+    // stack locals that outlive the call, and `synTensorSetQuantizationData`
+    // copies both the record and the `synFpQuantParam` array it points at
+    // out of them (probe `gemm-expbias11-B` set the bias from a local and
+    // the recipe carried it). The API declares the record `void*` though it
+    // only reads it, hence the `mut` binding rather than a cast away from
+    // `const`.
+    let mut meta = synFpQuantMetadata {
         dataType: dtype,
         fpQuantParams: &raw const param,
         numFpQuantParams: 1,
@@ -537,7 +544,7 @@ fn set_fp8_quant_metadata(t: synTensor, dtype: core::ffi::c_int, exp_bias: u32) 
     syn!(synTensorSetQuantizationData(
         t,
         SYN_FP_QUANT_METADATA,
-        (&raw const meta).cast::<c_void>().cast_mut(),
+        (&raw mut meta).cast::<c_void>(),
         core::mem::size_of::<synFpQuantMetadata>() as u64,
     ));
     Ok(())
@@ -892,7 +899,10 @@ impl<'a> Gb<'a> {
         self.scratch_typed(name, sizes, SYN_TYPE_BF16)
     }
 
-    /// [`Gb::scratch`] with an explicit dtype (bf16 or f32).
+    /// [`Gb::scratch`] with an explicit dtype: bf16, f32, or one of the
+    /// two fp8 formats (the persistent intermediate of a cast pair, see
+    /// [`crate::fp8::cast_round_trip`]). The runtime allocates
+    /// `elem_bytes(dtype)` per element.
     pub fn scratch_typed(
         &mut self,
         name: &str,

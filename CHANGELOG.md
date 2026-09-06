@@ -136,21 +136,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   240. Rows are quantized over up to eight threads.
   `RENG_FP8=1` or `--fp8` quantizes a model's q/k/v/o/gate/up/down at load
   (`load_weights_fp8`), leaving the norms, the embedding table and the LM
-  head bf16; `RENG_FP8=e5m2:hw` and `RENG_FP8=pcs,backoff=0.5` select the
-  format, the scheme and the backoff. `reng-fp8-quantize` runs that pass on
-  its own and reports the bytes and the error: SmolLM2-135M 0.198 GiB ->
+  head bf16; `RENG_FP8=e4m3:hw` and `RENG_FP8=pcs,backoff=0.5` select the
+  format, the scheme and the backoff (the hardware-aligned scheme is an
+  E4M3 one: E5M2's only accepted bias is its default, so `e5m2:hw`
+  quantizes as `e5m2:unit`). `reng-tp` refuses the switch rather than
+  ignoring it, because a shard's `o` and `down` weights are strided column
+  windows the quantizer does not take. `reng-fp8-quantize` runs that pass
+  on its own and reports the bytes and the error: SmolLM2-135M 0.198 GiB ->
   0.099 GiB and Llama-3.2-3B 5.25 GiB -> 2.63 GiB of projection weights,
-  mean relative error 0.0225 per weight in either case.
+  mean relative error 0.0225 over the sampled rows in either case.
   On the graph side, `Gb::input_fp8` creates a persistent fp8 tensor and
   attaches the exponent bias as `SYN_FP_QUANT_METADATA`, and
   `reng_synapse::fp8` builds the probe graphs. The node that consumes such
   an operand is not chosen yet: the MME refuses a bf16 activation against
   an fp8 weight, so the candidates are the plain `gemm` over two fp8
-  operands with an in-recipe `cast_bf16_to_hf8` of the activation and the
-  `fp8_gemm_bf16` complex guid with the per-channel `scaleB`.
-  `reng-fp8-probe` runs both at the decode shapes and times them against
-  bf16; until it has, the switch fails with that message instead of
-  quietly running the bf16 weights.
+  operands with an in-recipe `cast_bf16_to_hf8` of the activation (its
+  scale the exponent bias) and the `fp8_gemm_bf16` complex guid with the
+  per-channel `scaleB` (its operands `[A, B]` or `[A, B, scaleA, scaleB]`,
+  never three). `reng-fp8-probe` runs both at the decode shapes, against a
+  CPU reference of what each form actually computes, and times them against
+  bf16 with a floor under the ratio; until it has, the switch fails with
+  that message instead of quietly running the bf16 weights.
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds
