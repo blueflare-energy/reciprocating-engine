@@ -454,10 +454,20 @@ impl Bf16Slice {
         if cfg!(target_endian = "little") && bytes.as_ptr().align_offset(align_of::<u16>()) == 0 {
             return Self::Mapped { map, offset, len };
         }
-        let v: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect();
+        // An odd data offset (94 of the 723 tensors of the 70B distill,
+        // 19 GB) cannot be viewed as `u16`: one memcpy into an aligned
+        // buffer (byte-swapped on a big-endian host).
+        let mut v: Vec<u16> = vec![0; len];
+        // SAFETY: `v` holds `len * 2` bytes and `bytes` has exactly that
+        // many; the ranges do not overlap.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr().cast::<u8>(), len * 2);
+        }
+        if cfg!(target_endian = "big") {
+            for x in &mut v {
+                *x = x.swap_bytes();
+            }
+        }
         Self::from(v)
     }
 
@@ -544,6 +554,11 @@ pub struct LayerTensors {
     pub wk: Bf16Slice,
     pub wv: Bf16Slice,
     pub wo: Bf16Slice,
+    /// Row pitch of `wo` in elements when it is the column window of a
+    /// tensor-parallel shard (a view of the whole checkpoint matrix from
+    /// the shard's first column on; see [`LlamaWeights::shard`]); 0 for
+    /// the contiguous matrix.
+    pub wo_pitch: usize,
     /// Attention biases; empty when the checkpoint has none.
     pub bq: Vec<f32>,
     pub bk: Vec<f32>,
@@ -556,6 +571,8 @@ pub struct LayerTensors {
     pub wg: Bf16Slice,
     pub wu: Bf16Slice,
     pub wd: Bf16Slice,
+    /// Row pitch of `wd`, as `wo_pitch`.
+    pub wd_pitch: usize,
 }
 
 /// A whole model's weights on the host: the matrices bf16 in the
@@ -610,10 +627,14 @@ impl LlamaWeights {
     /// split): the q/k/v and gate/up projections keep the rows of this
     /// rank's heads and MLP columns (views into the mapped checkpoint,
     /// since `[out, in]` rows are contiguous), the o and down projections
-    /// keep the matching columns (gathered into owned copies), the biases
-    /// and the OLMo-2 full-width q/k gains are sliced the same way, and
-    /// the norms, the embedding and the LM head are shared. `cfg` is the
-    /// unsharded config; the shard's config is [`LlamaConfig::shard`].
+    /// keep the matching columns as strided views (the sub-view from the
+    /// shard's first column to the end of its last row, with the full
+    /// matrix width as the row pitch in `wo_pitch` / `wd_pitch`, gathered
+    /// row by row while they are uploaded), the biases and the OLMo-2
+    /// full-width q/k gains are sliced the same way, and the norms, the
+    /// embedding and the LM head are shared. Nothing is copied for a bf16
+    /// checkpoint. `cfg` is the unsharded config; the shard's config is
+    /// [`LlamaConfig::shard`].
     ///
     /// # Panics
     ///
@@ -629,15 +650,25 @@ impl LlamaWeights {
             assert_eq!(m.len(), all_rows * cols, "matrix shape");
             m.sub(rank * part * cols, part * cols)
         };
+        // The column window `rank * part ..` of every row, as the view
+        // from the first row's window to the end of the last row's; or,
+        // with diagnostic `RENG_SHARD_GATHER`, gathered into an owned
+        // contiguous copy (the loader's earlier form, kept to measure the
+        // strided view against).
+        let gather = std::env::var_os("RENG_SHARD_GATHER").is_some();
         let cols = |m: &Bf16Slice, out_rows: usize, all_cols: usize, part: usize| -> Bf16Slice {
             assert_eq!(m.len(), out_rows * all_cols, "matrix shape");
-            let mut v = Vec::with_capacity(out_rows * part);
-            for r in 0..out_rows {
-                let base = r * all_cols + rank * part;
-                v.extend_from_slice(&m[base..base + part]);
+            if gather {
+                let mut v = Vec::with_capacity(out_rows * part);
+                for r in 0..out_rows {
+                    let base = r * all_cols + rank * part;
+                    v.extend_from_slice(&m[base..base + part]);
+                }
+                return Bf16Slice::from(v);
             }
-            Bf16Slice::from(v)
+            m.sub(rank * part, (out_rows - 1) * all_cols + part)
         };
+        let pitch = |all_cols: usize| if gather { 0 } else { all_cols };
         let vec_part = |v: &[f32], all: usize, part: usize| -> Vec<f32> {
             if v.is_empty() {
                 return Vec::new();
@@ -657,6 +688,7 @@ impl LlamaWeights {
                 wk: rows(&l.wk, kv_all, kv_rows, h),
                 wv: rows(&l.wv, kv_all, kv_rows, h),
                 wo: cols(&l.wo, h, q_all, q_rows),
+                wo_pitch: pitch(q_all),
                 bq: vec_part(&l.bq, q_all, q_rows),
                 bk: vec_part(&l.bk, kv_all, kv_rows),
                 bv: vec_part(&l.bv, kv_all, kv_rows),
@@ -675,6 +707,7 @@ impl LlamaWeights {
                 wg: rows(&l.wg, i_all, i_rows, h),
                 wu: rows(&l.wu, i_all, i_rows, h),
                 wd: cols(&l.wd, h, i_all, i_rows),
+                wd_pitch: pitch(i_all),
             })
             .collect();
         Self {
@@ -1050,6 +1083,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             wk,
             wv,
             wo: residual(lin("self_attn.o_proj.weight", h, qd)?),
+            wo_pitch: 0,
             bq: opt("self_attn.q_proj.bias", &[qd])?,
             bk: opt("self_attn.k_proj.bias", &[kvd])?,
             bv: opt("self_attn.v_proj.bias", &[kvd])?,
@@ -1060,6 +1094,7 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             wg,
             wu,
             wd: residual(lin("mlp.down_proj.weight", h, i)?),
+            wd_pitch: 0,
         });
     }
     let mut final_gamma = plus_one(tensor_f32(st("model.norm.weight"), "model.norm.weight")?.0);
@@ -1239,6 +1274,7 @@ fn layer_views<'a>(
             wk: &l.wk,
             wv: &l.wv,
             wo: &l.wo,
+            wo_pitch: l.wo_pitch,
             bq: &l.bq,
             bk: &l.bk,
             bv: &l.bv,
@@ -1247,6 +1283,7 @@ fn layer_views<'a>(
             wg: &l.wg,
             wu: &l.wu,
             wd: &l.wd,
+            wd_pitch: l.wd_pitch,
             sin: if cfg.local_rope(li) {
                 rope.sin_local
             } else {
@@ -1612,6 +1649,112 @@ impl<'a> BatchedGenerator<'a> {
     }
 }
 
+/// One rank of a tensor-parallel model (see `reng_synapse::tp`): the
+/// shard's recipes and cache on this process's card, fed token ids, for
+/// `batch` sequences decoded in lockstep. Prompts go through the wide
+/// recipes from host-gathered embeddings one sequence at a time,
+/// generated tokens through the device decode loop.
+#[cfg(feature = "link-synapse")]
+pub struct TpGenerator<'a> {
+    model: reng_synapse::tp::TpModel<'a>,
+    w: &'a LlamaWeights,
+    cfg: &'a LlamaConfig,
+}
+
+#[cfg(feature = "link-synapse")]
+impl<'a> TpGenerator<'a> {
+    /// Compile this rank's recipes for `batch` sequences, prompt blocks
+    /// of `rows` tokens and a cache of `capacity` positions, and upload
+    /// its shard. `w` is the shard ([`LlamaWeights::shard`]) and `cfg` its
+    /// config ([`LlamaConfig::shard`]); `rank` the joined card and
+    /// communicator.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation or an upload fails.
+    pub fn new(
+        rank: reng_synapse::hccl::Rank,
+        w: &'a LlamaWeights,
+        cfg: &'a LlamaConfig,
+        batch: usize,
+        rows: usize,
+        capacity: usize,
+    ) -> Result<Self> {
+        let rope = cfg.rope_caches(capacity);
+        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let embed = reng_synapse::EmbedTable {
+            rows: &w.embed,
+            scale: cfg.embed_scale(),
+        };
+        let model = reng_synapse::tp::TpModel::new(
+            rank,
+            &m,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+            cfg.vocab_size,
+            batch,
+            rows,
+            capacity,
+            &rope.tables(),
+            &embed,
+        )?;
+        Ok(Self { model, w, cfg })
+    }
+
+    /// The model, for its mode switch and load report.
+    pub fn model(&mut self) -> &mut reng_synapse::tp::TpModel<'a> {
+        &mut self.model
+    }
+
+    /// Number of sequences.
+    #[must_use]
+    pub fn batch(&self) -> usize {
+        self.model.batch()
+    }
+
+    /// Positions of sequence `b` in the cache so far.
+    #[must_use]
+    pub fn position(&self, b: usize) -> usize {
+        self.model.position(b)
+    }
+
+    /// Start sequence `b` afresh.
+    pub fn reset(&mut self, b: usize) {
+        self.model.reset(b);
+    }
+
+    /// Append `ids` to sequence `b` (fed in blocks of at most `rows`) and
+    /// return the greedy next token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty or would overflow the cache.
+    pub fn prefill(&mut self, b: usize, ids: &[u32]) -> Result<u32> {
+        assert!(!ids.is_empty());
+        let x = embed_tokens(self.w, self.cfg, ids);
+        self.model.prefill(b, &x)
+    }
+
+    /// Feed `seeds` (one id per sequence) and continue every sequence
+    /// greedily for `n` tokens in all (see `TpModel::decode`), with the
+    /// run's times.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    pub fn generate(
+        &mut self,
+        seeds: &[u32],
+        n: usize,
+    ) -> Result<(Vec<u32>, reng_synapse::tp::StepTimes)> {
+        self.model.decode(seeds, n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,6 +2028,7 @@ mod tests {
             wk: mat(4, 4),
             wv: mat(4, 4),
             wo: mat(4, 4),
+            wo_pitch: 0,
             bq: (0..4).map(|i| i as f32).collect(),
             bk: Vec::new(),
             bv: Vec::new(),
@@ -1893,6 +2037,7 @@ mod tests {
             wg: mat(4, 4),
             wu: mat(4, 4),
             wd: mat(4, 4),
+            wd_pitch: 0,
         };
         let w = LlamaWeights {
             embed: mat(8, 4),
@@ -1917,9 +2062,23 @@ mod tests {
             &(8..16).map(|i| i as u16).collect::<Vec<u16>>()[..]
         );
         assert_eq!(l.bq, vec![2.0, 3.0]);
-        // o keeps columns 2..4 of every row: 2,3, 6,7, 10,11, 14,15.
-        assert_eq!(&l.wo[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
-        assert_eq!(&l.wd[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
+        // o keeps columns 2..4 of every row: 2,3, 6,7, 10,11, 14,15, as a
+        // strided view from element 2 to the end with the full width as
+        // its pitch.
+        let window = reng_synapse::Stride {
+            rows: 4,
+            cols: 2,
+            pitch: 4,
+        };
+        assert_eq!((l.wo_pitch, l.wo.len()), (4, 14));
+        assert_eq!(
+            reng_synapse::gather_columns(&l.wo, window),
+            [2u16, 3, 6, 7, 10, 11, 14, 15]
+        );
+        assert_eq!(
+            reng_synapse::gather_columns(&l.wd, window),
+            [2u16, 3, 6, 7, 10, 11, 14, 15]
+        );
         assert_eq!(l.wg.len(), 8);
         assert_eq!(
             &l.wg[..],

@@ -24,7 +24,7 @@
 
 use crate::ffi::*;
 use crate::model::Gb;
-use crate::{bf16_to_f32, f32_to_bf16};
+use crate::{Stride, bf16_to_f32, f32_to_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
 use std::collections::HashMap;
@@ -326,7 +326,14 @@ impl Staging {
         })
     }
 
-    /// Copy `src` to device address `dst` through the ring.
+    /// Copy `src` to device address `dst` through the ring. With a
+    /// `stride`, `src` is the base of a row-major matrix of which only a
+    /// column window is wanted: `rows` runs of `cols` bf16 elements,
+    /// `pitch` elements apart, gathered row by row into the slot so that
+    /// the device gets the contiguous `[rows, cols]` matrix (a tensor-
+    /// parallel shard of an `o_proj` or `down_proj` weight straight from
+    /// the mapped checkpoint).
+    #[allow(clippy::too_many_arguments)]
     fn upload(
         &mut self,
         dev: synDeviceId,
@@ -334,32 +341,84 @@ impl Staging {
         fence: &mut Fence,
         src: &[u8],
         scale: Option<f32>,
+        stride: Option<Stride>,
         dst: u64,
     ) -> Result<()> {
-        for (i, piece) in src.chunks(self.slot_bytes).enumerate() {
-            if self.next == self.slots.len() {
-                fence.wait(dev, stream)?;
-                self.next = 0;
-            }
-            let hb = self.slots[self.next];
-            self.next += 1;
-            // SAFETY: the slot holds `slot_bytes` bytes and no copy reads it
-            // (every copy issued before the last fence has landed).
-            unsafe {
-                match scale {
-                    Some(f) => copy_scaled_parallel(piece, f, hb.cast::<u8>()),
-                    None => copy_parallel(piece, hb.cast::<u8>()),
+        let Some(st) = stride else {
+            for (i, piece) in src.chunks(self.slot_bytes).enumerate() {
+                let hb = self.slot(dev, stream, fence)?;
+                // SAFETY: the slot holds `slot_bytes` bytes and no copy
+                // reads it (every copy issued before the last fence has
+                // landed).
+                unsafe {
+                    match scale {
+                        Some(f) => copy_scaled_parallel(piece, f, hb.cast::<u8>()),
+                        None => copy_parallel(piece, hb.cast::<u8>()),
+                    }
                 }
+                syn!(synMemCopyAsync(
+                    stream,
+                    hb as u64,
+                    piece.len() as u64,
+                    dst + (i * self.slot_bytes) as u64,
+                    SYN_HOST_TO_DRAM
+                ));
+            }
+            return Ok(());
+        };
+        let row_bytes = st.cols * 2;
+        let pitch_bytes = st.pitch * 2;
+        assert!(
+            row_bytes <= self.slot_bytes,
+            "a strided row exceeds a staging slot"
+        );
+        assert!(
+            (st.rows - 1) * pitch_bytes + row_bytes <= src.len(),
+            "strided source too short"
+        );
+        let per_slot = self.slot_bytes / row_bytes;
+        let mut row0 = 0usize;
+        while row0 < st.rows {
+            let n = per_slot.min(st.rows - row0);
+            let hb = self.slot(dev, stream, fence)?;
+            // SAFETY: as above; `n * row_bytes <= slot_bytes`.
+            unsafe {
+                gather_rows_parallel(
+                    &src[row0 * pitch_bytes..],
+                    n,
+                    row_bytes,
+                    pitch_bytes,
+                    scale,
+                    hb.cast::<u8>(),
+                );
             }
             syn!(synMemCopyAsync(
                 stream,
                 hb as u64,
-                piece.len() as u64,
-                dst + (i * self.slot_bytes) as u64,
+                (n * row_bytes) as u64,
+                dst + (row0 * row_bytes) as u64,
                 SYN_HOST_TO_DRAM
             ));
+            row0 += n;
         }
         Ok(())
+    }
+
+    /// The next free slot, waiting for every copy in flight when the ring
+    /// has been used up.
+    fn slot(
+        &mut self,
+        dev: synDeviceId,
+        stream: synStreamHandle,
+        fence: &mut Fence,
+    ) -> Result<*mut c_void> {
+        if self.next == self.slots.len() {
+            fence.wait(dev, stream)?;
+            self.next = 0;
+        }
+        let hb = self.slots[self.next];
+        self.next += 1;
+        Ok(hb)
     }
 
     /// Release the slots.
@@ -447,6 +506,189 @@ unsafe fn copy_scaled_parallel(src: &[u8], scale: f32, dst: *mut u8) {
     });
 }
 
+/// Gather `rows` runs of `row_bytes` bytes, `pitch_bytes` apart in `src`,
+/// into consecutive rows at `dst` (bf16 elements, scaled on the way when
+/// `scale` is given), the rows split over up to eight threads.
+///
+/// # Safety
+///
+/// `dst` must be writable for `rows * row_bytes` bytes and must not
+/// overlap `src`, which must hold `(rows - 1) * pitch_bytes + row_bytes`.
+unsafe fn gather_rows_parallel(
+    src: &[u8],
+    rows: usize,
+    row_bytes: usize,
+    pitch_bytes: usize,
+    scale: Option<f32>,
+    dst: *mut u8,
+) {
+    const PER_THREAD: usize = 8 << 20;
+    const THREADS: usize = 8;
+    let threads = ((rows * row_bytes) / PER_THREAD).clamp(1, THREADS);
+    let chunk = rows.div_ceil(threads);
+    let dst = dst as usize;
+    let run = |r0: usize, r1: usize| {
+        for r in r0..r1 {
+            let row = &src[r * pitch_bytes..r * pitch_bytes + row_bytes];
+            let out = (dst + r * row_bytes) as *mut u8;
+            // SAFETY: the caller's contract; rows are disjoint.
+            unsafe {
+                match scale {
+                    Some(f) => copy_scaled_parallel(row, f, out),
+                    None => core::ptr::copy_nonoverlapping(row.as_ptr(), out, row_bytes),
+                }
+            }
+        }
+    };
+    if threads == 1 {
+        run(0, rows);
+        return;
+    }
+    std::thread::scope(|s| {
+        for i in 0..threads {
+            let (r0, r1) = (i * chunk, ((i + 1) * chunk).min(rows));
+            if r0 < r1 {
+                s.spawn(move || run(r0, r1));
+            }
+        }
+    });
+}
+
+/// Device buffers of persistent tensors that other runtimes own, keyed by
+/// tensor name and element count, so that a recipe built with
+/// [`Runtime::new_bound`] binds to them instead of allocating its own (the
+/// generalisation of [`Runtime::new_with`] to several parents: the
+/// tensor-parallel decoder shares its residual stream, partial sums, KV
+/// cache and weights across half a dozen recipes). The first runtime
+/// added under a key owns the buffer; a later one with the same name and
+/// count is ignored.
+#[derive(Default)]
+pub(crate) struct Bindings {
+    map: HashMap<(String, u64), u64>,
+}
+
+impl Bindings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add every persistent tensor of `rt` (inputs, scratch and the
+    /// read-back tensor) that is not bound yet.
+    pub fn add(&mut self, rt: &Runtime<'_>) {
+        for (name, shape) in &rt.shapes {
+            let elems = shape.iter().product::<u64>();
+            self.map
+                .entry((name.clone(), elems))
+                .or_insert(rt.addrs[name]);
+        }
+    }
+
+    fn get(&self, name: &str, elems: u64) -> Option<u64> {
+        self.map.get(&(name.to_owned(), elems)).copied()
+    }
+}
+
+/// Device buffers allocated and filled outside any recipe: the weights of
+/// the layers a tensor-parallel runtime binds per launch (the recipe
+/// itself owns one layer's), and zeroed state buffers. Uploads go through
+/// the same staging ring as a runtime's inputs; [`Store::finish`] waits
+/// for the last of them and releases the ring. Everything is freed on
+/// drop.
+pub(crate) struct Store {
+    dev: synDeviceId,
+    stream: synStreamHandle,
+    owned: Vec<u64>,
+    staging: Option<Staging>,
+    fence: Fence,
+    /// Bytes uploaded and allocated, for reports.
+    pub bytes: u64,
+}
+
+impl Store {
+    pub fn new(dev: synDeviceId, stream: synStreamHandle) -> Self {
+        Self {
+            dev,
+            stream,
+            owned: Vec::new(),
+            staging: None,
+            fence: Fence::none(),
+            bytes: 0,
+        }
+    }
+
+    /// A new device buffer holding `src` (bf16 bytes, scaled while staged
+    /// when `scale` is given, gathered from a column window when `stride`
+    /// is given; see `Staging::upload`).
+    pub fn upload(
+        &mut self,
+        src: &[u8],
+        scale: Option<f32>,
+        stride: Option<Stride>,
+    ) -> Result<u64> {
+        let bytes = stride.map_or(src.len(), |s| s.rows * s.cols * 2);
+        let mut d = 0u64;
+        syn!(synDeviceMalloc(self.dev, bytes as u64, 0, 0, &mut d));
+        self.owned.push(d);
+        self.bytes += bytes as u64;
+        if self.staging.is_none() {
+            self.staging = Some(Staging::new(
+                self.dev,
+                Staging::SLOT_BYTES * Staging::SLOTS,
+                Staging::SLOT_BYTES,
+            )?);
+        }
+        let st = self.staging.as_mut().expect("staging ring");
+        st.upload(
+            self.dev,
+            self.stream,
+            &mut self.fence,
+            src,
+            scale,
+            stride,
+            d,
+        )?;
+        Ok(d)
+    }
+
+    /// A new zeroed device buffer of `bytes` bytes.
+    pub fn alloc_zeroed(&mut self, bytes: u64) -> Result<u64> {
+        let mut d = 0u64;
+        syn!(synDeviceMalloc(self.dev, bytes, 0, 0, &mut d));
+        self.owned.push(d);
+        self.bytes += bytes;
+        syn!(synMemsetD32Async(d, 0, (bytes / 4) as usize, self.stream));
+        Ok(d)
+    }
+
+    /// Wait until every upload so far has landed and release the staging
+    /// ring (the next upload makes a new one).
+    pub fn finish(&mut self) -> Result<()> {
+        if let Some(mut st) = self.staging.take() {
+            self.fence.wait(self.dev, self.stream)?;
+            // SAFETY: every copy from the ring has landed.
+            unsafe { st.free(self.dev) };
+        }
+        syn!(synStreamSynchronize(self.stream));
+        Ok(())
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        // SAFETY: owned buffers, no copy in flight after the sync.
+        unsafe {
+            synStreamSynchronize(self.stream);
+            if let Some(mut st) = self.staging.take() {
+                st.free(self.dev);
+            }
+            self.fence.free(self.dev);
+            for &d in &self.owned {
+                synDeviceFree(self.dev, d, 0);
+            }
+        }
+    }
+}
+
 /// A compiled recipe bound to device buffers for all of its persistent
 /// tensors. Inputs are uploaded once at construction; [`Runtime::upload`]
 /// replaces one input's contents between launches, and
@@ -466,6 +708,9 @@ pub(crate) struct Runtime<'a> {
     shapes: HashMap<String, Vec<u64>>,
     /// Whether this runtime acquired the device (else it borrows a parent's).
     owns_device: bool,
+    /// Whether the read-back tensor's buffer is this runtime's own (else it
+    /// is bound to another runtime's through [`Runtime::new_bound`]).
+    owns_out: bool,
     /// Pinned host buffer per input for the per-step re-uploads
     /// ([`Runtime::upload`] and friends), allocated on first use; the
     /// construction-time upload goes through a small staging ring instead,
@@ -510,7 +755,17 @@ impl<'a> Runtime<'a> {
     /// parent.
     pub fn new_with(gb: Gb<'a>, out: Out, parent: Option<&Runtime<'_>>) -> Result<Self> {
         let borrowed = parent.map(|p| (p.dev, p.stream));
-        Self::build(gb, out, parent, borrowed)
+        // A tensor is shared with the parent when it has the same name AND
+        // the same element count (a weight may be declared 4-D in one graph
+        // and 5-D with a trailing 1 in another; the per-step inputs of a
+        // narrower recipe have the same names but different counts).
+        let lookup = |name: &str, elems: u64| -> Option<u64> {
+            parent.and_then(|p| match (p.addrs.get(name), p.shapes.get(name)) {
+                (Some(&d), Some(sh)) if sh.iter().product::<u64>() == elems => Some(d),
+                _ => None,
+            })
+        };
+        Self::build(gb, out, &lookup, borrowed)
     }
 
     /// Like [`Runtime::new`], but on a device and stream the caller has
@@ -518,16 +773,31 @@ impl<'a> Runtime<'a> {
     /// exactly one device for its HCCL rank). Nothing is shared with another
     /// runtime, and drop leaves the device and stream alone.
     pub fn new_on(gb: Gb<'a>, out: Out, dev: synDeviceId, stream: synStreamHandle) -> Result<Self> {
-        Self::build(gb, out, None, Some((dev, stream)))
+        Self::build(gb, out, &|_, _| None, Some((dev, stream)))
     }
 
-    /// Persistent tensors named like `parent`'s bind to its buffers; a
-    /// `borrowed` device and stream are used instead of acquiring one.
+    /// Like [`Runtime::new_on`], binding every persistent tensor (the
+    /// read-back tensor included) whose name and element count `bind` has
+    /// to that buffer instead of allocating its own. The runtimes bound to
+    /// must outlive this one.
+    pub fn new_bound(
+        gb: Gb<'a>,
+        out: Out,
+        dev: synDeviceId,
+        stream: synStreamHandle,
+        bind: &Bindings,
+    ) -> Result<Self> {
+        Self::build(gb, out, &|n, e| bind.get(n, e), Some((dev, stream)))
+    }
+
+    /// Persistent tensors `lookup` knows (by name and element count) bind
+    /// to those buffers; a `borrowed` device and stream are used instead
+    /// of acquiring one.
     #[allow(clippy::too_many_lines)]
     fn build(
         mut gb: Gb<'a>,
         out: Out,
-        parent: Option<&Runtime<'_>>,
+        lookup: &dyn Fn(&str, u64) -> Option<u64>,
         borrowed: Option<(synDeviceId, synStreamHandle)>,
     ) -> Result<Self> {
         gb.serialize_if_requested()?;
@@ -559,17 +829,8 @@ impl<'a> Runtime<'a> {
             }
         };
         let t_device = t0.elapsed() - t_compile;
-        // A tensor is shared with the parent when it has the same name AND
-        // the same element count (a weight may be declared 4-D in one graph
-        // and 5-D with a trailing 1 in another; the per-step inputs of a
-        // narrower recipe have the same names but different counts).
         let shared = |name: &CString, sizes: &[u64]| -> Option<u64> {
-            let key = name.to_str().unwrap();
-            let elems = sizes.iter().product::<u64>();
-            parent.and_then(|p| match (p.addrs.get(key), p.shapes.get(key)) {
-                (Some(&d), Some(sh)) if sh.iter().product::<u64>() == elems => Some(d),
-                _ => None,
-            })
+            lookup(name.to_str().unwrap(), sizes.iter().product::<u64>())
         };
 
         let n_in = gb.names.len();
@@ -595,13 +856,18 @@ impl<'a> Runtime<'a> {
                 }
             }
         };
+        // The bytes input `idx` occupies on the device: its host bytes, or
+        // the column window of a strided source.
+        let device_bytes = |idx: usize| -> usize {
+            gb.strides[idx].map_or(input_bytes(idx).len(), |s| s.rows * s.cols * 2)
+        };
         // Every input with its own device buffer goes through a ring of a
         // few pinned staging buffers sized for the largest of them, so the
         // pinned memory of an upload stays bounded whatever the model size.
         let (mut total, mut largest) = (0usize, 0usize);
         for idx in 0..n_in {
             if shared(&gb.names[idx], &gb.sizes[idx]).is_none() {
-                let n = input_bytes(idx).len();
+                let n = device_bytes(idx);
                 total += n;
                 largest = largest.max(n);
             }
@@ -617,11 +883,20 @@ impl<'a> Runtime<'a> {
                 d
             } else {
                 let src = input_bytes(idx);
+                let bytes = device_bytes(idx);
                 let mut d = 0u64;
-                syn!(synDeviceMalloc(dev, src.len() as u64, 0, 0, &mut d));
-                in_bytes += src.len() as u64;
+                syn!(synDeviceMalloc(dev, bytes as u64, 0, 0, &mut d));
+                in_bytes += bytes as u64;
                 owned.push(d);
-                staging.upload(dev, stream, &mut fence, src, gb.scales[idx], d)?;
+                staging.upload(
+                    dev,
+                    stream,
+                    &mut fence,
+                    src,
+                    gb.scales[idx],
+                    gb.strides[idx],
+                    d,
+                )?;
                 own_input.push(true);
                 d
             };
@@ -649,7 +924,7 @@ impl<'a> Runtime<'a> {
             *d = std::borrow::Cow::Owned(Vec::new());
         }
         for (k, sizes) in gb.scratch_sizes.iter().enumerate() {
-            let bytes = sizes.iter().product::<u64>() * if gb.scratch_f32[k] { 4 } else { 2 };
+            let bytes = sizes.iter().product::<u64>() * gb.scratch_elem[k] as u64;
             let d = if let Some(of) = &gb.scratch_alias[k] {
                 // The output side of an in-place update: same memory.
                 addrs[of.as_str()]
@@ -678,8 +953,16 @@ impl<'a> Runtime<'a> {
             dev_bufs.push(d);
         }
         let out_bytes = (out.elems() * out.kind.bytes()) as u64;
-        let mut d_out = 0u64;
-        syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d_out));
+        // The read-back tensor: a buffer of its own, or one another runtime
+        // owns (a recipe whose product is state the next recipe reads).
+        let (d_out, owns_out) = match shared(&out.name, &out.sizes) {
+            Some(d) => (d, false),
+            None => {
+                let mut d = 0u64;
+                syn!(synDeviceMalloc(dev, out_bytes, 0, 0, &mut d));
+                (d, true)
+            }
+        };
         let mut h_out: *mut c_void = core::ptr::null_mut();
         syn!(synHostMalloc(dev, out_bytes, 0, &mut h_out));
         info_index.insert(out.name.to_str().unwrap().to_owned(), infos.len());
@@ -690,6 +973,7 @@ impl<'a> Runtime<'a> {
             &out.sizes,
         ));
         addrs.insert(out.name.to_str().unwrap().to_owned(), d_out);
+        shapes.insert(out.name.to_str().unwrap().to_owned(), out.sizes.clone());
 
         let mut ws = 0u64;
         syn!(synWorkspaceGetSize(&mut ws, recipe));
@@ -725,6 +1009,7 @@ impl<'a> Runtime<'a> {
             dev,
             stream,
             owns_device: borrowed.is_none(),
+            owns_out,
             recipe,
             infos,
             info_index,
@@ -921,6 +1206,33 @@ impl<'a> Runtime<'a> {
     pub fn rebind(&mut self, name: &str, addr: u64) {
         let idx = self.info_index[name];
         self.infos[idx].tensor_address = addr;
+    }
+
+    /// The launch-table index of persistent tensor `name`, for
+    /// [`Runtime::rebind_at`] (a rebind without the name lookup, for the
+    /// hundreds of rebinds per token of the tensor-parallel decoder).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is not a persistent tensor of this graph.
+    pub fn bind_index(&self, name: &str) -> usize {
+        self.info_index[name]
+    }
+
+    /// [`Runtime::rebind`] by launch-table index.
+    pub fn rebind_at(&mut self, idx: usize, addr: u64) {
+        self.infos[idx].tensor_address = addr;
+    }
+
+    /// Enqueue a fill of `words` 32-bit words at `addr` with `value` on
+    /// the stream (ordered with the launches around it).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the fill cannot be enqueued.
+    pub fn memset_d32(&mut self, addr: u64, value: u32, words: usize) -> Result<()> {
+        syn!(synMemsetD32Async(addr, value, words, self.stream));
+        Ok(())
     }
 
     /// Enqueue one launch without reading anything back (launches on the
@@ -1393,8 +1705,8 @@ impl<'a> Runtime<'a> {
         let n_in = self.gb.names.len();
         for (k, sizes) in self.gb.scratch_sizes.iter().enumerate() {
             let elems = sizes.iter().product::<u64>() as usize;
-            let f32s = self.gb.scratch_f32[k];
-            let bytes = (elems * if f32s { 4 } else { 2 }) as u64;
+            let f32s = self.gb.scratch_elem[k] == 4;
+            let bytes = (elems * self.gb.scratch_elem[k]) as u64;
             let mut hb: *mut c_void = core::ptr::null_mut();
             syn!(synHostMalloc(self.dev, bytes, 0, &mut hb));
             syn!(synMemCopyAsync(
@@ -1573,7 +1885,9 @@ impl Drop for Runtime<'_> {
             for &d in &self.owned {
                 synDeviceFree(self.dev, d, 0);
             }
-            synDeviceFree(self.dev, self.d_out, 0);
+            if self.owns_out {
+                synDeviceFree(self.dev, self.d_out, 0);
+            }
             if self.dws != 0 {
                 synDeviceFree(self.dev, self.dws, 0);
             }

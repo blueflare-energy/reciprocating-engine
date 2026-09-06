@@ -205,6 +205,7 @@ fn main() -> reng_core::Result<()> {
             wk: &o.wk,
             wv: &o.wv,
             wo: &o.wo,
+            wo_pitch: 0,
             bq: &o.bq,
             bk: &o.bk,
             bv: &o.bv,
@@ -213,6 +214,7 @@ fn main() -> reng_core::Result<()> {
             wg: &o.wg,
             wu: &o.wu,
             wd: &o.wd,
+            wd_pitch: 0,
             sin: if gemma && l % 2 == 1 {
                 &sinl_seq
             } else {

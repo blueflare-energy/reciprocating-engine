@@ -68,6 +68,33 @@ pub fn scale_bf16(w: &[u16], scale: f32) -> Vec<u16> {
         .collect()
 }
 
+/// A column window of a row-major bf16 matrix on the host: `rows` runs of
+/// `cols` elements, `pitch` elements apart (`pitch >= cols`), starting at
+/// the slice an input was given. The device gets the contiguous `[rows,
+/// cols]` matrix; the host keeps a view of the whole checkpoint matrix
+/// (a tensor-parallel shard of an `o_proj` or `down_proj` weight).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stride {
+    pub rows: usize,
+    pub cols: usize,
+    pub pitch: usize,
+}
+
+/// Gather the column window `st` of `data` into a contiguous `[rows,
+/// cols]` matrix (the CPU-side view of a strided weight).
+///
+/// # Panics
+///
+/// Panics if `data` is too short for the window.
+#[must_use]
+pub fn gather_columns(data: &[u16], st: Stride) -> Vec<u16> {
+    let mut v = Vec::with_capacity(st.rows * st.cols);
+    for r in 0..st.rows {
+        v.extend_from_slice(&data[r * st.pitch..r * st.pitch + st.cols]);
+    }
+    v
+}
+
 /// CPU reference matmul: `C[m,n] = A[m,k] @ B[k,n]`, row-major `f32`.
 #[must_use]
 pub fn matmul_cpu(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
@@ -149,6 +176,10 @@ pub use model::{
     EmbedTable, ModelWeights, RopeTables, layer_cpu, model_forward_bf16, model_forward_cpu,
     model_probe_bf16, model_probe_cpu,
 };
+
+/// Tensor-parallel decoding over the cards of one HCCL communicator.
+#[cfg(feature = "link-synapse")]
+pub mod tp;
 
 #[cfg(feature = "link-synapse")]
 mod runtime;

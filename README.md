@@ -176,14 +176,31 @@ which is where the performance work continues.
 ## Multi-card
 
 Every model in the benchmark table fits one card (Qwen2.5-32B occupies
-65 GB of the 96 GB). Larger models will run across cards. The HCCL
-bindings and a two-process all-reduce probe (`reng-hccl-test`) are in the
-tree and pass on this box: about 62 us per small all-reduce chained on
-one stream, 48 us with events between streams. The box needs the kernel
-option `iommu=pt`; without it the scheduler's completion counters never
-reach the host. `LlamaConfig::shard` / `LlamaWeights::shard` give a card
-its Megatron slice of the weights. The tensor-parallel decode path itself
-is the next piece of work.
+65 GB of the 96 GB). Larger models run across cards with tensor
+parallelism over HCCL: `reng-tp` spawns one worker process per card
+(`--modules 4,1`), each holding its Megatron shard of every layer
+(`LlamaConfig::shard` / `LlamaWeights::shard`; the o/down column blocks
+stay mapped views uploaded through a strided path) and a replica of the
+norms, embedding and LM head. A layer is two recipes with an f32
+all-reduce after `o_proj` and after `down_proj`, all enqueued on the
+rank's one stream without host synchronisation; the recipes are compiled
+once per kind and bound to each layer's buffers per launch. Every rank
+computes the same argmax after the last all-reduce and the coordinator
+checks that they agree.
+
+DeepSeek-R1-Distill-Llama-70B (141 GB bf16) on two cards reproduces its
+f32 reference 8/8 exact (free-running and teacher-forced) and decodes at
+27 tok/s at batch 1 (36.6 ms per token, 81% of the two-card HBM ceiling)
+and 207 tok/s at batch 8; the 8B distill on two cards matches the single
+card's ids exactly and runs 1.3x faster (166 against 130 tok/s at batch
+1, 1224 against 960 at batch 8). Per layer of the 70B at batch 1: recipe
+A 91 us, the two all-reduces 39 us, recipe B 315 us. The host enqueue
+(about 100 us per launch or collective, 322 of them per token) is close
+to the device time, so fewer or cheaper launches are the next step. With
+one module id the same path runs on one card without a communicator and
+reproduces `reng-generate`'s ids. The box needs the kernel option
+`iommu=pt`; without it the scheduler's completion counters never reach
+the host.
 
 ## License
 

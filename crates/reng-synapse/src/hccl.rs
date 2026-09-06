@@ -254,6 +254,12 @@ impl Card {
         self.dev
     }
 
+    /// The card's generic stream (null before [`Card::create_stream`]).
+    #[must_use]
+    pub fn stream_handle(&self) -> synStreamHandle {
+        self.stream
+    }
+
     /// Wait for the stream's queued work (as far as the stack's sync goes:
     /// it returns before DMA copies have landed, see `runtime.rs`).
     ///
@@ -460,6 +466,356 @@ impl Drop for Comm {
         // SAFETY: a live communicator handle, destroyed once.
         unsafe { hcclCommDestroy(self.h) };
     }
+}
+
+/// The device side of one rank of a model run: its card (with the stream
+/// the recipes and collectives go on) and, with more than one rank, the
+/// communicator.
+pub struct Rank {
+    pub card: Card,
+    /// `None` when the world has one rank (no collectives are needed).
+    pub comm: Option<Comm>,
+    pub rank: usize,
+    pub world: usize,
+}
+
+impl Rank {
+    /// Acquire card `module`, hand-shake with the coordinator through
+    /// `dir` (as the probe does: `rank<r>.acquired`, then `go` or
+    /// `abort`), exchange the unique id through `dir/id.bin`, join the
+    /// communicator and create the stream. With `world == 1` there is no
+    /// communicator; the hand-shake still runs so one coordinator serves
+    /// both cases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error whose message starts with `acquire:` when the
+    /// card cannot be acquired (the coordinator relaunches the group),
+    /// and other errors for a failed hand-shake or communicator init.
+    pub fn join(rank: usize, world: usize, module: u32, dir: &Path) -> Result<Self> {
+        assert!(world >= 1 && rank < world, "rank {rank} of {world}");
+        let t0 = Instant::now();
+        let card = match Card::acquire(module) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::write(
+                    dir.join(format!("rank{rank}.status")),
+                    format!("acquire-failed {e}"),
+                );
+                return Err(Error::Other(format!("acquire: {e}")));
+            }
+        };
+        println!(
+            "rank {rank}: module {module} -> synDeviceId {} in {:.2} s",
+            card.device_id(),
+            t0.elapsed().as_secs_f64()
+        );
+        std::fs::write(dir.join(format!("rank{rank}.acquired")), b"ok")?;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            if dir.join("go").exists() {
+                break;
+            }
+            if dir.join("abort").exists() {
+                return Err(Error::Other("acquire: aborted by coordinator".into()));
+            }
+            if Instant::now() > deadline {
+                return Err(Error::Other("no go from the coordinator in 180 s".into()));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let comm = if world > 1 {
+            let id_path = dir.join("id.bin");
+            let id = if rank == 0 {
+                let id = UniqueId::create()?;
+                let tmp = dir.join("id.tmp");
+                std::fs::write(&tmp, id.to_bytes())?;
+                std::fs::rename(&tmp, &id_path)?;
+                id
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(120);
+                loop {
+                    if let Ok(b) = std::fs::read(&id_path) {
+                        if b.len() == UniqueId::BYTES {
+                            break UniqueId::from_bytes(&b)?;
+                        }
+                    }
+                    if Instant::now() > deadline {
+                        return Err(Error::Other("no unique id from rank 0 in 120 s".into()));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let t1 = Instant::now();
+            let comm = Comm::init_rank(world, &id, rank)?;
+            println!(
+                "rank {rank}: communicator of {world} joined in {:.2} s (HCCL {}, id {:?})",
+                t1.elapsed().as_secs_f64(),
+                version()?,
+                id.text()
+            );
+            Some(comm)
+        } else {
+            None
+        };
+        let mut card = card;
+        card.create_stream()?;
+        Ok(Self {
+            card,
+            comm,
+            rank,
+            world,
+        })
+    }
+
+    /// Enqueue a summed all-reduce of `count` f32 elements in place at
+    /// device address `addr` on the card's stream (a no-op in a world of
+    /// one).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the enqueue is rejected.
+    pub fn all_reduce_f32(&self, addr: u64, count: usize) -> Result<()> {
+        match &self.comm {
+            Some(c) => c.all_reduce_sum(addr, addr, count, DType::F32, &self.card),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The coordinator side of a rank group: one child process per module id,
+/// their stdout and stderr echoed line by line under `[r<rank>]` prefixes.
+pub struct Group {
+    ranks: Vec<Child>,
+    pub dir: std::path::PathBuf,
+    started: Instant,
+}
+
+/// One spawned rank.
+pub struct Child {
+    pub rank: usize,
+    pub module: u32,
+    child: std::process::Child,
+    readers: Vec<std::thread::JoinHandle<()>>,
+    pub status: Option<i32>,
+}
+
+impl Child {
+    fn poll(&mut self) {
+        if self.status.is_none() {
+            if let Ok(Some(st)) = self.child.try_wait() {
+                self.status = Some(st.code().unwrap_or(-1));
+            }
+        }
+    }
+}
+
+/// Exit code a worker leaves with when its acquire failed (the
+/// coordinator may relaunch the group after a pause).
+pub const EXIT_ACQUIRE: i32 = 75;
+
+impl Group {
+    /// Spawn `exe` once per module id (in rank order) with `--rank r
+    /// --world n --module m --dir DIR` followed by `args`, `RENG_MODULE_ID`
+    /// set to the module, `HABANA_LOGS` under `dir`, and (with `numa`)
+    /// under `numactl` on the card's NUMA node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `dir` cannot be made or a child cannot spawn.
+    pub fn spawn(
+        exe: &Path,
+        modules: &[u32],
+        args: &[String],
+        dir: &Path,
+        numa: bool,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let numactl = numa
+            && std::process::Command::new("numactl")
+                .arg("--hardware")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+        let mut ranks = Vec::with_capacity(modules.len());
+        for (rank, &module) in modules.iter().enumerate() {
+            let node = if numactl { numa_node_of(module) } else { None };
+            let mut cmd = match node {
+                Some(n) => {
+                    let mut c = std::process::Command::new("numactl");
+                    c.arg(format!("--cpunodebind={n}"))
+                        .arg(format!("--membind={n}"))
+                        .arg(exe);
+                    c
+                }
+                None => std::process::Command::new(exe),
+            };
+            cmd.arg("--rank")
+                .arg(rank.to_string())
+                .arg("--world")
+                .arg(modules.len().to_string())
+                .arg("--module")
+                .arg(module.to_string())
+                .arg("--dir")
+                .arg(dir)
+                .args(args)
+                .env("RENG_MODULE_ID", module.to_string())
+                .env("HABANA_LOGS", dir.join(format!("logs-r{rank}")))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| Error::Other(format!("cannot spawn rank {rank}: {e}")))?;
+            println!(
+                "coordinator: rank {rank} = module {module}, pid {}{}",
+                child.id(),
+                node.map_or(String::new(), |n| format!(", numa node {n}"))
+            );
+            let mut readers = Vec::new();
+            if let Some(out) = child.stdout.take() {
+                readers.push(echo(out, format!("[r{rank}]")));
+            }
+            if let Some(err) = child.stderr.take() {
+                readers.push(echo(err, format!("[r{rank} err]")));
+            }
+            ranks.push(Child {
+                rank,
+                module,
+                child,
+                readers,
+                status: None,
+            });
+        }
+        Ok(Self {
+            ranks,
+            dir: dir.to_path_buf(),
+            started: Instant::now(),
+        })
+    }
+
+    /// Wait until every rank has written `rank<r>.acquired`, then write
+    /// `go`; on a failed acquire (a status file or an early exit) or the
+    /// deadline, write `abort` and return false.
+    pub fn wait_acquired(&mut self, deadline: Instant) -> bool {
+        loop {
+            for r in &mut self.ranks {
+                r.poll();
+            }
+            let acquired = self
+                .ranks
+                .iter()
+                .filter(|r| self.dir.join(format!("rank{}.acquired", r.rank)).exists())
+                .count();
+            let failed = self
+                .ranks
+                .iter()
+                .filter(|r| {
+                    self.dir.join(format!("rank{}.status", r.rank)).exists() || r.status.is_some()
+                })
+                .count();
+            if acquired == self.ranks.len() {
+                let _ = std::fs::write(self.dir.join("go"), b"go");
+                println!(
+                    "coordinator: all {} ranks acquired their cards in {:.1} s, go",
+                    self.ranks.len(),
+                    self.started.elapsed().as_secs_f64()
+                );
+                return true;
+            }
+            if failed > 0 || Instant::now() > deadline {
+                let _ = std::fs::write(self.dir.join("abort"), b"abort");
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Wait until every rank has exited or `deadline` passes (then kill
+    /// the rest by pid). A rank that outlives a failed peer by more than
+    /// 30 s is killed too: with its peer gone it never leaves its
+    /// collective. Returns each rank's exit status in rank order.
+    pub fn wait_all(&mut self, deadline: Instant) -> Vec<i32> {
+        let mut deadline = deadline;
+        let mut peer_failed = false;
+        loop {
+            for r in &mut self.ranks {
+                r.poll();
+            }
+            if self.ranks.iter().all(|r| r.status.is_some()) {
+                break;
+            }
+            if !peer_failed {
+                if let Some(f) = self.ranks.iter().find(|r| r.status.is_some_and(|c| c != 0)) {
+                    peer_failed = true;
+                    let grace = Instant::now() + Duration::from_secs(30);
+                    if grace < deadline {
+                        println!(
+                            "coordinator: rank {} exited with code {}; the other ranks get 30 s",
+                            f.rank,
+                            f.status.unwrap_or(-1)
+                        );
+                        deadline = grace;
+                    }
+                }
+            }
+            if Instant::now() > deadline {
+                for r in self.ranks.iter_mut().filter(|r| r.status.is_none()) {
+                    println!(
+                        "coordinator: {}, killing rank {} (module {}, pid {})",
+                        if peer_failed {
+                            "peer failed"
+                        } else {
+                            "TIMEOUT"
+                        },
+                        r.rank,
+                        r.module,
+                        r.child.id()
+                    );
+                    let _ = r.child.kill();
+                    let _ = r.child.wait();
+                    r.status = Some(-9);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for r in &mut self.ranks {
+            for h in r.readers.drain(..) {
+                let _ = h.join();
+            }
+        }
+        self.ranks.iter().map(|r| r.status.unwrap_or(-1)).collect()
+    }
+
+    /// Whether every rank's exit status is one of `codes`.
+    pub fn all_exited_with(&self, codes: &[i32]) -> bool {
+        self.ranks
+            .iter()
+            .all(|r| r.status.is_some_and(|c| codes.contains(&c)))
+    }
+
+    /// Seconds since the group was spawned.
+    pub fn elapsed(&self) -> f64 {
+        self.started.elapsed().as_secs_f64()
+    }
+}
+
+/// Echo a child's pipe line by line under a prefix.
+fn echo<R: std::io::Read + Send + 'static>(
+    reader: R,
+    prefix: String,
+) -> std::thread::JoinHandle<()> {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(reader)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            println!("{prefix} {line}");
+        }
+    })
 }
 
 /// Upper bound on waiting for a copy or a collective to land.

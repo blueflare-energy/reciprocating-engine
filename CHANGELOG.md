@@ -8,6 +8,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Tensor-parallel decoding over the cards of one HCCL communicator
+  (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
+  a coordinator spawns one worker process per module id, each rank holds
+  its Megatron shard of every layer plus the replicated norms, embedding
+  and LM head, and a layer runs as two recipes with an in-place f32
+  all-reduce after `o_proj` and after `down_proj` on the rank's stream,
+  every launch and collective of a decode run enqueued back to back
+  without host synchronisation (embedding, layers and head recipes bound
+  per launch to an id ring, as the device decode loop). The recipes are
+  compiled once per kind and shape and bound to each layer's buffers per
+  launch (`Runtime::new_bound` over `Bindings`, `Store` for the layers'
+  device buffers, `Runtime::rebind_at`). Prefill runs the same two
+  recipes at the block width; `--batch` decodes several sequences in
+  lockstep in the 5-D batched form. DeepSeek-R1-Distill-Llama-70B on two
+  cards reproduces its f32 reference 8/8 exact and decodes at 27 tok/s at
+  batch 1 and 207 tok/s at batch 8; world 1 reproduces `reng-generate`'s
+  ids exactly.
+- Strided weight uploads: `Gb::input_bf16_strided` and `Stride` describe
+  a column window of a mapped row-major matrix that the staging ring
+  gathers row by row into the pinned slot, so `LlamaWeights::shard` keeps
+  the o and down column blocks as views (`LayerTensors::wo_pitch`,
+  `wd_pitch`, `LayerWeights::wo_pitch`, `wd_pitch`) instead of gathering
+  24 GB of copies per rank of the 70B (`RENG_SHARD_GATHER` restores the
+  copies for comparison: 32 GB owned and 31 s to load against 14 GB and
+  23 s). An odd-offset safetensors tensor (94 of the 70B distill's, 19 GB)
+  is converted with one memcpy instead of a per-element loop.
+
 - The attention scale is applied to `wq` while the rows are staged for
   the upload (`Gb::input_bf16_scaled`, an f32 product rounded to bf16
   exactly as the old host copy was) instead of by a scaled copy of every
@@ -17,7 +44,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `LlamaWeights::shard(cfg, rank, world)` give one card's slice of a
   Megatron split (this rank's query and KV heads and MLP columns as views
   into the mapped checkpoint for the q/k/v and gate/up projections,
-  gathered column blocks of the o and down projections, sliced biases
+  strided views of the o and down projections' column blocks, sliced biases
   and full-width q/k gains, shared norms, embedding and LM head), for the
   coming multi-card path over HCCL.
 - `reng-synapse`: HCCL bindings (`ffi.rs`: the `hccl.h` collectives, the

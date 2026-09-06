@@ -49,6 +49,11 @@ pub struct LayerWeights<'a> {
     pub wk: &'a [u16],
     pub wv: &'a [u16],
     pub wo: &'a [u16],
+    /// Row pitch of `wo` in elements when it is a column window of a wider
+    /// matrix (a tensor-parallel shard: `hidden` rows of `n_heads *
+    /// head_dim` elements, `wo_pitch` apart, starting at `wo[0]`); 0 for
+    /// the contiguous matrix.
+    pub wo_pitch: usize,
     /// Attention biases (Qwen2-style), `n_heads * head_dim` for `bq` and
     /// `n_kv_heads * head_dim` for `bk`/`bv`; empty when the model has none.
     pub bq: &'a [f32],
@@ -86,6 +91,10 @@ pub struct LayerWeights<'a> {
     pub wg: &'a [u16],
     pub wu: &'a [u16],
     pub wd: &'a [u16],
+    /// Row pitch of `wd` in elements when it is a column window (`hidden`
+    /// rows of `inter` elements); 0 for the contiguous matrix, as
+    /// `wo_pitch`.
+    pub wd_pitch: usize,
     /// RoPE caches `[tokens, head_dim]` (head_dim contiguous), shared by heads.
     pub sin: &'a [f32],
     pub cos: &'a [f32],

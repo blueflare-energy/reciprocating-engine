@@ -37,3 +37,8 @@ required-features = ["link-synapse"]
 name = "reng-bench"
 path = "src/bin/bench.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-tp"
+path = "src/bin/tp.rs"
+required-features = ["link-synapse"]

@@ -36,7 +36,7 @@
 use crate::ffi::*;
 use crate::heads::AxisParams;
 use crate::runtime::{Out, OutKind, Runtime};
-use crate::{Activation, LayerWeights};
+use crate::{Activation, LayerWeights, Stride, gather_columns};
 use crate::{bf16_to_f32, scale_bf16};
 use core::ffi::c_void;
 use reng_core::{Error, Result};
@@ -169,6 +169,54 @@ fn wq_input<'a>(
         gb.input_bf16_scaled(name, sizes, w.wq, score_scale(w))
     } else {
         gb.input_bf16(name, sizes, std::borrow::Cow::Borrowed(w.wq))
+    }
+}
+
+/// The `wo` or `wd` input of a layer graph: the checkpoint's `[out, in]`
+/// matrix as it is, or (`pitch > 0`) the column window of a tensor-
+/// parallel shard, `out_rows` rows of `in_cols` elements gathered from
+/// the mapped checkpoint while they are uploaded (see
+/// [`LayerWeights::wo_pitch`]).
+fn col_input<'a>(
+    gb: &mut Gb<'a>,
+    name: &str,
+    sizes: &[u64],
+    data: &'a [u16],
+    out_rows: usize,
+    in_cols: usize,
+    pitch: usize,
+) -> Result<synTensor> {
+    if pitch == 0 {
+        gb.input_bf16(name, sizes, std::borrow::Cow::Borrowed(data))
+    } else {
+        let st = Stride {
+            rows: out_rows,
+            cols: in_cols,
+            pitch,
+        };
+        gb.input_bf16_strided(name, sizes, data, st, None)
+    }
+}
+
+/// A `[out, in]` matrix for the CPU reference: the slice itself, or the
+/// gathered column window of a strided one.
+fn col_view(
+    data: &[u16],
+    out_rows: usize,
+    in_cols: usize,
+    pitch: usize,
+) -> std::borrow::Cow<'_, [u16]> {
+    if pitch == 0 {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        std::borrow::Cow::Owned(gather_columns(
+            data,
+            Stride {
+                rows: out_rows,
+                cols: in_cols,
+                pitch,
+            },
+        ))
     }
 }
 
@@ -456,6 +504,12 @@ fn post_norm_node(
     Ok(out)
 }
 
+/// Bytes per element of a device dtype the engine's persistent tensors
+/// take: 2 for bf16, 4 for f32 and int32.
+fn elem_bytes(dtype: core::ffi::c_int) -> usize {
+    if dtype == SYN_TYPE_BF16 { 2 } else { 4 }
+}
+
 pub(crate) fn make_tensor(
     graph: synGraphHandle,
     name: &str,
@@ -520,10 +574,14 @@ pub(crate) struct Gb<'a> {
     /// the upload (the attention scale on `wq`), so the host keeps a view of
     /// the checkpoint instead of a scaled copy. `None` for the others.
     pub scales: Vec<Option<f32>>,
+    /// Per input: the column window of a strided host source (see
+    /// [`Stride`]); `None` for a contiguous one.
+    pub strides: Vec<Option<Stride>>,
     pub scratch_names: Vec<CString>,
     pub scratch_sizes: Vec<Vec<u64>>,
-    /// Whether each scratch tensor is f32 (else bf16); sizes count elements.
-    pub scratch_f32: Vec<bool>,
+    /// Bytes per element of each scratch tensor (2 for bf16, 4 for f32 and
+    /// int32); sizes count elements.
+    pub scratch_elem: Vec<usize>,
     /// For a scratch tensor that shares another scratch tensor's section
     /// (in-place update), that tensor's name; the runtime binds both to one
     /// buffer.
@@ -555,9 +613,10 @@ impl<'a> Gb<'a> {
             data: Vec::new(),
             raw: Vec::new(),
             scales: Vec::new(),
+            strides: Vec::new(),
             scratch_names: Vec::new(),
             scratch_sizes: Vec::new(),
-            scratch_f32: Vec::new(),
+            scratch_elem: Vec::new(),
             scratch_alias: Vec::new(),
             scratch_sections: std::collections::HashMap::new(),
             node_ids: Vec::new(),
@@ -652,6 +711,44 @@ impl<'a> Gb<'a> {
         self.data.push(data);
         self.raw.push(None);
         self.scales.push(None);
+        self.strides.push(None);
+        Ok(t)
+    }
+
+    /// A persistent bf16 input whose host data is the column window `st`
+    /// of the row-major matrix starting at `data` (see [`Stride`]),
+    /// gathered row by row while it is staged for the upload and, with a
+    /// `scale`, scaled on the way like [`Gb::input_bf16_scaled`]. `sizes`
+    /// describe the device tensor, `rows * cols` elements.
+    pub fn input_bf16_strided(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        data: &'a [u16],
+        st: Stride,
+        scale: Option<f32>,
+    ) -> Result<synTensor> {
+        assert_eq!(
+            sizes.iter().product::<u64>() as usize,
+            st.rows * st.cols,
+            "input {name}: sizes {sizes:?} against a {} x {} window",
+            st.rows,
+            st.cols
+        );
+        assert!(
+            st.pitch >= st.cols && data.len() >= (st.rows - 1) * st.pitch + st.cols,
+            "input {name}: {} elements do not hold the window {st:?}",
+            data.len()
+        );
+        let of = scale.map_or(String::new(), |s| format!("scale={}", s.to_bits()));
+        self.note_tensor("in", name, sizes, SYN_TYPE_BF16, &of);
+        let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
+        self.names.push(cname);
+        self.sizes.push(sizes.to_vec());
+        self.data.push(std::borrow::Cow::Borrowed(data));
+        self.raw.push(None);
+        self.scales.push(scale);
+        self.strides.push(Some(st));
         Ok(t)
     }
 
@@ -685,6 +782,7 @@ impl<'a> Gb<'a> {
         self.data.push(std::borrow::Cow::Borrowed(data));
         self.raw.push(None);
         self.scales.push(Some(scale));
+        self.strides.push(None);
         Ok(t)
     }
 
@@ -704,6 +802,7 @@ impl<'a> Gb<'a> {
         self.data.push(std::borrow::Cow::Owned(Vec::new()));
         self.raw.push(Some(bytes.to_vec()));
         self.scales.push(None);
+        self.strides.push(None);
         Ok(t)
     }
 
@@ -728,7 +827,7 @@ impl<'a> Gb<'a> {
         self.scratch_sections.insert(name.to_owned(), sec);
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
-        self.scratch_f32.push(dtype == SYN_TYPE_F32);
+        self.scratch_elem.push(elem_bytes(dtype));
         self.scratch_alias.push(None);
         Ok(t)
     }
@@ -764,7 +863,7 @@ impl<'a> Gb<'a> {
         let (t, cname) = make_tensor_in(self.graph, name, sizes, dtype, sec)?;
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
-        self.scratch_f32.push(dtype == SYN_TYPE_F32);
+        self.scratch_elem.push(elem_bytes(dtype));
         self.scratch_alias.push(Some(of.to_owned()));
         Ok(t)
     }
@@ -1039,10 +1138,18 @@ pub(crate) fn build_layer<'a>(
             )?,
         )
     };
-    let t_wo = gb.input_bf16(&p("wo"), &[qw, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wo = col_input(
+        gb,
+        &p("wo"),
+        &[qw, h],
+        w.wo,
+        hidden,
+        qw as usize,
+        w.wo_pitch,
+    )?;
     let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
-    let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
+    let t_wd = col_input(gb, &p("wd"), &[i, h], w.wd, hidden, inter, w.wd_pitch)?;
 
     // The pre-norm tensors; a post-norm layer feeds the block input to the
     // projections and normalises the branch outputs instead (below).
@@ -1734,10 +1841,18 @@ pub(crate) fn build_layer_batched<'a>(
             )?,
         )
     };
-    let t_wo = gb.input_bf16(&p("wo"), &[qw, h], std::borrow::Cow::Borrowed(w.wo))?;
+    let t_wo = col_input(
+        gb,
+        &p("wo"),
+        &[qw, h],
+        w.wo,
+        hidden,
+        qw as usize,
+        w.wo_pitch,
+    )?;
     let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
-    let t_wd = gb.input_bf16(&p("wd"), &[i, h], std::borrow::Cow::Borrowed(w.wd))?;
+    let t_wd = col_input(gb, &p("wd"), &[i, h], w.wd, hidden, inter, w.wd_pitch)?;
 
     // Pre-norm tensors (see `build_layer`).
     let t_n1 = (!post_norm)
@@ -2731,7 +2846,7 @@ pub fn layer_cpu(
             }
         }
     }
-    let o = matmul(&attn, w.wo, qw, hidden);
+    let o = matmul(&attn, &col_view(w.wo, hidden, qw, w.wo_pitch), qw, hidden);
     let o = if w.post_norm { rmsnorm(&o, w.g1) } else { o };
     let o = if w.g_post_attn.is_empty() {
         o
@@ -2753,7 +2868,12 @@ pub fn layer_cpu(
         }
     };
     let gated: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| act(*g) * u).collect();
-    let down = matmul(&gated, w.wd, inter, hidden);
+    let down = matmul(
+        &gated,
+        &col_view(w.wd, hidden, inter, w.wd_pitch),
+        inter,
+        hidden,
+    );
     let down = if w.post_norm {
         rmsnorm(&down, w.g2)
     } else {
