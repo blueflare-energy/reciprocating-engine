@@ -27,10 +27,15 @@
 //! sliding layers get the sliding window and, for Gemma-3, the local RoPE
 //! table (`rope_local_base_freq`) while the full layers get `rope_theta`;
 //! and `tie_word_embeddings` defaults to true (the key is absent from the
-//! configs). A multimodal Gemma-3 config (`model_type: gemma3`, the 4B
-//! and up) is flattened to its `text_config` by [`LlamaConfig::from_json`]
-//! and its weights are read under `language_model.model.`; the vision
-//! tower and projector are never touched.
+//! configs). A multimodal Gemma-3 config (`model_type: gemma3`; the 4B
+//! and 12B files are the two this was checked against) is flattened to
+//! its `text_config` by [`LlamaConfig::from_json`] and its weights are
+//! read under `language_model.model.`; the vision tower and projector are
+//! never touched. The defaults filled in for the keys a `text_config`
+//! leaves out are `Gemma3TextConfig`'s, so a variant that both omits a
+//! key and departs from that default (gemma-3-27b's
+//! `query_pre_attn_scalar` is 168, not 256) would load and compute the
+//! wrong thing: only shape-bearing keys are caught by `load_weights`.
 //!
 //! RoPE scaling (`rope_scaling`): the `llama3`, `linear`, `yarn` and
 //! `longrope` types are host-side table recipes ([`rope_spec`]: an
@@ -51,14 +56,15 @@
 //! in place (the maps stay alive for as long as any view does), so loading
 //! costs no copy and the file pages are shared with the page cache and
 //! reclaimable. Only derived data is owned: f32 and f16 checkpoints
-//! converted to bf16, the scaled Granite copies, and a tensor whose data
-//! offset is not 2-aligned (94 of the 723 tensors of the 70B distill,
-//! 19.2 GB: safetensors pads its header to 8 bytes but not the tensors
-//! inside it) or on a big-endian host. An unaligned tensor is not copied
-//! when it is read from the file but when it is first used, and a shard
-//! narrows it first, so a rank copies its own rows and column blocks and
-//! never the whole tensor (see [`Bf16Slice::sub`] and
-//! [`Bf16Slice::column_block`]).
+//! converted to bf16, the scaled Granite copies, the permuted q and k
+//! rows of a partial-rotary model (about 0.8 GB for Phi-4-mini), and a
+//! tensor whose data offset is not 2-aligned (94 of the 723 tensors of
+//! the 70B distill, 19.2 GB: safetensors pads its header to 8 bytes but
+//! not the tensors inside it) or on a big-endian host. An unaligned
+//! tensor is not copied when it is read from the file but when it is
+//! first used, and a shard narrows it first, so a rank copies its own
+//! rows and column blocks and never the whole tensor (see
+//! [`Bf16Slice::sub`] and [`Bf16Slice::column_block`]).
 
 use memmap2::{Advice, Mmap};
 use reng_core::{Error, Result};
@@ -106,9 +112,10 @@ pub struct LlamaConfig {
     pub original_max_position_embeddings: Option<usize>,
     /// The fraction of each head that RoPE rotates (Phi-4-mini 0.75: dims
     /// 0..96 of 128, paired `i, i + 48`; the rest pass through); see
-    /// [`LlamaConfig::rotary_dim`].
+    /// [`LlamaConfig::rotary_dim`]. Kept in f64, the width Python reads
+    /// it at, so the truncation of `head_dim * factor` matches.
     #[serde(default)]
-    pub partial_rotary_factor: Option<f32>,
+    pub partial_rotary_factor: Option<f64>,
     /// Where the language model's tensors live in the checkpoint:
     /// `language_model.model.` for a multimodal `gemma3` config (set by
     /// [`LlamaConfig::from_json`]), `model.` otherwise.
@@ -423,6 +430,30 @@ impl LlamaConfig {
         }
     }
 
+    /// The warning a cached run deserves when its capacity, not its
+    /// length, decides which `longrope` factor list the tables carry.
+    /// The tables are built once for `capacity` positions, so a capacity
+    /// past the pretraining length reads the long factors from position 0
+    /// while transformers, which switches on the position actually
+    /// reached, would keep the short ones for a run that never gets
+    /// there. `None` for every other config and for a capacity inside the
+    /// pretraining length.
+    #[must_use]
+    pub fn longrope_capacity_warning(&self, capacity: usize) -> Option<String> {
+        let s = self.rope_scaling.as_ref()?;
+        if s.rope_type.as_deref() != Some("longrope") {
+            return None;
+        }
+        let orig = s.original_max_position_embeddings?;
+        (capacity > orig).then(|| {
+            format!(
+                "rope_scaling: cache capacity {capacity} is past the pretraining length {orig}, \
+                 so the longrope long factors serve every position; size the cache to the run's \
+                 length to match transformers"
+            )
+        })
+    }
+
     /// Read `config.json` from a model directory (see
     /// [`LlamaConfig::from_json`]).
     ///
@@ -448,12 +479,14 @@ impl LlamaConfig {
     ///
     /// Returns an error if the text cannot be parsed, the activation is
     /// unknown, `partial_rotary_factor` does not give an even rotary width
-    /// between 2 and `head_dim`, or a longrope factor list does not hold
-    /// one entry per rotary pair.
+    /// between 2 and `head_dim`, a longrope factor list does not hold one
+    /// entry per rotary pair, or a `rope_scaling` lacks a parameter its
+    /// type needs (which would otherwise panic in [`rope_spec`]).
     pub fn from_json(text: &str) -> Result<Self> {
         let err = |e: serde_json::Error| Error::Other(format!("config.json: {e}"));
         let mut v: serde_json::Value = serde_json::from_str(text).map_err(err)?;
         let mut prefix = None;
+        let mut flattened = false;
         if v.get("model_type").and_then(serde_json::Value::as_str) == Some("gemma3") {
             let Some(mut text_cfg) = v.get("text_config").cloned() else {
                 return Err(Error::Other(
@@ -475,8 +508,16 @@ impl LlamaConfig {
             }
             v = text_cfg;
             prefix = Some("language_model.model.".to_owned());
+            flattened = true;
         }
-        let mut cfg: Self = serde_json::from_value(v).map_err(err)?;
+        // `from_value` drops the line and column a parse error carries, so
+        // a config that is not flattened is read from its own text.
+        let mut cfg: Self = if flattened {
+            serde_json::from_value(v)
+                .map_err(|e| Error::Other(format!("config.json text_config: {e}")))?
+        } else {
+            serde_json::from_str(text).map_err(err)?
+        };
         cfg.weight_prefix = prefix;
         let phi3 = cfg.model_type.as_deref() == Some("phi3");
         let (max_pos, orig) = (
@@ -505,6 +546,47 @@ impl LlamaConfig {
                     "config.json: partial_rotary_factor {f} rotates {rd} of {} head dims",
                     cfg.head_dim()
                 )));
+            }
+        }
+        // Every parameter the type's arm of [`rope_spec`] will `expect`,
+        // so that a config-shaped fault is this Result and not a panic
+        // inside a generator (transformers `validate_rope`).
+        if let Some(s) = cfg.rope_scaling.as_ref() {
+            let t = s.rope_type.as_deref().unwrap_or("default");
+            let need = |name: &str, have: bool| -> Result<()> {
+                if have {
+                    Ok(())
+                } else {
+                    Err(Error::Other(format!(
+                        "config.json: rope_scaling.{name} is required by rope_type {t}"
+                    )))
+                }
+            };
+            // longrope and yarn take `max_position_embeddings / original`
+            // when `factor` is absent.
+            let factor = s.factor.is_some()
+                || (s.max_position_embeddings.is_some()
+                    && s.original_max_position_embeddings.is_some());
+            let orig = s.original_max_position_embeddings.is_some();
+            match t {
+                "llama3" => {
+                    need("factor", s.factor.is_some())?;
+                    need("low_freq_factor", s.low_freq_factor.is_some())?;
+                    need("high_freq_factor", s.high_freq_factor.is_some())?;
+                    need("original_max_position_embeddings", orig)?;
+                }
+                "linear" => need("factor", s.factor.is_some())?,
+                "yarn" => {
+                    need("factor", factor)?;
+                    need("original_max_position_embeddings", orig)?;
+                }
+                "longrope" => {
+                    need("factor", factor)?;
+                    need("original_max_position_embeddings", orig)?;
+                    need("short_factor", s.short_factor.is_some())?;
+                    need("long_factor", s.long_factor.is_some())?;
+                }
+                _ => {}
             }
         }
         // longrope divides one rotary pair per factor-list entry
@@ -544,12 +626,16 @@ impl LlamaConfig {
     }
 
     /// The head dims RoPE rotates: `int(head_dim * partial_rotary_factor)`
-    /// (transformers), the whole head without the key.
+    /// (transformers), the whole head without the key. The product is
+    /// taken in f64, the width Python reads the factor at: a factor whose
+    /// f64 value sits just under a whole number of dims can round over it
+    /// in f32 and rotate one pair too many (0.2499999999999999 of a
+    /// 128-dim head is 31 dims in Python and 32 in f32).
     #[must_use]
     pub fn rotary_dim(&self) -> usize {
         let hd = self.head_dim();
         match self.partial_rotary_factor {
-            Some(f) => (hd as f32 * f) as usize,
+            Some(f) => (hd as f64 * f) as usize,
             None => hd,
         }
     }
@@ -611,9 +697,12 @@ impl LlamaConfig {
 /// The bf16 elements of a weight tensor: a view into a memory-mapped
 /// safetensors file (a bf16 checkpoint, the common case: nothing is copied
 /// and the pages belong to the page cache) or an owned buffer (an f32 or
-/// f16 checkpoint converted at load, a scaled or otherwise derived copy,
-/// or the fallback for a view that cannot be taken). Dereferences to
-/// `[u16]`; cloning is cheap (the tied LM head shares the embedding view).
+/// f16 checkpoint converted at load, a scaled or otherwise derived copy
+/// such as the permuted q and k rows of a partial-rotary model, or the
+/// fallback for a view that cannot be taken). Dereferences to `[u16]`;
+/// cloning is cheap (the tied LM head shares the embedding view).
+/// [`Bf16Slice::sub`] of an `Owned` slice copies, so a shard of a derived
+/// tensor is owned per rank.
 #[derive(Clone)]
 pub enum Bf16Slice {
     /// Heap data (shared, so that clones cost nothing).
@@ -965,7 +1054,11 @@ impl LlamaWeights {
     /// row by row while they are uploaded), the biases and the OLMo-2
     /// full-width q/k gains are sliced the same way, and the norms, the
     /// embedding and the LM head are shared. Nothing is copied for a bf16
-    /// checkpoint whose tensors are 2-aligned. `cfg` is the unsharded
+    /// checkpoint whose tensors are 2-aligned mapped views; a tensor the
+    /// loader owns is copied per rank, which for a partial-rotary model
+    /// means each rank's slice of the permuted q and k rows on top of the
+    /// whole permuted copy the parent holds (Phi-4-mini: about 0.8 GB
+    /// parent, 0.8 GB spread over the ranks). `cfg` is the unsharded
     /// config; the shard's config is [`LlamaConfig::shard`].
     ///
     /// A tensor at an odd data offset cannot be viewed in place
@@ -1467,10 +1560,26 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             *g /= cap;
         }
     }
-    let has_head = shards.index.contains_key("lm_head.weight")
-        || (shards.index.is_empty() && parsed[0].tensor("lm_head.weight").is_ok());
-    let lm_head = if has_head {
-        linear(st("lm_head.weight"), "lm_head.weight", v, h)?
+    // The head sits beside the decoder, not inside it: `lm_head.weight`
+    // under `model.`, `language_model.lm_head.weight` under
+    // `language_model.model.`. Probe the prefixed name first so an untied
+    // multimodal checkpoint cannot fall through to the tied branch and
+    // run with the embedding as its head.
+    let head_names: Vec<String> = {
+        let outer = pre.strip_suffix("model.").unwrap_or("");
+        let mut n = vec![format!("{outer}lm_head.weight")];
+        if !outer.is_empty() {
+            n.push("lm_head.weight".to_owned());
+        }
+        n
+    };
+    let has = |name: &str| {
+        shards.index.contains_key(name)
+            || (shards.index.is_empty() && parsed[0].tensor(name).is_ok())
+    };
+    let head_name = head_names.iter().find(|n| has(n.as_str()));
+    let lm_head = if let Some(name) = head_name {
+        linear(st(name), name, v, h)?
     } else if cfg.tied() {
         embed.clone()
     } else {
@@ -1855,6 +1964,22 @@ pub fn argmax_rows(logits: &[f32], vocab: usize) -> Vec<usize> {
 /// position (padded queries sit after all real keys and are never attended).
 pub const MIN_PREFILL_TOKENS: usize = 256;
 
+/// The sequence length a prefill's RoPE tables serve: the real prompt
+/// length, never the padded row count ([`MIN_PREFILL_TOKENS`], or a block
+/// rounding). `longrope` picks its factor list from this (see
+/// [`rope_spec`]), so a 300-token prompt padded to 4096 rows must still
+/// read the short factors. The padded count is taken only to assert the
+/// two are the right way round.
+///
+/// # Panics
+///
+/// Panics (debug builds) if `padded < real`.
+#[must_use]
+pub fn table_seq_len(real: usize, padded: usize) -> usize {
+    debug_assert!(padded >= real, "padded {padded} under real {real}");
+    real
+}
+
 /// Borrow `w` as the engine's per-layer weight views, each layer with its
 /// RoPE tables (`rope`'s global or local pair, empty tables for the cached
 /// decoders, which take rows per step), window, activation and the
@@ -1939,7 +2064,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     let tokens = real.max(MIN_PREFILL_TOKENS);
     let mut padded: Vec<u32> = ids.to_vec();
     padded.resize(tokens, 0);
-    let rope = cfg.rope_caches_for(tokens, real);
+    let rope = cfg.rope_caches_for(tokens, table_seq_len(real, tokens));
     let x = embed_tokens(w, cfg, &padded);
     let m = layer_views(w, cfg, &rope.tables());
     let mut logits = reng_synapse::model_forward_bf16(
@@ -1975,7 +2100,8 @@ impl<'a> Generator<'a> {
     /// a sequence of `capacity` tokens: a longrope model reads its long
     /// factors when that exceeds its pretraining length (HF switches at
     /// the first forward past it and recomputes the cache), so size the
-    /// cache for the run's total length.
+    /// cache for the run's total length. That case is reported on stderr
+    /// ([`LlamaConfig::longrope_capacity_warning`]).
     ///
     /// # Errors
     ///
@@ -1987,6 +2113,9 @@ impl<'a> Generator<'a> {
         decode_rows: usize,
         capacity: usize,
     ) -> Result<Self> {
+        if let Some(msg) = cfg.longrope_capacity_warning(capacity) {
+            eprintln!("{msg}");
+        }
         let rope = cfg.rope_caches(capacity);
         // The cached recipes take RoPE rows as per-step inputs, so the layer
         // views carry no tables (they would have to outlive `rope`).
@@ -2120,7 +2249,12 @@ pub struct BatchedGenerator<'a> {
 #[cfg(feature = "link-synapse")]
 impl<'a> BatchedGenerator<'a> {
     /// Compile for `batch` sequences over a cache of `capacity` positions,
-    /// with prefill blocks of `rows` tokens, and upload the weights.
+    /// with prefill blocks of `rows` tokens, and upload the weights. The
+    /// RoPE tables serve a sequence of `capacity` tokens, as
+    /// [`Generator::new`]: a longrope model reads its long factors when
+    /// the capacity exceeds its pretraining length, whatever the run's
+    /// own length, and says so on stderr
+    /// ([`LlamaConfig::longrope_capacity_warning`]).
     ///
     /// # Errors
     ///
@@ -2132,6 +2266,9 @@ impl<'a> BatchedGenerator<'a> {
         rows: usize,
         capacity: usize,
     ) -> Result<Self> {
+        if let Some(msg) = cfg.longrope_capacity_warning(capacity) {
+            eprintln!("{msg}");
+        }
         let rope = cfg.rope_caches(capacity);
         // The batched recipes take RoPE rows as per-step inputs, so the
         // layer views carry no tables (they would have to outlive `rope`).
@@ -2282,7 +2419,9 @@ impl<'a> TpGenerator<'a> {
     /// of `rows` tokens and a cache of `capacity` positions, and upload
     /// its shard. `w` is the shard ([`LlamaWeights::shard`]) and `cfg` its
     /// config ([`LlamaConfig::shard`]); `rank` the joined card and
-    /// communicator.
+    /// communicator. The RoPE tables serve a sequence of `capacity`
+    /// tokens, as [`Generator::new`], with the same longrope warning on
+    /// stderr ([`LlamaConfig::longrope_capacity_warning`]).
     ///
     /// # Errors
     ///
@@ -2295,6 +2434,9 @@ impl<'a> TpGenerator<'a> {
         rows: usize,
         capacity: usize,
     ) -> Result<Self> {
+        if let Some(msg) = cfg.longrope_capacity_warning(capacity) {
+            eprintln!("{msg}");
+        }
         let rope = cfg.rope_caches(capacity);
         let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
         let embed = reng_synapse::EmbedTable {
@@ -2541,6 +2683,115 @@ mod tests {
         );
     }
 
+    /// A minimal Llama-shaped `config.json` (128 head dims) carrying the
+    /// given `rope_scaling` object and no length keys of its own, so that
+    /// what the scaling does not state is genuinely absent.
+    fn config_with_scaling(sc: &str) -> String {
+        format!(
+            r#"{{"model_type": "llama", "hidden_size": 4096, "intermediate_size": 11008,
+            "num_hidden_layers": 2, "num_attention_heads": 32, "rms_norm_eps": 1e-5,
+            "vocab_size": 32000, "rope_scaling": {sc}}}"#
+        )
+    }
+
+    #[test]
+    fn a_scaling_without_its_parameters_is_refused_at_load() {
+        // Every arm of `rope_spec` expects the parameters its type needs;
+        // `from_json` is where a config that lacks them has to stop, so
+        // that a bad checkpoint is an Err and not a panic three calls
+        // later inside a generator.
+        for sc in [
+            r#"{"rope_type": "linear"}"#,
+            r#"{"rope_type": "yarn"}"#,
+            r#"{"rope_type": "llama3", "factor": 8.0}"#,
+            r#"{"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0}"#,
+            r#"{"rope_type": "longrope", "original_max_position_embeddings": 4096}"#,
+        ] {
+            let e = LlamaConfig::from_json(&config_with_scaling(sc)).unwrap_err();
+            let m = format!("{e}");
+            assert!(m.contains("rope_scaling."), "{sc}: {m}");
+        }
+        // The same shapes with their parameters load and build tables.
+        for sc in [
+            r#"{"rope_type": "linear", "factor": 8.0}"#,
+            r#"{"rope_type": "yarn", "factor": 40.0,
+                "original_max_position_embeddings": 4096}"#,
+            r#"{"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}"#,
+        ] {
+            let cfg = LlamaConfig::from_json(&config_with_scaling(sc)).unwrap();
+            assert_eq!(cfg.rope_caches(4).cos.len(), 4 * 128, "{sc}");
+        }
+        // A `dynamic` or unknown type is still ignored, not refused.
+        let cfg = LlamaConfig::from_json(&config_with_scaling(
+            r#"{"rope_type": "dynamic", "factor": 8.0}"#,
+        ))
+        .unwrap();
+        assert_eq!(cfg.rope_caches(2).cos[0], 1.0);
+    }
+
+    /// Phi-3.5-mini's shape as a `config.json`: 96 rotary dims, 4096
+    /// pretrained, 48 short factors of 1.0 and 48 long factors of 2.0.
+    fn phi35_like_config() -> String {
+        format!(
+            r#"{{"model_type": "phi3", "hidden_size": 3072, "intermediate_size": 8192,
+            "num_hidden_layers": 32, "num_attention_heads": 32, "rms_norm_eps": 1e-5,
+            "vocab_size": 32064, "max_position_embeddings": 131072,
+            "original_max_position_embeddings": 4096,
+            "rope_scaling": {{"type": "longrope", "short_factor": {s}, "long_factor": {l}}}}}"#,
+            s = serde_json::to_string(&vec![1.0f32; 48]).unwrap(),
+            l = serde_json::to_string(&vec![2.0f32; 48]).unwrap()
+        )
+    }
+
+    #[test]
+    fn a_cache_capacity_past_the_pretraining_length_is_reported() {
+        // The cached decoders build one set of tables for the whole cache,
+        // so the capacity, an operational knob, decides which longrope
+        // factor list every position reads.
+        let cfg = LlamaConfig::from_json(&phi35_like_config()).unwrap();
+        assert!(cfg.longrope_capacity_warning(1024).is_none());
+        assert!(cfg.longrope_capacity_warning(4096).is_none());
+        let msg = cfg.longrope_capacity_warning(8192).unwrap();
+        assert!(msg.contains("8192") && msg.contains("4096"), "{msg}");
+        // And the warning is about a real difference: the tables built at
+        // that capacity carry the long factors.
+        let short = cfg.rope_caches(4096);
+        let long = cfg.rope_caches(8192);
+        assert!(
+            (short.cos[96] / long.cos[96] - 1.0).abs() > 1e-3,
+            "{} {}",
+            short.cos[96],
+            long.cos[96]
+        );
+        // Not a longrope config: nothing to say at any capacity.
+        let llama = LlamaConfig::from_json(&config_with_scaling(
+            r#"{"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}"#,
+        ))
+        .unwrap();
+        assert!(llama.longrope_capacity_warning(1 << 20).is_none());
+    }
+
+    #[test]
+    fn a_padded_prefill_serves_the_prompt_length_not_the_row_count() {
+        // The policy `prefill_logits` applies: pad the prompt out to
+        // MIN_PREFILL_TOKENS rows, but build the tables for the prompt's
+        // own length. Pinned here so a later "simplification" back to
+        // `rope_caches(tokens)` fails a test rather than a checkpoint.
+        assert_eq!(table_seq_len(7, MIN_PREFILL_TOKENS), 7);
+        assert_eq!(table_seq_len(300, 300), 300);
+        assert_eq!(table_seq_len(4097, 4097), 4097);
+        let cfg = LlamaConfig::from_json(&phi35_like_config()).unwrap();
+        let s = cfg.rope_scaling.as_ref().unwrap();
+        // 300 real tokens in a hypothetical 8192-row block: short factors
+        // (1.0), not the long ones (2.0), so the frequencies differ by 2.
+        let real = rope_spec(96, 1e4, Some(s), table_seq_len(300, 8192));
+        let padded = rope_spec(96, 1e4, Some(s), 8192);
+        assert!((real.inv_freq[0] / padded.inv_freq[0] - 2.0).abs() < 1e-6);
+    }
+
     /// The `llama3` recipe as first committed (322641a), kept verbatim so
     /// the tables can be checked bit for bit.
     fn legacy_llama3_tables(
@@ -2592,6 +2843,10 @@ mod tests {
         for sc in [None, Some(&s)] {
             let (sin_a, cos_a) = legacy_llama3_tables(1000, 128, 500_000.0, sc);
             let (sin_b, cos_b) = rope_caches_scaled(1000, 128, 500_000.0, sc);
+            // `zip` stops at the shorter of the two, so the lengths are
+            // asserted first: a comparison over nothing would pass.
+            assert_eq!(sin_a.len(), 1000 * 128);
+            assert_eq!((sin_a.len(), cos_a.len()), (sin_b.len(), cos_b.len()));
             assert!(
                 sin_a
                     .iter()
@@ -2760,7 +3015,25 @@ mod tests {
         let fx: RopeFixture =
             serde_json::from_str(include_str!("../testdata/rope_reference.json")).unwrap();
         assert!(fx.transformers.starts_with('5'), "{}", fx.transformers);
-        assert_eq!(fx.cases.len(), 10);
+        // Named rather than counted: a fixture regenerated on a box that
+        // is missing a checkpoint says which case went, not `9 != 10`.
+        let want = [
+            "phi35-short",
+            "phi35-long",
+            "phi35-long-short-table",
+            "phi4mini-short",
+            "phi4mini-long",
+            "gemma3-4b-global",
+            "gemma3-4b-local",
+            "yarn-dsv2lite",
+            "yarn-kimi-k2",
+            "yarn-dsv4-flash",
+        ];
+        let have: Vec<&str> = fx.cases.iter().map(|c| c.name.as_str()).collect();
+        for name in want {
+            assert!(have.contains(&name), "fixture case {name} is missing");
+        }
+        assert_eq!(have.len(), want.len(), "{have:?}");
         // A relative gap, against the reference value.
         let rel = |a: f32, b: f32| {
             let (a, b) = (f64::from(a), f64::from(b));

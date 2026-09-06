@@ -79,11 +79,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `original_max_position_embeddings` feed the derived factors, and
   Phi-3's legacy `su` / `yarn` type names mean longrope. The `llama3` and
   unscaled tables are unchanged bit for bit, which a test pins against a
-  copy of the original recipe. Measured on Gaudi2 with these tables,
-  Phi-3.5-mini-instruct against its f32 reference at 300, 2000, 4096
-  (short factors) and 4500 (long factors) tokens: argmax agreement 94 to
-  97.5 percent with last-logits cosine 1.0000, where the unscaled tables
-  gave 82, 86, 55 and 50 percent.
+  copy of the original recipe. Measured on Gaudi2 with these tables (an
+  earlier session, on a prototype carrying the same table recipe; this
+  commit's own device checks are queued behind a measurement sweep and
+  have not run), Phi-3.5-mini-instruct against its f32 reference at 300,
+  2000, 4096 (short factors) and 4500 (long factors) tokens: argmax
+  agreement 94 to 97.5 percent with last-logits cosine 1.0000, where the
+  unscaled tables gave 82, 86, 55 and 50 percent. A cached generator
+  builds its tables once for the whole cache, so a capacity past the
+  pretraining length makes longrope read its long factors from position
+  0; that case now says so on stderr.
 - `tools/oracle/rope_reference.py` writes the inverse frequencies,
   attention factors and `cos` / `sin` rows transformers 5.16 computes for
   Phi-3.5-mini-instruct, Phi-4-mini-instruct, google/gemma-3-4b-pt and
@@ -92,12 +97,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each checkpoint's own `config.json` and compares the engine's tables
   against that reference at positions on both sides of the pretraining
   length.
-- Multimodal Gemma-3 checkpoints (`model_type: gemma3`, the 4B and up):
-  `LlamaConfig::from_json` flattens the `text_config`, fills
-  `Gemma3TextConfig`'s defaults for the keys the files leave out, and
-  the loader reads the weights under `language_model.model.` (the vision
-  tower is skipped). Gemma-3-4B: greedy 8/8 and prefill agreement 97 to
-  98 percent at 300 to 4500 tokens, cosine 1.0000.
+- Multimodal Gemma-3 checkpoints (`model_type: gemma3`; checked against
+  the 4B and 12B configs): `LlamaConfig::from_json` flattens the
+  `text_config`, fills `Gemma3TextConfig`'s defaults for the keys the
+  files leave out, and the loader reads the weights under
+  `language_model.model.` (the vision tower is skipped). A variant that
+  both omits a numeric key and departs from that default (gemma-3-27b's
+  `query_pre_attn_scalar` is 168, not 256) would load and compute the
+  wrong thing, since only shape-bearing keys are caught at load.
+  Gemma-3-4B, from the same earlier session: greedy 8/8 and prefill
+  agreement 97 to 98 percent at 300 to 4500 tokens, cosine 1.0000.
 - Partial rotations (`partial_rotary_factor`: Phi-4-mini rotates 96 of
   its 128 head dims, pairing `i` with `i + 48` and passing the rest
   through) need no graph change. The loader permutes each head's q and k
@@ -106,7 +115,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   does not depend on the order of the head dims, and `v` and `o_proj` are
   untouched. A `partial_rotary_factor` that does not give a whole number
   of rotary pairs, and a longrope factor list of the wrong length, are
-  refused at config load.
+  refused at config load, as is a `rope_scaling` that lacks a parameter
+  its type needs. The permuted rows are owned rather than mapped: about
+  0.8 GB for Phi-4-mini, and a tensor-parallel shard of them is copied
+  again per rank.
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds

@@ -52,6 +52,12 @@ yarn configurations. A model directory without a `config.json` is filled
 from the Hub (`hf download <repo> --include config.json`); `--offline`
 skips the download and the case with it.
 
+The fixture embeds each case's `config.json` verbatim, so the test parses
+what the checkpoint ships rather than a transcription. Two of those files
+come from repositories with their own terms: `google/gemma-3-4b-pt` is
+gated behind the Gemma terms, and Phi-3.5 / Phi-4-mini are MIT. Only the
+configuration metadata is copied, no weights and no tokenizer.
+
 ## Runner checks
 
 The `bench` workflow runs `reng-generate --ref` on the self-hosted runner
