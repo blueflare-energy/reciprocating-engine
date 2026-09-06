@@ -11,8 +11,9 @@
 //! DMA copies on the same stream.
 //!
 //! The probe ([`run_worker`]) checks a summed all-reduce against an exact
-//! integer expectation, times all-reduces of 16 KB, 1 MB and 16 MB, and
-//! settles the ordering question the tensor-parallel design depends on:
+//! integer expectation, times all-reduces over a size sweep
+//! ([`SWEEP_BYTES`], 8 KB to 64 MB), and settles the ordering question
+//! the tensor-parallel design depends on:
 //! whether a recipe launch, an all-reduce and another launch on one stream
 //! execute in order without host synchronisation (and, for comparison, the
 //! same with the collective on a second stream bridged by events).
@@ -975,6 +976,12 @@ const LATE_LIMIT: Duration = Duration::from_secs(3);
 /// The elements of the probe's vectors.
 const N: usize = 4096;
 
+/// The all-reduce message sizes the timing sweep covers, in bytes: from a
+/// per-layer tensor-parallel message (8 KB is one batch-1 f32 row of a
+/// 2048-wide model) to a size where the links, not the launch, decide.
+/// Every entry must be at most [`BIG_BYTES`] and a multiple of four.
+const SWEEP_BYTES: [usize; 6] = [8 << 10, 32 << 10, 128 << 10, 1 << 20, 16 << 20, 64 << 20];
+
 /// What the probe worker is asked to do.
 pub struct WorkerArgs<'a> {
     pub rank: usize,
@@ -1148,10 +1155,19 @@ fn checks(w: &mut Worker<'_>, a: &WorkerArgs<'_>) -> Result<usize> {
     failures += usize::from(!w.correctness()?);
     failures += usize::from(!w.correctness_large()?);
     w.timing_pipelined("timing-A", N, DType::F32, a.iters)?;
-    w.timing_serial("timing-B", N, 200.min(a.iters.max(1)))?;
-    w.timing_pipelined("timing-C1", 1 << 18, DType::F32, a.iters)?;
-    w.timing_pipelined("timing-C", 1 << 22, DType::F32, a.iters)?;
+    // The sweep runs before the serial timing: the 200 host round trips of
+    // `timing_serial` leave the host slow enough to add several us to the
+    // next pipelined size, which would land on whichever size came first.
+    for bytes in SWEEP_BYTES {
+        w.timing_pipelined(
+            &format!("timing-S{}", bytes),
+            bytes / DType::F32.bytes(),
+            DType::F32,
+            a.iters,
+        )?;
+    }
     w.timing_pipelined("timing-C2", 1 << 23, DType::Bf16, a.iters)?;
+    w.timing_serial("timing-B", N, 200.min(a.iters.max(1)))?;
     failures += usize::from(!w.ordering_single(100.min(a.iters.max(1)))?);
     failures += usize::from(!w.ordering_chain(a.iters)?);
     failures += usize::from(!w.ordering_events(a.iters)?);
@@ -1181,14 +1197,14 @@ struct Worker<'a> {
     s: Vec<f32>,
     /// The canonical 16 KB f32 vector every recipe reads or writes.
     p: u64,
-    /// 16 MB scratch buffers for the timings (send, recv).
+    /// [`BIG_BYTES`] scratch buffers for the timings (send, recv).
     big_a: u64,
     big_b: u64,
-    /// Pinned host buffer of 16 MB for reads.
+    /// Pinned host buffer of [`BIG_BYTES`] for reads.
     h_read: *mut c_void,
     /// The three recipes, once [`Worker::build_recipes`] ran: W `P = X + 0`
     /// (writes P), R `Q = P + 0` (reads P; Q is read back), D
-    /// `P = 0.5 P + X` in place plus `Q = P + 0`.
+    /// `P = P / world + X` in place plus `Q = P + 0`.
     recipes: Option<Recipes<'a>>,
 }
 
@@ -1198,7 +1214,7 @@ struct Recipes<'a> {
     d: Runtime<'a>,
 }
 
-const BIG_BYTES: u64 = 16 << 20;
+const BIG_BYTES: u64 = 64 << 20;
 
 impl<'a> Worker<'a> {
     fn new(card: Card, comm: Comm, a: &WorkerArgs<'_>) -> Result<Self> {
@@ -1232,11 +1248,15 @@ impl<'a> Worker<'a> {
     fn build_recipes(&mut self, a: &WorkerArgs<'_>) -> Result<()> {
         let t0 = Instant::now();
         let zeros = vec![0f32; N];
-        let half = vec![0.5f32; N];
+        // `1 / world` (a power of two here, so exact in f32) and not 0.5:
+        // the all-reduce that follows D sums `world` copies of `P / world`,
+        // so P grows by exactly S each pass at any world size. With 0.5 the
+        // chain converges only at world 2 and overflows at 4 and 8.
+        let inv = vec![1.0 / self.world as f32; N];
         let mut rec = Recipes {
             w: recipe_w(&self.card, &self.x, &zeros)?,
             r: recipe_r(&self.card, &zeros)?,
-            d: recipe_d(&self.card, &self.x, &zeros, &half)?,
+            d: recipe_d(&self.card, &self.x, &zeros, &inv)?,
         };
         rec.w.rebind("P", self.p);
         rec.r.rebind("P", self.p);
@@ -1244,7 +1264,8 @@ impl<'a> Worker<'a> {
         rec.d.rebind("P_out", self.p);
         self.recipes = Some(rec);
         println!(
-            "recipes: W (P = X + 0), R (Q = P + 0), D (P = 0.5 P + X; Q = P + 0) ready in {:.2} s (iters {})",
+            "recipes: W (P = X + 0), R (Q = P + 0), D (P = P / {} + X; Q = P + 0) ready in {:.2} s (iters {})",
+            self.world,
             t0.elapsed().as_secs_f64(),
             a.iters
         );
@@ -1615,7 +1636,7 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Recipe D (`P = 0.5 P + X_r`) then an in-place all-reduce of P, on one
+    /// Recipe D (`P = P / world + X_r`) then an in-place all-reduce of P, on one
     /// stream, `iters` times without any host sync: each pass adds exactly
     /// `S` to P, so P must equal `iters * S` at the end (read through R).
     /// Any reordering of a launch and a collective breaks the count.
@@ -1823,14 +1844,14 @@ fn recipe_r<'a>(card: &Card, zeros: &[f32]) -> Result<Runtime<'a>> {
     Runtime::new_on(gb, out, card.dev, card.stream)
 }
 
-/// Recipe D: `T = P * H` (H = 0.5), `P_out = T + X` with `P_out` in P's
-/// section (in place), `Q = P_out + Z` as the read-back output.
-fn recipe_d<'a>(card: &Card, x: &[f32], zeros: &[f32], half: &[f32]) -> Result<Runtime<'a>> {
+/// Recipe D: `T = P * H` (H = `1 / world`), `P_out = T + X` with `P_out`
+/// in P's section (in place), `Q = P_out + Z` as the read-back output.
+fn recipe_d<'a>(card: &Card, x: &[f32], zeros: &[f32], inv: &[f32]) -> Result<Runtime<'a>> {
     let mut gb = Gb::new()?;
     let sizes = [N as u64];
     let tx = gb.input_raw("X", &sizes, SYN_TYPE_F32, &f32_bytes(x))?;
     let tz = gb.input_raw("Z", &sizes, SYN_TYPE_F32, &f32_bytes(zeros))?;
-    let th = gb.input_raw("H", &sizes, SYN_TYPE_F32, &f32_bytes(half))?;
+    let th = gb.input_raw("H", &sizes, SYN_TYPE_F32, &f32_bytes(inv))?;
     let tp = gb.scratch_typed("P", &sizes, SYN_TYPE_F32)?;
     let tpo = gb.scratch_alias_typed("P_out", &sizes, "P", SYN_TYPE_F32)?;
     let tt = gb.mid("T", &sizes, SYN_TYPE_F32)?;
