@@ -273,6 +273,7 @@ name = "reng-synapse"
 version = "0.0.1"
 dependencies = [
  "reng-core",
+ "tempfile",
 ]
 
 [[package]]
