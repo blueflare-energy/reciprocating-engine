@@ -23,6 +23,7 @@ use crate::runtime::{HOST_SENTINEL_D32, Out, OutKind, Runtime, SENTINEL_D32};
 use core::ffi::{CStr, c_int, c_void};
 use reng_core::{Error, Result};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 macro_rules! syn {
@@ -327,13 +328,54 @@ impl Drop for Card {
 /// `~DeviceCommon`) and the process hangs in the failure-analysis dump for
 /// minutes while still holding the card; the kernel driver reclaims the
 /// device on exit anyway.
-fn die(code: i32) -> ! {
+pub fn die(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     // SAFETY: `_exit` never returns.
     unsafe { _exit(code) }
 }
+
+/// How long a rank asked to stop is given to abort its communicator and
+/// leave before the coordinator kills it, and how long
+/// [`abort_and_die`] waits for `hcclCommAbort` before leaving anyway.
+pub const ABORT_GRACE: Duration = Duration::from_secs(10);
+
+/// Exit code a worker leaves with when the coordinator asked the group to
+/// stop (or went away) while the rank was running.
+pub const EXIT_ABORTED: i32 = 76;
+
+/// Abort this process's communicator, if it has one, and leave at once
+/// through [`die`], so a rank that is stuck in a collective releases its
+/// card instead of being killed inside HCL (Multi-Card risk 10: a process
+/// killed mid-collective can leave the card needing a reboot). A second
+/// thread holds a hard deadline of [`ABORT_GRACE`] in case
+/// `hcclCommAbort` itself blocks.
+pub fn abort_and_die(code: i32) -> ! {
+    use std::io::Write;
+    std::thread::spawn(move || {
+        std::thread::sleep(ABORT_GRACE);
+        let _ = writeln!(
+            std::io::stderr(),
+            "hcclCommAbort did not return in {} s, leaving anyway",
+            ABORT_GRACE.as_secs()
+        );
+        die(code);
+    });
+    let t = Instant::now();
+    Comm::abort_current();
+    let _ = writeln!(
+        std::io::stderr(),
+        "hcclCommAbort returned in {:.2} s",
+        t.elapsed().as_secs_f64()
+    );
+    die(code)
+}
+
+/// The live communicator handle of this process (0 when there is none),
+/// so [`abort_and_die`] can reach it from another thread. One card and one
+/// communicator per process, so one slot is enough.
+static ABORT_COMM: AtomicUsize = AtomicUsize::new(0);
 
 /// An HCCL communicator this process is one rank of.
 pub struct Comm {
@@ -355,6 +397,7 @@ impl Comm {
         let world = c_int::try_from(world).map_err(|_| Error::Other("world too large".into()))?;
         let rank = c_int::try_from(rank).map_err(|_| Error::Other("rank too large".into()))?;
         hccl!(hcclCommInitRank(&mut h, world, id.0, rank));
+        ABORT_COMM.store(h as usize, Ordering::SeqCst);
         Ok(Self { h })
     }
 
@@ -459,12 +502,32 @@ impl Comm {
         // SAFETY: a live communicator handle.
         unsafe { hcclCommAbort(self.h) };
     }
+
+    /// `hcclCommAbort` on this process's communicator, from any thread,
+    /// or nothing when the process has none (world 1, or the communicator
+    /// is already going away).
+    pub fn abort_current() {
+        let h = ABORT_COMM.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            // SAFETY: the handle `init_rank` recorded, taken exactly once
+            // (the swap), so no other thread can be destroying it.
+            unsafe { hcclCommAbort(h as hcclComm_t) };
+        }
+    }
 }
 
 impl Drop for Comm {
     fn drop(&mut self) {
-        // SAFETY: a live communicator handle, destroyed once.
-        unsafe { hcclCommDestroy(self.h) };
+        let _ = ABORT_COMM.compare_exchange(self.h as usize, 0, Ordering::SeqCst, Ordering::SeqCst);
+        // SAFETY: a live communicator handle, finalized then destroyed
+        // once. `hcclCommFinalize` (the documented sequence, and the
+        // symbol is exported by libSynapse.so) drains the communicator's
+        // outstanding work while the device is still acquired; without it
+        // `hcclCommDestroy` prints "device not initialized" at teardown.
+        unsafe {
+            hcclCommFinalize(self.h);
+            hcclCommDestroy(self.h);
+        }
     }
 }
 
@@ -472,9 +535,12 @@ impl Drop for Comm {
 /// the recipes and collectives go on) and, with more than one rank, the
 /// communicator.
 pub struct Rank {
-    pub card: Card,
     /// `None` when the world has one rank (no collectives are needed).
+    /// Declared before `card`: fields drop in declaration order and
+    /// `hcclCommFinalize` / `hcclCommDestroy` need the device the card
+    /// releases.
     pub comm: Option<Comm>,
+    pub card: Card,
     pub rank: usize,
     pub world: usize,
 }
@@ -511,6 +577,7 @@ impl Rank {
             t0.elapsed().as_secs_f64()
         );
         std::fs::write(dir.join(format!("rank{rank}.acquired")), b"ok")?;
+        let ppid = std::os::unix::process::parent_id();
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             if dir.join("go").exists() {
@@ -518,6 +585,9 @@ impl Rank {
             }
             if dir.join("abort").exists() {
                 return Err(Error::Other("acquire: aborted by coordinator".into()));
+            }
+            if std::os::unix::process::parent_id() != ppid {
+                return Err(Error::Other("the coordinator went away before go".into()));
             }
             if Instant::now() > deadline {
                 return Err(Error::Other("no go from the coordinator in 180 s".into()));
@@ -560,9 +630,10 @@ impl Rank {
         };
         let mut card = card;
         card.create_stream()?;
+        watch_coordinator(dir, rank);
         Ok(Self {
-            card,
             comm,
+            card,
             rank,
             world,
         })
@@ -581,6 +652,40 @@ impl Rank {
             None => Ok(()),
         }
     }
+}
+
+/// Watch the coordinator from a background thread: once a rank is
+/// running, nothing else notices that the coordinator asked the group to
+/// stop (`dir/abort`) or died (Ctrl-C, a kill), and a worker that keeps
+/// its card until it finishes on its own is exactly the "already
+/// acquired by PID" condition on a shared box. On either the rank aborts
+/// its communicator and leaves through [`abort_and_die`].
+fn watch_coordinator(dir: &Path, rank: usize) {
+    use std::io::Write;
+    let abort = dir.join("abort");
+    let ppid = std::os::unix::process::parent_id();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let orphan = std::os::unix::process::parent_id() != ppid;
+            if !orphan && !abort.exists() {
+                continue;
+            }
+            // Not `println!`: when the coordinator is gone the pipe is
+            // closed, and `println!` panics on a broken pipe, which would
+            // kill this thread and leave the rank holding its card.
+            let _ = writeln!(
+                std::io::stderr(),
+                "rank {rank}: {}, aborting the communicator and leaving",
+                if orphan {
+                    "the coordinator went away"
+                } else {
+                    "the coordinator asked the group to stop"
+                }
+            );
+            abort_and_die(EXIT_ABORTED);
+        }
+    });
 }
 
 /// The coordinator side of a rank group: one child process per module id,
@@ -761,22 +866,15 @@ impl Group {
                 }
             }
             if Instant::now() > deadline {
-                for r in self.ranks.iter_mut().filter(|r| r.status.is_none()) {
-                    println!(
-                        "coordinator: {}, killing rank {} (module {}, pid {})",
-                        if peer_failed {
-                            "peer failed"
-                        } else {
-                            "TIMEOUT"
-                        },
-                        r.rank,
-                        r.module,
-                        r.child.id()
-                    );
-                    let _ = r.child.kill();
-                    let _ = r.child.wait();
-                    r.status = Some(-9);
-                }
+                println!(
+                    "coordinator: {}, asking the remaining ranks to abort their communicators",
+                    if peer_failed {
+                        "peer failed"
+                    } else {
+                        "TIMEOUT"
+                    }
+                );
+                self.abort_and_reap();
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -799,6 +897,56 @@ impl Group {
     /// Seconds since the group was spawned.
     pub fn elapsed(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
+    }
+
+    /// Write `abort` (every running rank's watchdog polls it and leaves
+    /// through `hcclCommAbort`), give the group [`ABORT_GRACE`] to go, and
+    /// only then kill by pid and reap. Multi-Card risk 10: a rank killed
+    /// inside a collective can leave its card in the state that needed a
+    /// reboot, so the kill is the last resort, never the first move.
+    fn abort_and_reap(&mut self) {
+        let _ = std::fs::write(self.dir.join("abort"), b"abort");
+        let kill_at = Instant::now() + ABORT_GRACE;
+        while Instant::now() < kill_at {
+            for r in &mut self.ranks {
+                r.poll();
+            }
+            if self.ranks.iter().all(|r| r.status.is_some()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for r in self.ranks.iter_mut().filter(|r| r.status.is_none()) {
+            println!(
+                "coordinator: killing rank {} (module {}, pid {}) after the abort grace",
+                r.rank,
+                r.module,
+                r.child.id()
+            );
+            let _ = r.child.kill();
+            let _ = r.child.wait();
+            r.status = Some(-9);
+        }
+    }
+}
+
+impl Drop for Group {
+    /// `std::process::Child` does not kill on drop, so without this an
+    /// early return, a `?` or a panic in the coordinator would leave the
+    /// workers holding their cards until they finished on their own.
+    fn drop(&mut self) {
+        for r in &mut self.ranks {
+            r.poll();
+        }
+        if !self.ranks.iter().all(|r| r.status.is_some()) {
+            println!("coordinator: teardown with ranks still running");
+            self.abort_and_reap();
+        }
+        for r in &mut self.ranks {
+            for h in r.readers.drain(..) {
+                let _ = h.join();
+            }
+        }
     }
 }
 
@@ -955,7 +1103,7 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
     let mut card = card;
     if let Err(e) = card.create_stream() {
         println!("ERROR: {e}");
-        die(2);
+        abort_and_die(2);
     }
     println!("stream: synStreamCreateGeneric after the communicator init, ok");
 
@@ -963,7 +1111,7 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
         Ok(w) => w,
         Err(e) => {
             println!("ERROR: {e}");
-            die(2);
+            abort_and_die(2);
         }
     };
     let failures = match checks(&mut w, a) {
@@ -973,7 +1121,7 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
             if let Ok(Some((code, msg))) = w.comm.async_error() {
                 println!("async-error: {code} {msg}");
             }
-            die(2);
+            abort_and_die(2);
         }
     };
     let t2 = Instant::now();
@@ -1021,8 +1169,10 @@ fn checks(w: &mut Worker<'_>, a: &WorkerArgs<'_>) -> Result<usize> {
 /// canonical `P` buffer the three recipes are bound to, timing buffers and
 /// a pinned host buffer for reads.
 struct Worker<'a> {
-    card: Card,
+    /// Declared before `card`: the communicator's finalize and destroy
+    /// need the device the card releases.
     comm: Comm,
+    card: Card,
     rank: usize,
     world: usize,
     /// `X_r[i] = (r + 1) * (1 + i % 7)`, the rank's summand.
@@ -1063,8 +1213,8 @@ impl<'a> Worker<'a> {
         let big_b = card.dev_alloc(BIG_BYTES)?;
         let h_read = card.host_alloc(BIG_BYTES)?;
         Ok(Self {
-            card,
             comm,
+            card,
             rank: a.rank,
             world: a.world,
             x,
@@ -1588,7 +1738,8 @@ impl Drop for Worker<'_> {
         let _ = self.card.sync();
         // Recipes first (their drop syncs the stream and frees their
         // buffers on the still-acquired device), then the raw buffers; the
-        // communicator and the card drop after this body, in field order.
+        // communicator and then the card drop after this body, in field
+        // order.
         self.recipes = None;
         self.card.host_free(self.h_read);
         self.card.dev_free(self.p);

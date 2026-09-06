@@ -1723,8 +1723,14 @@ impl<'a> TpGenerator<'a> {
         self.model.reset(b);
     }
 
-    /// Append `ids` to sequence `b` (fed in blocks of at most `rows`) and
-    /// return the greedy next token.
+    /// Prefill sequence `b` with `ids` (fed in blocks of at most `rows`)
+    /// and return the greedy next token. A sequence is prefilled once,
+    /// from position 0: the wide recipe's out-of-place ScatterND makes the
+    /// blocks alternate between the sequence's slot and a shared scratch
+    /// buffer, so a second prefill onto a non-empty sequence is rejected
+    /// unless its block count is even (`TpModel::prefill`). Continue a
+    /// sequence with [`TpGenerator::generate`], or [`TpGenerator::reset`]
+    /// it first.
     ///
     /// # Errors
     ///
@@ -1732,7 +1738,8 @@ impl<'a> TpGenerator<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `ids` is empty or would overflow the cache.
+    /// Panics if `ids` is empty, would overflow the cache, or is a second
+    /// prefill of an odd number of blocks onto a non-empty sequence.
     pub fn prefill(&mut self, b: usize, ids: &[u32]) -> Result<u32> {
         assert!(!ids.is_empty());
         let x = embed_tokens(self.w, self.cfg, ids);

@@ -15,26 +15,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and LM head, and a layer runs as two recipes with an in-place f32
   all-reduce after `o_proj` and after `down_proj` on the rank's stream,
   every launch and collective of a decode run enqueued back to back
-  without host synchronisation (embedding, layers and head recipes bound
-  per launch to an id ring, as the device decode loop). The recipes are
+  without host synchronisation (the embedding and head recipes bound per
+  launch to an id ring, as the device decode loop). The recipes are
   compiled once per kind and shape and bound to each layer's buffers per
   launch (`Runtime::new_bound` over `Bindings`, `Store` for the layers'
-  device buffers, `Runtime::rebind_at`). Prefill runs the same two
-  recipes at the block width; `--batch` decodes several sequences in
-  lockstep in the 5-D batched form. DeepSeek-R1-Distill-Llama-70B on two
-  cards reproduces its f32 reference 8/8 exact and decodes at 27 tok/s at
-  batch 1 and 207 tok/s at batch 8; world 1 reproduces `reng-generate`'s
-  ids exactly.
+  device buffers, `Runtime::rebind_at`; a recipe's read-back buffer now
+  joins its `Bindings`, so a child recipe of `Runtime::new_with` can share
+  the parent's, which `cached.rs` and `batched.rs` could not do before).
+  Prefill runs the same two recipes at the block width; `--batch` decodes
+  several sequences in lockstep in the 5-D batched form. A sequence is
+  prefilled once, from position 0: the wide recipe's ScatterND is out of
+  place, so its blocks alternate between the sequence's cache slot and a
+  shared scratch buffer, and a second prefill onto a non-empty sequence is
+  rejected unless its block count is even. `--prompt-file <json>` takes
+  the prompt from the `"prompt"` array of a `generate.py` reference file.
+  DeepSeek-R1-Distill-Llama-70B on two cards reproduces its f32 reference
+  8/8 exact and decodes at 27 tok/s at batch 1 and 207 tok/s at batch 8;
+  the 8B distill reproduces the single card's ids over a 1000-token
+  prompt (four prefill blocks) as well as a five-token one; world 1
+  reproduces `reng-generate`'s ids exactly.
+- Multi-card lifecycle: a rank never outlives its coordinator holding a
+  card. Each worker runs a watchdog thread that polls the hand-shake
+  directory's `abort` file and its own parent id, and on either aborts the
+  communicator (`hcclCommAbort`) and leaves through `_exit`;
+  `Group::wait_all` writes `abort` and waits out a 10 s grace before it
+  kills anything, and `Group`'s new `Drop` does the same for a coordinator
+  that returns or panics early. A worker's error path leaves the same way
+  rather than through the destructor chain, which after an HCL failure can
+  hang in libSynapse for minutes while still holding the card. `Comm` is
+  finalized (`hcclCommFinalize`) before it is destroyed and is declared
+  before the `Card`, so the communicator goes away while the device is
+  still acquired; that removes the `hccl_device.cpp:45 ... device not
+  initialized` line every world-2 process used to print at teardown.
 - Strided weight uploads: `Gb::input_bf16_strided` and `Stride` describe
   a column window of a mapped row-major matrix that the staging ring
   gathers row by row into the pinned slot, so `LlamaWeights::shard` keeps
   the o and down column blocks as views (`LayerTensors::wo_pitch`,
   `wd_pitch`, `LayerWeights::wo_pitch`, `wd_pitch`) instead of gathering
-  24 GB of copies per rank of the 70B (`RENG_SHARD_GATHER` restores the
-  copies for comparison: 32 GB owned and 31 s to load against 14 GB and
-  23 s). An odd-offset safetensors tensor (94 of the 70B distill's, 19 GB)
-  is converted with one memcpy instead of a per-element loop.
-
+  the 24 GB they come to per rank of the 70B. `RENG_SHARD_GATHER` restores
+  the copies for comparison: 32 GB owned and 31 s to load against 14 GB
+  and 23 s, an 18 GB saving rather than the full 24 GB, because the 94
+  odd-offset tensors still copy nearly their whole row range for the
+  shard. An odd-offset safetensors tensor (94 of the 70B distill's,
+  19 GB) is converted with one memcpy instead of a per-element loop.
 - The attention scale is applied to `wq` while the rows are staged for
   the upload (`Gb::input_bf16_scaled`, an f32 product rounded to bf16
   exactly as the old host copy was) instead of by a scaled copy of every
@@ -45,8 +68,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Megatron split (this rank's query and KV heads and MLP columns as views
   into the mapped checkpoint for the q/k/v and gate/up projections,
   strided views of the o and down projections' column blocks, sliced biases
-  and full-width q/k gains, shared norms, embedding and LM head), for the
-  coming multi-card path over HCCL.
+  and full-width q/k gains, shared norms, embedding and LM head), which
+  the `reng-tp` path above runs on.
 - `reng-synapse`: HCCL bindings (`ffi.rs`: the `hccl.h` collectives, the
   1032-byte `hcclUniqueId` passed by value, `synEventElapsedTime`) and a
   `hccl` module with one card per process (`Card`), a communicator

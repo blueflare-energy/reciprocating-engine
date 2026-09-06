@@ -186,19 +186,37 @@ all-reduce after `o_proj` and after `down_proj`, all enqueued on the
 rank's one stream without host synchronisation; the recipes are compiled
 once per kind and bound to each layer's buffers per launch. Every rank
 computes the same argmax after the last all-reduce and the coordinator
-checks that they agree.
+checks that they agree. The prompt is the trailing ids or, for a long
+one, `--prompt-file <json>` (the `"prompt"` array of a `generate.py`
+reference file). A sequence is prefilled once, from position 0: the wide
+prefill recipe's ScatterND is out of place, so its blocks alternate
+between the sequence's cache slot and a shared scratch buffer, and a
+second prefill onto a non-empty sequence is rejected rather than silently
+overwriting the keys already there.
+
+No rank outlives its coordinator holding a card. A watchdog thread in
+each worker polls the hand-shake directory's `abort` file and its own
+parent id; on either it calls `hcclCommAbort` and leaves through `_exit`,
+and the coordinator writes `abort` and waits out a grace period before it
+kills anything. Ctrl-C on a two-card 8B decode has both workers gone and
+both cards free within 15 s.
 
 DeepSeek-R1-Distill-Llama-70B (141 GB bf16) on two cards reproduces its
 f32 reference 8/8 exact (free-running and teacher-forced) and decodes at
-27 tok/s at batch 1 (36.6 ms per token, 81% of the two-card HBM ceiling)
+27.4 tok/s at batch 1 (36.5 ms per token, 79% of the two-card HBM
+ceiling: 70.6 GB of weights per card per token, so 28.8 ms at 2.45 TB/s,
+counting the embedding table as the lookup it is, as `reng-ceiling` does)
 and 207 tok/s at batch 8; the 8B distill on two cards matches the single
 card's ids exactly and runs 1.3x faster (166 against 130 tok/s at batch
-1, 1224 against 960 at batch 8). Per layer of the 70B at batch 1: recipe
-A 91 us, the two all-reduces 39 us, recipe B 315 us. The host enqueue
-(about 100 us per launch or collective, 322 of them per token) is close
-to the device time, so fewer or cheaper launches are the next step. With
-one module id the same path runs on one card without a communicator and
-reproduces `reng-generate`'s ids. The box needs the kernel option
+1, 1224 against 960 at batch 8). A 1000-token prompt through the 8B
+distill (four 256-row prefill blocks) gives the same eight ids on two
+cards, on one card through the same path, through single-card
+`reng-generate`, and in the f32 oracle. Per layer of the 70B at batch 1:
+recipe A 90 us, the two all-reduces 38 us, recipe B 315 us. The host
+enqueue (about 100 us per launch or collective, 322 of them per token) is
+close to the device time, so fewer or cheaper launches are the next step.
+With one module id the same path runs on one card without a communicator
+and reproduces `reng-generate`'s ids. The box needs the kernel option
 `iommu=pt`; without it the scheduler's completion counters never reach
 the host.
 

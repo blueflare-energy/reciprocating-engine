@@ -50,7 +50,7 @@ use crate::model::{
 };
 use crate::probe::SYN_TYPE_INT32;
 use crate::runtime::{Bindings, Out, OutKind, Runtime, Store};
-use crate::{LayerWeights, Stride, f32_to_bf16, to_bf16};
+use crate::{Activation, LayerWeights, Stride, f32_to_bf16, to_bf16};
 use core::ffi::c_void;
 use reng_core::Result;
 use std::time::Instant;
@@ -298,7 +298,10 @@ impl<'a> TpModel<'a> {
     ///
     /// Panics on a layer form the tensor-parallel graphs do not build
     /// (post-norm, Gemma's extra norms and softcaps, sliding windows, the
-    /// OLMo-2 full-width q/k norm, NoPE layers) or a size mismatch.
+    /// OLMo-2 full-width q/k norm, NoPE layers, any MLP activation other
+    /// than SiLU, layers that do not all agree with layer 0 on the
+    /// presence of the attention biases and the q/k norms and on the
+    /// norm epsilon) or a size mismatch.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         rank: Rank,
@@ -332,9 +335,32 @@ impl<'a> TpModel<'a> {
                     && (l.qn.is_empty() || l.qn.len() == hd),
                 "layer form not supported by the tensor-parallel graphs"
             );
+            assert!(
+                matches!(l.act, Activation::Silu),
+                "recipe B open-codes SiLU (sigmoid, mult, mult); this layer wants {:?}",
+                l.act
+            );
             assert_eq!(l.n_heads, l0.n_heads);
             assert_eq!(l.n_kv_heads, n_kv);
             assert_eq!(l.head_dim, hd);
+            // The recipes and their per-layer bind lists come from layer 0
+            // (`a_weight_names(l0)`, `layer_views`), so every layer must
+            // agree with it on which optional tensors exist and on the
+            // epsilon baked into the norms.
+            assert_eq!(
+                l.bq.is_empty(),
+                l0.bq.is_empty(),
+                "attention biases must be present on every layer or none"
+            );
+            assert_eq!(
+                l.qn.is_empty(),
+                l0.qn.is_empty(),
+                "q/k norms must be present on every layer or none"
+            );
+            assert_eq!(
+                l.eps, l0.eps,
+                "every layer must share layer 0's RMS norm epsilon"
+            );
         }
         let trace = std::env::var_os("RENG_RECIPE_TRACE").is_some();
         let (dev, stream) = (rank.card.device_id(), rank.card.stream_handle());
@@ -563,14 +589,25 @@ impl<'a> TpModel<'a> {
     /// sequence's cache slot and the recipe's own buffer, starting so that
     /// the last block lands in the slot (a stale input is masked out).
     ///
+    /// Limitation from that alternation: a sequence is prefilled once,
+    /// from position 0. Block 0 reads whichever buffer block -1 "would
+    /// have" written, which for a fresh sequence is entirely masked out;
+    /// for a sequence that already holds keys it would be the wide
+    /// recipe's shared scratch, and the block would then write that over
+    /// the sequence's slot. A second `prefill` on a non-empty sequence is
+    /// therefore rejected unless the block count makes block 0 read the
+    /// slot (an even number of blocks). Feed further tokens through
+    /// [`TpModel::decode`], or [`TpModel::reset`] the sequence first.
+    ///
     /// # Errors
     ///
     /// Returns an error if a call fails or the ids never complete.
     ///
     /// # Panics
     ///
-    /// Panics if `x` is empty or not whole rows, `b` is not a slot, or the
-    /// tokens overflow the cache.
+    /// Panics if `x` is empty or not whole rows, `b` is not a slot, the
+    /// tokens overflow the cache, or the sequence already holds keys and
+    /// the block count is odd (see the limitation above).
     #[allow(clippy::too_many_lines)]
     pub fn prefill(&mut self, b: usize, x: &[f32]) -> Result<u32> {
         let (h, hd, c, p) = (self.hidden, self.head_dim, self.capacity, self.rows);
@@ -584,6 +621,13 @@ impl<'a> TpModel<'a> {
         );
         let off = b as u64 * self.slot_bytes();
         let n_blocks = n_total.div_ceil(p);
+        assert!(
+            self.pos[b] == 0 || n_blocks % 2 == 0,
+            "prefill of {n_total} tokens ({n_blocks} blocks) onto sequence {b} at position {}: \
+             block 0 would read the wide recipe's scratch and write it over the slot; \
+             prefill a sequence once from position 0",
+            self.pos[b]
+        );
         let keys = c + 1;
         let neg = f32_to_bf16(MASK_NEG);
         let count = p * h;

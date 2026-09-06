@@ -6,7 +6,12 @@
 //! `[r<rank>]` prefixes, and checks that every rank produced the same ids
 //! (each rank computes the argmax after the last all-reduce, so they must).
 //!
-//! `reng-tp <model_dir> <n_new> <id> [<id> ...] --modules 4,1 [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]`
+//! `reng-tp <model_dir> <n_new> [<id> ...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]`
+//!
+//! The prompt is the trailing ids, or `--prompt-file <json>`: the
+//! `"prompt"` array of a `generate.py` reference file (any trailing ids
+//! are appended to it), which is how a long prompt gets in without a
+//! thousand arguments.
 //!
 //! With `--ref` the run is teacher-forced against a `generate.py`
 //! reference, as `reng-generate --ref` (step `i` scores `prompt ++
@@ -23,7 +28,7 @@
 //! `reng-tp --rank r --world n --module m --dir DIR <the coordinator's arguments>`
 
 use reng_model::{LlamaConfig, TpGenerator, load_weights};
-use reng_synapse::hccl::{EXIT_ACQUIRE, Group, Rank};
+use reng_synapse::hccl::{EXIT_ACQUIRE, Group, Rank, abort_and_die};
 use reng_synapse::tp::{Mode, rss_bytes};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -69,6 +74,7 @@ struct Opts {
     n_new: usize,
     ids: Vec<u32>,
     modules: Vec<u32>,
+    prompt_file: Option<String>,
     ref_path: Option<String>,
     margin: f32,
     rows: usize,
@@ -89,7 +95,7 @@ struct Opts {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: reng-tp <model_dir> <n_new> <id>... --modules 4,1 [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]"
+        "usage: reng-tp <model_dir> <n_new> [<id>...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]"
     );
     std::process::exit(2)
 }
@@ -102,6 +108,7 @@ fn parse() -> Opts {
         n_new: 0,
         ids: Vec::new(),
         modules: Vec::new(),
+        prompt_file: None,
         ref_path: None,
         margin: DEFAULT_MARGIN,
         rows: DEFAULT_ROWS,
@@ -131,6 +138,7 @@ fn parse() -> Opts {
                     o.modules.push(m.trim().parse().unwrap_or_else(|_| usage()));
                 }
             }
+            "--prompt-file" => o.prompt_file = Some(value(&mut i)),
             "--ref" => o.ref_path = Some(value(&mut i)),
             "--margin" => o.margin = value(&mut i).parse().unwrap_or_else(|_| usage()),
             "--rows" => o.rows = num(&value(&mut i)),
@@ -149,12 +157,17 @@ fn parse() -> Opts {
         }
         i += 1;
     }
-    if positional.len() < 3 {
+    if positional.len() < if o.prompt_file.is_some() { 2 } else { 3 } {
         usage();
     }
     o.dir = positional[0].clone();
     o.n_new = num(&positional[1]);
     o.ids = positional[2..].iter().map(|s| num(s) as u32).collect();
+    if let Some(path) = &o.prompt_file {
+        let mut ids = prompt_ids(path);
+        ids.extend_from_slice(&o.ids);
+        o.ids = ids;
+    }
     if o.rank.is_none() && o.modules.is_empty() {
         usage();
     }
@@ -173,6 +186,25 @@ fn parse() -> Opts {
     }
     o.raw = fwd;
     o
+}
+
+/// The `"prompt"` array of a `generate.py` reference file, as ids.
+fn prompt_ids(path: &str) -> Vec<u32> {
+    let bail = |e: String| -> ! {
+        eprintln!("{path}: {e}");
+        std::process::exit(2)
+    };
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| bail(e.to_string()));
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| bail(e.to_string()));
+    let Some(a) = v.get("prompt").and_then(|p| p.as_array()) else {
+        bail(String::from("no \"prompt\" array"))
+    };
+    a.iter()
+        .map(|x| {
+            u32::try_from(x.as_u64().unwrap_or_else(|| bail(format!("prompt id {x}"))))
+                .unwrap_or_else(|_| bail(format!("prompt id {x}")))
+        })
+        .collect()
 }
 
 fn load_reference(path: &str) -> reng_core::Result<Reference> {
@@ -289,6 +321,32 @@ fn worker(o: &Opts, rank: usize) -> reng_core::Result<()> {
         t_start.elapsed().as_secs_f64()
     );
 
+    match generate_and_check(&mut g, o, rank, dir, n_new, reference.as_ref(), t_start) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The probe's rule: after a failure with a live communicator
+            // the orderly teardown can hang inside libSynapse for minutes
+            // while still holding the card. Abort the communicator and
+            // leave at once instead.
+            println!("RESULT: rank {rank} ERROR: {e}");
+            abort_and_die(2);
+        }
+    }
+}
+
+/// Prefill the prompt into every sequence, run the decode loop (teacher
+/// forced against `reference` when there is one), write this rank's ids
+/// for the coordinator to compare, and run the bench when asked.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn generate_and_check(
+    g: &mut TpGenerator<'_>,
+    o: &Opts,
+    rank: usize,
+    dir: &Path,
+    n_new: usize,
+    reference: Option<&Reference>,
+    t_start: Instant,
+) -> reng_core::Result<()> {
     let nb = o.batch;
     let mut generated: Vec<u32> = Vec::with_capacity(n_new);
     let mut step_ms: Vec<f64> = Vec::with_capacity(n_new);
@@ -308,7 +366,7 @@ fn worker(o: &Opts, rank: usize) -> reng_core::Result<()> {
     let quiet = rank != 0;
     generated.push(first);
     step_ms.push(ms);
-    match &reference {
+    match reference {
         Some(r) => {
             if !quiet {
                 verdict(r, 0, first, o.margin, ms, &mut near_ties, &mut failures);
@@ -361,10 +419,10 @@ fn worker(o: &Opts, rank: usize) -> reng_core::Result<()> {
     std::fs::write(dir.join(format!("rank{rank}.ids")), ids_json.to_string())?;
 
     if o.bench > 0 {
-        bench(&mut g, o, rank)?;
+        bench(g, o, rank)?;
     }
 
-    if let Some(r) = &reference {
+    if let Some(r) = reference {
         if !quiet {
             let exact = generated
                 .iter()
@@ -449,9 +507,14 @@ fn coordinate(o: &Opts) -> i32 {
         eprintln!("current_exe: {e}");
         std::process::exit(2)
     });
+    let prompt = if o.ids.len() > 8 {
+        format!("{} ids {:?}..", o.ids.len(), &o.ids[..8])
+    } else {
+        format!("{:?}", o.ids)
+    };
     println!(
-        "coordinator: modules {:?} (rank order), model {}, {} new tokens, prompt {:?}, rows {}, capacity {}, timeout {} s",
-        o.modules, o.dir, o.n_new, o.ids, o.rows, o.capacity, o.timeout_s
+        "coordinator: modules {:?} (rank order), model {}, {} new tokens, prompt {prompt}, rows {}, capacity {}, timeout {} s",
+        o.modules, o.dir, o.n_new, o.rows, o.capacity, o.timeout_s
     );
     let started = Instant::now();
     let deadline = started + Duration::from_secs(o.timeout_s);
