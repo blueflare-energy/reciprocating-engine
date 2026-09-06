@@ -102,25 +102,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   names it; otherwise an inherited setting stands, and failing that the
   interface carrying the default route is used
   (`reng_synapse::hccl::pick_ifname`, which skips interfaces that are
-  down, the loopback, `docker`/`veth`/`br-`/`virbr`/`tun`/`tap`/`vnet`
-  devices and, unless nothing else is left, MAC-named USB ones). The
-  hand-shake directory is removed when the run ends, whether it passed,
-  failed or was interrupted (`RENG_TP_KEEP_DIR` keeps it), and one left
-  behind by an earlier run whose pid the kernel reused is detected and
-  removed rather than joined, where before its stale `go` would skip this
-  run's acquire barrier and its stale `id.bin` would name a dead HCCL
-  coordinator. A worker's waits for `go` and for the unique id are bounded
-  by `--timeout` (forwarded to the workers) instead of a fixed 180 s and
-  120 s, and a rank that gives up waiting for `go` now exits with
+  down, the loopback and `docker`/`veth`/`br-`/`virbr`/`tun`/`tap`/`vnet`
+  devices - a default route through one of those is skipped too, since
+  the sideband has to reach a peer host - and, unless nothing else is
+  left, MAC-named USB ones). `--ifname ""` asks for the library's own
+  enumeration back, since an empty variable is not an unset one.
+  The hand-shake directory (mode 0700: its `id.bin` carries rank 0's
+  address) is removed when the run ends or is interrupted, and kept when a
+  rank failed, since the workers' SynapseAI logs under it say why
+  (`RENG_TP_KEEP_DIR` keeps it always). One left behind by an earlier run
+  whose pid the kernel reused is detected and removed rather than joined,
+  where before its stale `go` would skip this run's acquire barrier and
+  its stale `id.bin` would name a dead HCCL coordinator. A worker's wait
+  for `go` is bounded by `--timeout` (forwarded to the workers) instead of
+  a fixed 180 s, and its wait for rank 0's unique id by the same value
+  capped at 180 s; both end at once on `abort` or on a coordinator that
+  went away, so a rank never holds a card waiting for one that is not
+  there. A rank that gives up waiting for `go` now exits with
   `EXIT_ACQUIRE`, which is what makes the coordinator relaunch the group.
   At `--batch B` every sequence's ids are written to `rank<r>.ids` and
-  compared across the ranks, not sequence 0's alone.
+  compared across the ranks, not sequence 0's alone, and a rank whose own
+  sequences disagree with each other fails the run.
 - Multi-card lifecycle: a rank never outlives its coordinator holding a
   card. SIGINT and SIGTERM are caught: the coordinator asks the ranks to
   abort their communicators, reaps them, removes the hand-shake directory
   and leaves with 130, and a worker signalled with its coordinator (the
   terminal signals the whole process group) aborts its communicator
-  instead of dying inside a collective. Each worker runs a watchdog thread that polls the hand-shake
+  instead of dying inside a collective (a second signal leaves at once,
+  without that, which is what a card wedged inside a collective costs).
+  Each worker runs a watchdog thread that polls the hand-shake
   directory's `abort` file and its own parent id, and on either aborts the
   communicator (`hcclCommAbort`) and leaves through `_exit`;
   `Group::wait_all` writes `abort` and waits out a 10 s grace before it
@@ -149,9 +159,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   straight out of the map, which `LlamaWeights::shard` uses for the o and
   down projections of such a tensor (`wo_pitch` / `wd_pitch` 0) instead of
   a strided view whose read would copy the whole row range. A rank now
-  copies `1 / world` of an unaligned tensor, once: 10.7 GB owned per rank
-  of the 70B at world 2 against 13.7 GB, and 10.7 GB copied over the run
-  against 32.9 GB (19.2 at load, 13.7 at the shard).
+  copies its own shard of an unaligned tensor once - `1 / world` of a
+  split one, all of a replicated one (`lm_head`, 2.1 GB of the 70B's
+  19.2 GB of odd bytes, is copied whole on every rank, which is why the
+  figure below is 10.7 GB and not 9.6 GB): 10.7 GB owned per rank of the
+  70B at world 2 against 13.7 GB, and 10.7 GB copied over the run against
+  32.9 GB (19.2 at load, 13.7 at the shard).
   `LlamaWeights::footprint` counts an unaligned view without reading it.
 - The attention scale is applied to `wq` while the rows are staged for
   the upload (`Gb::input_bf16_scaled`, an f32 product rounded to bf16

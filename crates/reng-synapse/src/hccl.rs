@@ -562,11 +562,14 @@ impl Rank {
     /// communicator; the hand-shake still runs so one coordinator serves
     /// both cases.
     ///
-    /// `timeout` bounds each of the two waits (for `go` and for the
-    /// unique id) and is the coordinator's own `--timeout`, so a peer
-    /// whose acquire is slow does not make an already-acquired rank give
-    /// up first; both waits also end at once when the coordinator writes
-    /// `abort` or goes away.
+    /// `timeout` bounds the wait for `go` and is the coordinator's own
+    /// `--timeout`, so a peer whose acquire is slow does not make an
+    /// already-acquired rank give up first; the wait for the unique id
+    /// that follows is bounded by the same value capped at
+    /// [`DEFAULT_HANDSHAKE_TIMEOUT`], since by then every rank holds its
+    /// card and rank 0 has only a file to write. Both waits also end at
+    /// once when the coordinator writes `abort` or goes away, so a rank
+    /// never holds a card waiting for a coordinator that is not there.
     ///
     /// # Errors
     ///
@@ -601,15 +604,14 @@ impl Rank {
         std::fs::write(dir.join(format!("rank{rank}.acquired")), b"ok")?;
         wait_for_go(dir, std::os::unix::process::parent_id(), timeout)?;
         let comm = if world > 1 {
-            let id_path = dir.join("id.bin");
             let id = if rank == 0 {
                 let id = UniqueId::create()?;
                 let tmp = dir.join("id.tmp");
                 std::fs::write(&tmp, id.to_bytes())?;
-                std::fs::rename(&tmp, &id_path)?;
+                std::fs::rename(&tmp, dir.join("id.bin"))?;
                 id
             } else {
-                wait_for_id(&id_path, timeout)?
+                wait_for_id(dir, std::os::unix::process::parent_id(), timeout)?
             };
             let t1 = Instant::now();
             let comm = Comm::init_rank(world, &id, rank)?;
@@ -684,20 +686,36 @@ fn wait_for_go(dir: &Path, ppid: u32, timeout: Duration) -> Result<()> {
     }
 }
 
-/// Wait for rank 0 to leave its unique id at `id_path` (it renames the
+/// Wait for rank 0 to leave its unique id at `dir/id.bin` (it renames the
 /// file into place, so a short read is a partial write from an earlier
-/// run and is read again).
+/// run and is read again). Ends early with an error when the coordinator
+/// writes `abort` instead or goes away (this process is reparented away
+/// from `ppid`), and in any case after `timeout` capped at
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`]: by this point every rank holds its card
+/// and rank 0 has only a file to write, so a longer wait is a rank
+/// holding a card for nothing.
 ///
 /// # Errors
 ///
-/// Returns an error if no id of the right size arrives within `timeout`.
-fn wait_for_id(id_path: &Path, timeout: Duration) -> Result<UniqueId> {
+/// Returns an error if no id of the right size arrives, the coordinator
+/// aborts, or it goes away.
+fn wait_for_id(dir: &Path, ppid: u32, timeout: Duration) -> Result<UniqueId> {
+    let id_path = dir.join("id.bin");
+    let timeout = id_wait_timeout(timeout);
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(b) = std::fs::read(id_path) {
+        if let Ok(b) = std::fs::read(&id_path) {
             if b.len() == UniqueId::BYTES {
                 return UniqueId::from_bytes(&b);
             }
+        }
+        if dir.join("abort").exists() {
+            return Err(Error::Other("unique id: aborted by coordinator".into()));
+        }
+        if std::os::unix::process::parent_id() != ppid {
+            return Err(Error::Other(
+                "unique id: the coordinator went away before rank 0's id".into(),
+            ));
         }
         if Instant::now() > deadline {
             return Err(Error::Other(format!(
@@ -707,6 +725,15 @@ fn wait_for_id(id_path: &Path, timeout: Duration) -> Result<UniqueId> {
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// The bound on the wait for the unique id: the caller's `timeout`
+/// (the coordinator's `--timeout`, which is the whole run's), capped at
+/// [`DEFAULT_HANDSHAKE_TIMEOUT`]. The cap is the point: the card is
+/// already acquired and rank 0 has one file to write, so an hour of
+/// waiting is an hour of holding a card for nothing.
+fn id_wait_timeout(timeout: Duration) -> Duration {
+    timeout.min(DEFAULT_HANDSHAKE_TIMEOUT)
 }
 
 /// Watch the coordinator from a background thread: once a rank is
@@ -794,9 +821,13 @@ const VIRTUAL_PREFIXES: [&str; 8] = ["lo", "docker", "veth", "br-", "virbr", "tu
 /// picks it).
 ///
 /// `route` is `/proc/net/route`, whose default entry is the one with a
-/// zero destination; ties go to the lowest metric.
+/// zero destination, an `RTF_UP` (1) flag and, when there are several,
+/// the lowest metric. A default route through a virtual interface (a VPN
+/// `tun0`, a container bridge) is skipped like the rest of
+/// [`VIRTUAL_PREFIXES`]: HCCL's sideband has to reach a peer host.
 #[must_use]
 pub fn pick_ifname(route: &str, ifaces: &[Iface]) -> Option<String> {
+    let physical = |name: &str| !VIRTUAL_PREFIXES.iter().any(|p| name.starts_with(p));
     let usable = |name: &str| ifaces.iter().any(|i| i.name == name && i.usable());
     let mut best: Option<(u32, &str)> = None;
     for line in route.lines().skip(1) {
@@ -804,8 +835,12 @@ pub fn pick_ifname(route: &str, ifaces: &[Iface]) -> Option<String> {
         if f.len() < 8 || f[1] != "00000000" {
             continue;
         }
+        // `flags` and `metric` are the kernel's own columns: RTF_UP is
+        // bit 0, and an entry without it is not a route to use.
+        let flags = u32::from_str_radix(f[3], 16).unwrap_or(1);
         let metric: u32 = f[6].parse().unwrap_or(u32::MAX);
-        if usable(f[0]) && best.is_none_or(|(m, _)| metric < m) {
+        if flags & 1 != 0 && usable(f[0]) && physical(f[0]) && best.is_none_or(|(m, _)| metric < m)
+        {
             best = Some((metric, f[0]));
         }
     }
@@ -814,7 +849,7 @@ pub fn pick_ifname(route: &str, ifaces: &[Iface]) -> Option<String> {
     }
     let mut rest: Vec<&Iface> = ifaces
         .iter()
-        .filter(|i| i.usable() && !VIRTUAL_PREFIXES.iter().any(|p| i.name.starts_with(p)))
+        .filter(|i| i.usable() && physical(&i.name))
         .collect();
     rest.sort_by_key(|i| i.rank());
     rest.first().map(|i| i.name.clone())
@@ -866,10 +901,16 @@ pub fn default_ifname() -> Option<String> {
 ///
 /// Returns an error if the directory cannot be made.
 pub fn prepare_dir(dir: &Path) -> Result<bool> {
+    use std::os::unix::fs::DirBuilderExt;
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    match std::fs::create_dir(dir) {
+    // Mode 0700: the directory lives in a shared `/tmp` and `id.bin`
+    // carries rank 0's `IP:PORT`, which is all another user needs to talk
+    // to the communicator.
+    let mut b = std::fs::DirBuilder::new();
+    b.mode(0o700);
+    match b.create(dir) {
         Ok(()) => Ok(false),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             println!(
@@ -878,7 +919,7 @@ pub fn prepare_dir(dir: &Path) -> Result<bool> {
                 std::process::id()
             );
             std::fs::remove_dir_all(dir)?;
-            std::fs::create_dir(dir)?;
+            b.create(dir)?;
             Ok(true)
         }
         Err(e) => Err(Error::Other(format!("{}: {e}", dir.display()))),
@@ -887,14 +928,22 @@ pub fn prepare_dir(dir: &Path) -> Result<bool> {
 
 /// Remove a hand-shake directory and everything under it (`id.bin`, the
 /// `rank<r>.*` files and the workers' `HABANA_LOGS` trees), unless
-/// `RENG_TP_KEEP_DIR` is set. Returns whether anything is left behind.
-pub fn remove_dir(dir: &Path) -> bool {
+/// `RENG_TP_KEEP_DIR` is set or `keep` says a rank failed: the SynapseAI
+/// logs under it are what says why, and a run that has to be repeated to
+/// get them back costs the cards again. Returns whether anything is left
+/// behind.
+pub fn remove_dir(dir: &Path, keep: Option<&str>) -> bool {
     if !dir.exists() {
         return false;
     }
-    if std::env::var_os("RENG_TP_KEEP_DIR").is_some() {
+    let why = if std::env::var_os("RENG_TP_KEEP_DIR").is_some() {
+        Some("RENG_TP_KEEP_DIR")
+    } else {
+        keep
+    };
+    if let Some(why) = why {
         println!(
-            "coordinator: keeping the hand-shake directory {} (RENG_TP_KEEP_DIR)",
+            "coordinator: keeping the hand-shake directory {} ({why}); the workers' HABANA logs are its logs-r<rank> trees",
             dir.display()
         );
         return true;
@@ -936,10 +985,12 @@ extern "C" fn on_signal(_sig: c_int) {
 /// leaves at once.
 pub fn catch_signals() {
     // SAFETY: `signal` takes the handler by pointer and returns the
-    // previous one, which we do not need.
-    unsafe {
-        signal(SIGINT, on_signal);
-        signal(SIGTERM, on_signal);
+    // previous one, or `SIG_ERR` (-1 as a `usize`).
+    let (a, b) = unsafe { (signal(SIGINT, on_signal), signal(SIGTERM, on_signal)) };
+    if a == usize::MAX || b == usize::MAX {
+        // Not fatal, but Ctrl-C is then fatal to this process and the
+        // ranks are left to their watchdogs, so say so.
+        eprintln!("warning: SIGINT/SIGTERM handler not installed; an interrupt will be fatal");
     }
 }
 
@@ -1007,7 +1058,15 @@ impl Group {
                 .stderr(std::process::Stdio::null())
                 .status()
                 .is_ok_and(|s| s.success());
-        let mut ranks = Vec::with_capacity(modules.len());
+        // Built in place so that a spawn that fails part way drops a
+        // `Group`: the ranks already spawned are asked to abort and are
+        // reaped, and the directory made above goes with them instead of
+        // being left in `/tmp`.
+        let mut group = Self {
+            ranks: Vec::with_capacity(modules.len()),
+            dir: dir.to_path_buf(),
+            started: Instant::now(),
+        };
         for (rank, &module) in modules.iter().enumerate() {
             let node = if numactl { numa_node_of(module) } else { None };
             let mut cmd = match node {
@@ -1052,7 +1111,7 @@ impl Group {
             if let Some(err) = child.stderr.take() {
                 readers.push(echo(err, format!("[r{rank} err]")));
             }
-            ranks.push(Child {
+            group.ranks.push(Child {
                 rank,
                 module,
                 child,
@@ -1060,11 +1119,7 @@ impl Group {
                 status: None,
             });
         }
-        Ok(Self {
-            ranks,
-            dir: dir.to_path_buf(),
-            started: Instant::now(),
-        })
+        Ok(group)
     }
 
     /// Wait until every rank has written `rank<r>.acquired`, then write
@@ -1206,8 +1261,10 @@ impl Drop for Group {
     /// `std::process::Child` does not kill on drop, so without this an
     /// early return, a `?` or a panic in the coordinator would leave the
     /// workers holding their cards until they finished on their own. The
-    /// hand-shake directory goes with the group, whether the run passed,
-    /// failed or was interrupted (see [`remove_dir`]).
+    /// hand-shake directory goes with the group when the run passed, was
+    /// interrupted, or only failed to acquire a card; a rank that failed
+    /// for any other reason keeps it, since its `logs-r<rank>` tree is
+    /// the SynapseAI side of the story (see [`remove_dir`]).
     fn drop(&mut self) {
         for r in &mut self.ranks {
             r.poll();
@@ -1221,9 +1278,23 @@ impl Drop for Group {
                 let _ = h.join();
             }
         }
+        let keep = (!interrupted())
+            .then(|| {
+                self.ranks
+                    .iter()
+                    .find(|r| r.status.is_some_and(|c| c != 0 && c != EXIT_ACQUIRE))
+            })
+            .flatten()
+            .map(|r| {
+                format!(
+                    "rank {} exited with code {}",
+                    r.rank,
+                    r.status.unwrap_or(-1)
+                )
+            });
         // Every rank has exited, so nothing is reading the hand-shake
         // files any more.
-        remove_dir(&self.dir);
+        remove_dir(&self.dir, keep.as_deref());
     }
 }
 
@@ -1339,7 +1410,11 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
         );
         id
     } else if a.id_file {
-        wait_for_id(&id_path, DEFAULT_HANDSHAKE_TIMEOUT)?
+        wait_for_id(
+            a.dir,
+            std::os::unix::process::parent_id(),
+            DEFAULT_HANDSHAKE_TIMEOUT,
+        )?
     } else {
         println!("unique-id: zeroed (env mode, HCCL_COMM_ID must be set)");
         UniqueId::zeroed()
@@ -2249,6 +2324,30 @@ mod tests {
             pick_ifname(&route, &box_ifaces()).as_deref(),
             Some("enxf8e43bd2a69c")
         );
+        // A default route through a VPN or a container bridge is not a
+        // way to another host: it is skipped like any other virtual
+        // interface, even at a better metric, and so is an entry whose
+        // RTF_UP flag (bit 0 of the flags column) is clear.
+        let mut virt = box_ifaces();
+        virt.push(iface("tun0", "unknown", false));
+        let route = format!(
+            "{HEADER}\
+             tun0\t00000000\t0101FF0A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+             enxf8e43bd2a69c\t00000000\t0101FF0A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        );
+        assert_eq!(
+            pick_ifname(&route, &virt).as_deref(),
+            Some("enxf8e43bd2a69c")
+        );
+        let route = format!(
+            "{HEADER}\
+             enxbe3af2b6059f\t00000000\t0101FF0A\t0000\t0\t0\t0\t00000000\t0\t0\t0\n\
+             enxf8e43bd2a69c\t00000000\t0101FF0A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        );
+        assert_eq!(
+            pick_ifname(&route, &box_ifaces()).as_deref(),
+            Some("enxf8e43bd2a69c")
+        );
     }
 
     #[test]
@@ -2322,8 +2421,9 @@ mod tests {
     fn id_wait_honours_its_timeout_and_takes_only_a_whole_id() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("id.bin");
+        let ppid = std::os::unix::process::parent_id();
         let t = Instant::now();
-        let e = match wait_for_id(&path, Duration::from_millis(300)) {
+        let e = match wait_for_id(d.path(), ppid, Duration::from_millis(300)) {
             Ok(_) => panic!("an id appeared in an empty directory"),
             Err(e) => e.to_string(),
         };
@@ -2331,24 +2431,66 @@ mod tests {
         assert!(t.elapsed() >= Duration::from_millis(300));
         // A short file is a partial write, not an id.
         std::fs::write(&path, [7u8; 8]).unwrap();
-        assert!(wait_for_id(&path, Duration::from_millis(200)).is_err());
-        // The whole 1032 bytes are read back as written.
+        assert!(wait_for_id(d.path(), ppid, Duration::from_millis(200)).is_err());
+        // A coordinator that went away is noticed at once, and so is an
+        // abort: this wait is between `go` and the communicator, with a
+        // card already held, and nothing else is watching yet.
+        std::fs::remove_file(&path).unwrap();
+        let t = Instant::now();
+        let e = match wait_for_id(d.path(), u32::MAX, Duration::from_secs(600)) {
+            Ok(_) => panic!("an id appeared in an empty directory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.starts_with("unique id: the coordinator went away"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10));
+        std::fs::write(d.path().join("abort"), b"abort").unwrap();
+        let t = Instant::now();
+        let e = match wait_for_id(d.path(), ppid, Duration::from_secs(600)) {
+            Ok(_) => panic!("an id appeared in an empty directory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.starts_with("unique id: aborted by coordinator"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10));
+        // The whole 1032 bytes are read back as written, and an id that
+        // is there wins over the abort.
         let mut bytes = vec![0u8; UniqueId::BYTES];
         bytes[..4].copy_from_slice(b"addr");
         bytes[HCCL_UNIQUE_ID_MAX_BYTES..].copy_from_slice(&16u64.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
-        let id = wait_for_id(&path, Duration::from_secs(5)).unwrap();
+        let id = wait_for_id(d.path(), ppid, Duration::from_secs(5)).unwrap();
         assert_eq!(id.length(), 16);
         assert_eq!(id.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn the_id_wait_is_capped_below_a_long_run_timeout() {
+        // The coordinator's `--timeout` is the whole run's (3600 s by
+        // default) and bounds the wait for `go`, where a rank holds no
+        // card yet. The wait for the unique id is after the acquire, so
+        // it keeps a cap of its own.
+        assert_eq!(
+            id_wait_timeout(Duration::from_secs(3600)),
+            DEFAULT_HANDSHAKE_TIMEOUT
+        );
+        assert_eq!(
+            id_wait_timeout(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
     fn stale_hand_shake_directory_is_detected_and_removed() {
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("reng-tp-4242-1");
-        // A fresh directory is not reported as stale.
+        // A fresh directory is not reported as stale, and it is the
+        // run's own: `id.bin` under it carries rank 0's address.
         assert!(!prepare_dir(&dir).unwrap());
         assert!(dir.is_dir());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // A directory of the same name from an earlier run of a reused
         // pid is: its `go` would skip this run's acquire barrier.
         std::fs::write(dir.join("go"), b"go").unwrap();
@@ -2363,13 +2505,22 @@ mod tests {
         // Removal takes the whole tree, and asking twice is not an error.
         std::fs::create_dir(dir.join("logs-r1")).unwrap();
         std::fs::write(dir.join("logs-r1").join("synapse.log"), b"new").unwrap();
-        assert!(!remove_dir(&dir));
+        // A failed rank keeps the directory: its HABANA logs are the only
+        // record of why, and getting them back costs the cards again.
+        assert!(remove_dir(&dir, Some("rank 1 exited with code 2")));
+        assert!(dir.join("logs-r1").join("synapse.log").exists());
+        assert!(!remove_dir(&dir, None));
         assert!(!dir.exists());
-        assert!(!remove_dir(&dir));
+        assert!(!remove_dir(&dir, None));
     }
 
     #[test]
     fn an_interrupt_sets_the_flag_instead_of_killing_the_coordinator() {
+        // The handler and the counter are process-wide, and the second
+        // signal `_exit`s: this test starts from a known count and puts
+        // it back, so running it twice in one test binary (a retry, a
+        // rerun with other threads) is not an exit 130.
+        SIGNALS.store(0, Ordering::SeqCst);
         assert!(!interrupted());
         catch_signals();
         // SAFETY: `raise` sends the signal to this process, where the
@@ -2382,5 +2533,7 @@ mod tests {
             std::thread::sleep(POLL);
         }
         assert!(interrupted());
+        assert_eq!(SIGNALS.load(Ordering::SeqCst), 1);
+        SIGNALS.store(0, Ordering::SeqCst);
     }
 }

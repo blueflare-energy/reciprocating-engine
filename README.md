@@ -379,13 +379,18 @@ are compared across the ranks, not sequence 0's alone.
 
 The coordinator pins the interface HCCL uses for its sideband TCP
 connections (`HCCL_SOCKET_IFNAME`): `--ifname <nic>`, or an inherited
-setting, or the interface carrying the default route. The library's own
-default is the first interface whose name is not `lo` or `docker`, which
-on this box is the BMC's virtual NIC. `--timeout <s>` bounds the run and
-the workers' waits for the coordinator's `go` and for rank 0's unique id.
-The hand-shake directory (`$TMPDIR/reng-tp-<pid>-<attempt>`) is removed
-when the run ends, however it ends, and a stale one from a reused pid is
-removed rather than joined.
+setting, or the interface carrying the default route (`--ifname ""` asks
+for the library's own enumeration back). The library's own default is the
+first interface whose name is not `lo` or `docker`, which on this box is
+the BMC's virtual NIC. `--timeout <s>` bounds the run and the workers'
+wait for the coordinator's `go`; their wait for rank 0's unique id is
+bounded by the same value capped at 180 s, and both end at once if the
+coordinator aborts or goes away, so no rank waits on a card for a
+coordinator that is not there. The hand-shake directory
+(`$TMPDIR/reng-tp-<pid>-<attempt>`, mode 0700) is removed when the run
+ends or is interrupted and kept when a rank failed, since the workers'
+SynapseAI logs are under it (`RENG_TP_KEEP_DIR` keeps it always); a stale
+one from a reused pid is removed rather than joined.
 
 No rank outlives its coordinator holding a card. A watchdog thread in
 each worker polls the hand-shake directory's `abort` file and its own
@@ -393,8 +398,11 @@ parent id; on either it calls `hcclCommAbort` and leaves through `_exit`,
 and the coordinator writes `abort` and waits out a grace period before it
 kills anything. Ctrl-C is caught rather than fatal: the coordinator asks
 the ranks to abort, reaps them, removes the hand-shake directory and
-leaves with 130 (a second Ctrl-C leaves at once). Ctrl-C on a two-card 8B
-decode has both workers gone and both cards free within 15 s.
+leaves with 130. Ctrl-C on a two-card 8B decode has both workers gone and
+both cards free within 15 s; a second Ctrl-C before that is through
+leaves at once instead, which is the old behaviour and its old cost - no
+`hcclCommAbort`, a rank possibly killed inside a collective, and the
+hand-shake directory left behind.
 
 DeepSeek-R1-Distill-Llama-70B (141 GB bf16) on two cards reproduces its
 f32 reference 8/8 exact (free-running and teacher-forced) and decodes at

@@ -458,8 +458,12 @@ fn generate_and_check(
         }
     }
     println!("rank {rank}: generated ids: {:?}", generated[0]);
+    // Every sequence of the batch was given the same prompt, so within a
+    // rank all `nb` id lists must be the same; a slot that decoded
+    // something else is a batched-decode bug even when both ranks agree
+    // on it, so it fails the run rather than only printing.
+    let same = generated.iter().filter(|s| **s == generated[0]).count();
     if nb > 1 {
-        let same = generated.iter().filter(|s| **s == generated[0]).count();
         println!("rank {rank}: {same} of {nb} sequences produced sequence 0's ids");
     }
     let ids_json = serde_json::json!({
@@ -471,6 +475,18 @@ fn generate_and_check(
         "step_ms": step_ms,
     });
     std::fs::write(dir.join(format!("rank{rank}.ids")), ids_json.to_string())?;
+    if same != nb {
+        // After the ids file is written, so the coordinator can still say
+        // which slot differs.
+        let b = generated
+            .iter()
+            .position(|s| *s != generated[0])
+            .unwrap_or(0);
+        return Err(reng_core::Error::Other(format!(
+            "rank {rank}: {same} of {nb} sequences produced sequence 0's ids; sequence {b} produced {:?} against sequence 0's {:?}",
+            generated[b], generated[0]
+        )));
+    }
 
     if o.bench > 0 {
         bench(g, o, rank)?;
@@ -631,9 +647,14 @@ fn compare_ranks(ids: &[Option<serde_json::Value>]) -> (bool, Vec<String>) {
 /// The interface to give the workers as `HCCL_SOCKET_IFNAME`, and where
 /// it came from: `--ifname`, an inherited setting, or the interface of
 /// the default route. `None` leaves the variable unset, which is HCCL's
-/// own enumeration (the trap this exists to avoid).
+/// own enumeration (the trap this exists to avoid) and is what
+/// `--ifname ""` asks for: an empty variable is not the same as an unset
+/// one for the library, so it is never passed on.
 fn ifname_for_workers(explicit: Option<&str>) -> (Option<String>, &'static str) {
     if let Some(n) = explicit {
+        if n.is_empty() {
+            return (None, "--ifname \"\": left to the library");
+        }
         return (Some(n.to_owned()), "--ifname");
     }
     if let Some(n) = std::env::var_os("HCCL_SOCKET_IFNAME") {
@@ -642,7 +663,10 @@ fn ifname_for_workers(explicit: Option<&str>) -> (Option<String>, &'static str) 
             return (Some(n), "inherited HCCL_SOCKET_IFNAME");
         }
     }
-    (default_ifname(), "the default route")
+    match default_ifname() {
+        Some(n) => (Some(n), "the default route"),
+        None => (None, "no usable interface"),
+    }
 }
 
 /// Spawn the ranks, wait for them, and compare their ids.
@@ -664,7 +688,7 @@ fn coordinate(o: &Opts) -> i32 {
     match &ifname {
         Some(n) => println!("coordinator: HCCL_SOCKET_IFNAME={n} (from {whence})"),
         None => println!(
-            "coordinator: no interface to pin; leaving HCCL_SOCKET_IFNAME to the library's enumeration"
+            "coordinator: leaving HCCL_SOCKET_IFNAME unset for the library's own enumeration ({whence})"
         ),
     }
     // A SIGINT or SIGTERM now stops the group through the abort file and
@@ -820,11 +844,25 @@ mod tests {
             ifname_for_workers(Some("eno1")),
             (Some(String::from("eno1")), "--ifname")
         );
+        // `--ifname ""` is the way back to the library's own enumeration:
+        // an empty variable is not an unset one, so nothing is exported.
+        assert_eq!(
+            ifname_for_workers(Some("")),
+            (None, "--ifname \"\": left to the library")
+        );
         // Whatever this host offers, it is never the loopback and never
         // empty; on a host with no interfaces at all it is `None` and the
         // variable is left unset.
         let (name, whence) = ifname_for_workers(None);
-        assert!(whence == "the default route" || whence == "inherited HCCL_SOCKET_IFNAME");
+        assert!(
+            [
+                "the default route",
+                "inherited HCCL_SOCKET_IFNAME",
+                "no usable interface"
+            ]
+            .contains(&whence),
+            "{whence}"
+        );
         if let Some(n) = name {
             assert!(!n.is_empty() && n != "lo", "{n}");
         }
