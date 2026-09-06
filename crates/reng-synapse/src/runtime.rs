@@ -333,6 +333,7 @@ impl Staging {
         stream: synStreamHandle,
         fence: &mut Fence,
         src: &[u8],
+        scale: Option<f32>,
         dst: u64,
     ) -> Result<()> {
         for (i, piece) in src.chunks(self.slot_bytes).enumerate() {
@@ -344,7 +345,12 @@ impl Staging {
             self.next += 1;
             // SAFETY: the slot holds `slot_bytes` bytes and no copy reads it
             // (every copy issued before the last fence has landed).
-            unsafe { copy_parallel(piece, hb.cast::<u8>()) };
+            unsafe {
+                match scale {
+                    Some(f) => copy_scaled_parallel(piece, f, hb.cast::<u8>()),
+                    None => copy_parallel(piece, hb.cast::<u8>()),
+                }
+            }
             syn!(synMemCopyAsync(
                 stream,
                 hb as u64,
@@ -400,6 +406,43 @@ unsafe fn copy_parallel(src: &[u8], dst: *mut u8) {
                     );
                 }
             });
+        }
+    });
+}
+
+/// Like [`copy_parallel`] for bf16 data that is multiplied by `scale` on
+/// the way (f32 product, rounded to bf16 as [`crate::scale_bf16`] does);
+/// `src` is the little-endian bf16 bytes.
+///
+/// # Safety
+///
+/// `dst` must be writable for `src.len()` bytes and must not overlap `src`.
+unsafe fn copy_scaled_parallel(src: &[u8], scale: f32, dst: *mut u8) {
+    const PER_THREAD: usize = 8 << 20;
+    const THREADS: usize = 8;
+    let threads = (src.len() / PER_THREAD).clamp(1, THREADS);
+    let convert = |part: &[u8], out: *mut u8| {
+        for (j, b) in part.chunks_exact(2).enumerate() {
+            let v =
+                crate::f32_to_bf16(crate::bf16_to_f32(u16::from_le_bytes([b[0], b[1]])) * scale);
+            let le = v.to_le_bytes();
+            // SAFETY: the caller's contract; `j * 2 + 1 < part.len()`.
+            unsafe {
+                *out.add(j * 2) = le[0];
+                *out.add(j * 2 + 1) = le[1];
+            }
+        }
+    };
+    if threads == 1 {
+        convert(src, dst);
+        return;
+    }
+    // Chunks hold whole bf16 elements.
+    let chunk = src.len().div_ceil(threads).div_ceil(2) * 2;
+    let dst = dst as usize;
+    std::thread::scope(|s| {
+        for (i, part) in src.chunks(chunk).enumerate() {
+            s.spawn(move || convert(part, (dst + i * chunk) as *mut u8));
         }
     });
 }
@@ -578,7 +621,7 @@ impl<'a> Runtime<'a> {
                 syn!(synDeviceMalloc(dev, src.len() as u64, 0, 0, &mut d));
                 in_bytes += src.len() as u64;
                 owned.push(d);
-                staging.upload(dev, stream, &mut fence, src, d)?;
+                staging.upload(dev, stream, &mut fence, src, gb.scales[idx], d)?;
                 own_input.push(true);
                 d
             };

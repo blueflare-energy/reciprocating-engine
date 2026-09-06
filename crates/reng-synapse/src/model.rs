@@ -156,6 +156,22 @@ fn scaled_wq<'a>(w: &LayerWeights<'a>) -> std::borrow::Cow<'a, [u16]> {
     }
 }
 
+/// The `wq` input of a layer graph: the checkpoint's rows, scaled while
+/// they are uploaded when the scale rides on `wq` (no q norm), else as
+/// they are (the scale is on the q norm gain).
+fn wq_input<'a>(
+    gb: &mut Gb<'a>,
+    name: &str,
+    sizes: &[u64],
+    w: &LayerWeights<'a>,
+) -> Result<synTensor> {
+    if w.qn.is_empty() {
+        gb.input_bf16_scaled(name, sizes, w.wq, score_scale(w))
+    } else {
+        gb.input_bf16(name, sizes, std::borrow::Cow::Borrowed(w.wq))
+    }
+}
+
 /// The factor on `q` before the scores: the attention scale, divided by
 /// the attention softcap when the layer has one (the scores then come out
 /// of the gemm as `scores / cap`, ready for the `tanh`).
@@ -500,6 +516,10 @@ pub(crate) struct Gb<'a> {
     pub data: Vec<std::borrow::Cow<'a, [u16]>>,
     /// Raw device bytes for non-bf16 inputs (else `data` is converted).
     pub raw: Vec<Option<Vec<u8>>>,
+    /// Per input: a factor applied to the bf16 data while it is staged for
+    /// the upload (the attention scale on `wq`), so the host keeps a view of
+    /// the checkpoint instead of a scaled copy. `None` for the others.
+    pub scales: Vec<Option<f32>>,
     pub scratch_names: Vec<CString>,
     pub scratch_sizes: Vec<Vec<u64>>,
     /// Whether each scratch tensor is f32 (else bf16); sizes count elements.
@@ -534,6 +554,7 @@ impl<'a> Gb<'a> {
             sizes: Vec::new(),
             data: Vec::new(),
             raw: Vec::new(),
+            scales: Vec::new(),
             scratch_names: Vec::new(),
             scratch_sizes: Vec::new(),
             scratch_f32: Vec::new(),
@@ -630,6 +651,40 @@ impl<'a> Gb<'a> {
         self.sizes.push(sizes.to_vec());
         self.data.push(data);
         self.raw.push(None);
+        self.scales.push(None);
+        Ok(t)
+    }
+
+    /// A persistent bf16 input whose data is multiplied by `scale` (in f32,
+    /// rounded to bf16 like [`crate::scale_bf16`]) while it is staged for
+    /// the upload; the host slice stays borrowed. The scale is part of the
+    /// recipe cache key.
+    pub fn input_bf16_scaled(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        data: &'a [u16],
+        scale: f32,
+    ) -> Result<synTensor> {
+        assert_eq!(
+            sizes.iter().product::<u64>() as usize,
+            data.len(),
+            "input {name}: sizes {sizes:?} against {} elements",
+            data.len()
+        );
+        self.note_tensor(
+            "in",
+            name,
+            sizes,
+            SYN_TYPE_BF16,
+            &format!("scale={}", scale.to_bits()),
+        );
+        let (t, cname) = make_tensor(self.graph, name, sizes, SYN_TYPE_BF16, true)?;
+        self.names.push(cname);
+        self.sizes.push(sizes.to_vec());
+        self.data.push(std::borrow::Cow::Borrowed(data));
+        self.raw.push(None);
+        self.scales.push(Some(scale));
         Ok(t)
     }
 
@@ -648,6 +703,7 @@ impl<'a> Gb<'a> {
         self.sizes.push(sizes.to_vec());
         self.data.push(std::borrow::Cow::Owned(Vec::new()));
         self.raw.push(Some(bytes.to_vec()));
+        self.scales.push(None);
         Ok(t)
     }
 
@@ -956,7 +1012,7 @@ pub(crate) fn build_layer<'a>(
         )?)
     } else if head_blocks {
         QkvProj::Separate(
-            gb.input_bf16(&p("wq"), &[h, hd, hpg, groups], scaled_wq(w))?,
+            wq_input(gb, &p("wq"), &[h, hd, hpg, groups], w)?,
             gb.input_bf16(
                 &p("wk"),
                 &[h, hd, 1, groups],
@@ -970,7 +1026,7 @@ pub(crate) fn build_layer<'a>(
         )
     } else {
         QkvProj::Separate(
-            gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?,
+            wq_input(gb, &p("wq2"), &[h, qw], w)?,
             gb.input_bf16(
                 &p("wk2"),
                 &[h, hd * groups],
@@ -1665,7 +1721,7 @@ pub(crate) fn build_layer_batched<'a>(
         )?)
     } else {
         QkvProj::Separate(
-            gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?,
+            wq_input(gb, &p("wq2"), &[h, qw], w)?,
             gb.input_bf16(
                 &p("wk2"),
                 &[h, hd * groups],

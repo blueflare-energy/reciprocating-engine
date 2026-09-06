@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The attention scale is applied to `wq` while the rows are staged for
+  the upload (`Gb::input_bf16_scaled`, an f32 product rounded to bf16
+  exactly as the old host copy was) instead of by a scaled copy of every
+  q matrix on the host: the 8B distill now loads with 0 GB of owned
+  weights (was 1 GB) and the logits are bit-identical.
 - Tensor-parallel shards of a model: `LlamaConfig::shard(rank, world)`
   and `LlamaWeights::shard(cfg, rank, world)` give one card's slice of a
   Megatron split (this rank's query and KV heads and MLP columns as views
