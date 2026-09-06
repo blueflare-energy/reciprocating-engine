@@ -259,7 +259,18 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// libc `_exit`: terminate without atexit handlers or destructors.
     pub fn _exit(status: c_int) -> !;
+    /// libc `signal`: install `handler` for signal `sig`. Returns the
+    /// previous handler (or `SIG_ERR`), which the engine does not need.
+    pub fn signal(sig: c_int, handler: extern "C" fn(c_int)) -> usize;
+    /// libc `raise`: send `sig` to this process (used to check the
+    /// coordinator's handler).
+    pub fn raise(sig: c_int) -> c_int;
 }
+
+/// `SIGINT`, the terminal's interrupt (Linux `signal.h`).
+pub const SIGINT: c_int = 2;
+/// `SIGTERM`, the default kill (Linux `signal.h`).
+pub const SIGTERM: c_int = 15;
 
 /// `synEventCreate` flag: the event carries a device timestamp, so a pair
 /// of them gives `synEventElapsedTime` (`synapse_api_types.h`:

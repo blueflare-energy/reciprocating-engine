@@ -35,8 +35,13 @@
 //! costs no copy and the file pages are shared with the page cache and
 //! reclaimable. Only derived data is owned: f32 and f16 checkpoints
 //! converted to bf16, the scaled Granite copies, and a tensor whose data
-//! offset is not 2-aligned (never seen; safetensors pads its header to 8
-//! bytes) or on a big-endian host.
+//! offset is not 2-aligned (94 of the 723 tensors of the 70B distill,
+//! 19.2 GB: safetensors pads its header to 8 bytes but not the tensors
+//! inside it) or on a big-endian host. An unaligned tensor is not copied
+//! when it is read from the file but when it is first used, and a shard
+//! narrows it first, so a rank copies its own rows and column blocks and
+//! never the whole tensor (see [`Bf16Slice::sub`] and
+//! [`Bf16Slice::column_block`]).
 
 use memmap2::{Advice, Mmap};
 use reng_core::{Error, Result};
@@ -437,42 +442,69 @@ pub enum Bf16Slice {
         offset: usize,
         len: usize,
     },
+    /// `len` elements at an odd byte `offset` of a mapped file (or on a
+    /// big-endian host): they cannot be viewed as `[u16]`, so the first
+    /// read copies them into the aligned buffer in `cell` and every read
+    /// after that returns it. [`Bf16Slice::sub`] and
+    /// [`Bf16Slice::column_block`] narrow the range before that happens,
+    /// so a tensor-parallel shard copies its own rows once instead of the
+    /// whole tensor.
+    Unaligned {
+        map: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+        /// Shared with the clones of this slice, so they copy once
+        /// between them; a sub-view gets a cell of its own.
+        cell: Arc<std::sync::OnceLock<Vec<u16>>>,
+    },
 }
 
 impl Bf16Slice {
-    /// A view of `len` bf16 elements at byte `offset` of `map` when the
-    /// elements can be read in place (the offset is 2-aligned and the host
-    /// is little-endian, as the file format is); otherwise a converted
-    /// copy.
+    /// A view of `len` bf16 elements at byte `offset` of `map`: read in
+    /// place when the elements can be (the offset is 2-aligned and the
+    /// host is little-endian, as the file format is), otherwise a
+    /// [`Bf16Slice::Unaligned`] view that copies when it is read.
     ///
     /// # Panics
     ///
     /// Panics if the range lies outside the map.
     #[must_use]
     pub fn mapped(map: Arc<Mmap>, offset: usize, len: usize) -> Self {
-        let bytes = &map[offset..offset + len * 2];
-        if cfg!(target_endian = "little") && bytes.as_ptr().align_offset(align_of::<u16>()) == 0 {
+        assert!(
+            offset <= map.len() && len * 2 <= map.len() - offset,
+            "mapped range outside the map"
+        );
+        if cfg!(target_endian = "little") && offset % align_of::<u16>() == 0 {
             return Self::Mapped { map, offset, len };
         }
-        // An odd data offset (94 of the 723 tensors of the 70B distill,
-        // 19 GB) cannot be viewed as `u16`: one memcpy into an aligned
-        // buffer (byte-swapped on a big-endian host).
-        let mut v: Vec<u16> = vec![0; len];
-        // SAFETY: `v` holds `len * 2` bytes and `bytes` has exactly that
-        // many; the ranges do not overlap.
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), v.as_mut_ptr().cast::<u8>(), len * 2);
+        Self::Unaligned {
+            map,
+            offset,
+            len,
+            cell: Arc::new(std::sync::OnceLock::new()),
         }
-        if cfg!(target_endian = "big") {
-            for x in &mut v {
-                *x = x.swap_bytes();
-            }
+    }
+
+    /// The number of bf16 elements, without reading (and so without
+    /// copying) them.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Mapped { len, .. } | Self::Unaligned { len, .. } => *len,
         }
-        Self::from(v)
+    }
+
+    /// Whether the slice has no elements.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Elements `start..start + len` as a slice of their own: a sub-view
-    /// of a mapped slice (no copy), a copy of an owned one.
+    /// of a mapped slice, aligned or not (no copy: an unaligned sub-view
+    /// copies its own elements only, and only when it is read), a copy of
+    /// an owned one.
     ///
     /// # Panics
     ///
@@ -487,13 +519,104 @@ impl Bf16Slice {
                 offset: offset + start * 2,
                 len,
             },
+            Self::Unaligned { map, offset, .. } => Self::Unaligned {
+                map: Arc::clone(map),
+                offset: offset + start * 2,
+                len,
+                cell: Arc::new(std::sync::OnceLock::new()),
+            },
         }
     }
 
-    /// Whether the elements are read from a mapped file.
+    /// The column window `[col0, col0 + cols)` of every row of this slice
+    /// read as a `[rows, pitch]` row-major matrix, gathered into a
+    /// contiguous owned `[rows, cols]` copy of its own. Reads the window
+    /// straight out of the map, so an unaligned tensor is copied once and
+    /// only where the window falls (`rows * cols` elements, not the
+    /// `(rows - 1) * pitch + cols` a [`Bf16Slice::sub`] view spans).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the window lies outside the slice.
+    #[must_use]
+    pub fn column_block(&self, rows: usize, pitch: usize, col0: usize, cols: usize) -> Self {
+        assert!(
+            cols <= pitch && rows * pitch <= self.len() && col0 + cols <= pitch,
+            "column block [{rows}, {cols}] at {col0} of a [{rows}, {pitch}] matrix of {} elements",
+            self.len()
+        );
+        let mut v: Vec<u16> = vec![0; rows * cols];
+        match self {
+            Self::Owned(_) | Self::Mapped { .. } => {
+                let src: &[u16] = self;
+                for r in 0..rows {
+                    let at = r * pitch + col0;
+                    v[r * cols..(r + 1) * cols].copy_from_slice(&src[at..at + cols]);
+                }
+            }
+            Self::Unaligned { map, offset, .. } => {
+                for r in 0..rows {
+                    let at = offset + (r * pitch + col0) * 2;
+                    copy_bf16_bytes(&map[at..at + cols * 2], &mut v[r * cols..(r + 1) * cols]);
+                }
+            }
+        }
+        Self::from(v)
+    }
+
+    /// Whether the elements are read from a mapped file in place. False
+    /// for an owned buffer and for an unaligned view, which is copied into
+    /// one when it is read.
     #[must_use]
     pub fn is_mapped(&self) -> bool {
         matches!(self, Self::Mapped { .. })
+    }
+
+    /// The bytes this slice holds, or will hold once it is read, in a
+    /// buffer of its own: zero for a view read in place.
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        match self {
+            Self::Mapped { .. } => 0,
+            Self::Owned(_) | Self::Unaligned { .. } => self.len() * 2,
+        }
+    }
+
+    /// What identifies the elements this slice reads, so that
+    /// [`LlamaWeights::footprint`] can count a shared buffer (the tied LM
+    /// head, a clone) once without reading it.
+    fn source_key(&self) -> (usize, usize) {
+        match self {
+            Self::Owned(v) => (Arc::as_ptr(v) as usize, 0),
+            Self::Mapped { map, offset, .. } | Self::Unaligned { map, offset, .. } => {
+                (Arc::as_ptr(map) as usize, *offset)
+            }
+        }
+    }
+
+    /// Whether an unaligned view has already been copied into its aligned
+    /// buffer (always true for the other forms).
+    #[cfg(test)]
+    fn is_materialised(&self) -> bool {
+        match self {
+            Self::Owned(_) | Self::Mapped { .. } => true,
+            Self::Unaligned { cell, .. } => cell.get().is_some(),
+        }
+    }
+}
+
+/// Copy `src` (little-endian bf16 bytes, any alignment) into `dst`.
+fn copy_bf16_bytes(src: &[u8], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len() * 2);
+    // SAFETY: `dst` holds `src.len()` bytes and the ranges do not overlap
+    // (`dst` is a fresh buffer); a u16 accepts every bit pattern.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<u8>(), src.len());
+    }
+    if cfg!(target_endian = "big") {
+        for x in dst {
+            *x = x.swap_bytes();
+        }
     }
 }
 
@@ -518,6 +641,18 @@ impl std::ops::Deref for Bf16Slice {
                 assert!(head.is_empty() && tail.is_empty());
                 mid
             }
+            // The one copy an unaligned view makes, of exactly the
+            // elements it spans, kept for every read after this one.
+            Self::Unaligned {
+                map,
+                offset,
+                len,
+                cell,
+            } => cell.get_or_init(|| {
+                let mut v: Vec<u16> = vec![0; *len];
+                copy_bf16_bytes(&map[*offset..*offset + *len * 2], &mut v);
+                v
+            }),
         }
     }
 }
@@ -528,6 +663,9 @@ impl std::fmt::Debug for Bf16Slice {
             Self::Owned(v) => write!(f, "Bf16Slice::Owned({} elements)", v.len()),
             Self::Mapped { offset, len, .. } => {
                 write!(f, "Bf16Slice::Mapped({len} elements at byte {offset})")
+            }
+            Self::Unaligned { offset, len, .. } => {
+                write!(f, "Bf16Slice::Unaligned({len} elements at byte {offset})")
             }
         }
     }
@@ -602,22 +740,24 @@ impl LlamaWeights {
     }
 
     /// Bytes of bf16 weights viewed in place in the mapped checkpoint
-    /// files and bytes held in owned buffers (converted, scaled or split
-    /// copies; a tied head counts once).
+    /// files and bytes held in buffers of their own (converted, scaled or
+    /// split copies, and unaligned views, which are copied when they are
+    /// read; a tied head counts once). Reads no weights, so asking does
+    /// not itself make an unaligned view copy.
     #[must_use]
     pub fn footprint(&self) -> (usize, usize) {
         let (mut mapped, mut owned) = (0, 0);
-        let mut seen: Vec<*const u16> = Vec::new();
+        let mut seen: Vec<(usize, usize)> = Vec::new();
         for m in self.matrices() {
-            let p = m.as_ptr();
-            if seen.contains(&p) {
+            let k = m.source_key();
+            if seen.contains(&k) {
                 continue;
             }
-            seen.push(p);
+            seen.push(k);
             if m.is_mapped() {
                 mapped += m.len() * 2;
             } else {
-                owned += m.len() * 2;
+                owned += m.owned_bytes();
             }
         }
         (mapped, owned)
@@ -633,8 +773,15 @@ impl LlamaWeights {
     /// row by row while they are uploaded), the biases and the OLMo-2
     /// full-width q/k gains are sliced the same way, and the norms, the
     /// embedding and the LM head are shared. Nothing is copied for a bf16
-    /// checkpoint. `cfg` is the unsharded config; the shard's config is
-    /// [`LlamaConfig::shard`].
+    /// checkpoint whose tensors are 2-aligned. `cfg` is the unsharded
+    /// config; the shard's config is [`LlamaConfig::shard`].
+    ///
+    /// A tensor at an odd data offset cannot be viewed in place
+    /// ([`Bf16Slice::Unaligned`]): its row block is copied when it is
+    /// read, and its column block is gathered here (`wo_pitch` /
+    /// `wd_pitch` 0, as with `RENG_SHARD_GATHER`) rather than left as a
+    /// strided view whose read would copy the whole row range. Either way
+    /// a rank copies `1 / world` of such a tensor, once.
     ///
     /// # Panics
     ///
@@ -650,25 +797,27 @@ impl LlamaWeights {
             assert_eq!(m.len(), all_rows * cols, "matrix shape");
             m.sub(rank * part * cols, part * cols)
         };
-        // The column window `rank * part ..` of every row, as the view
-        // from the first row's window to the end of the last row's; or,
-        // with diagnostic `RENG_SHARD_GATHER`, gathered into an owned
-        // contiguous copy (the loader's earlier form, kept to measure the
-        // strided view against).
+        // The column window `rank * part ..` of every row and the row
+        // pitch that goes with it: the view from the first row's window to
+        // the end of the last row's, with the full width as its pitch,
+        // where the elements can be read in place; or the window gathered
+        // into an owned contiguous copy with pitch 0, where they cannot
+        // (an odd data offset, an owned buffer) or with diagnostic
+        // `RENG_SHARD_GATHER` (the loader's earlier form, kept to measure
+        // the strided view against).
         let gather = std::env::var_os("RENG_SHARD_GATHER").is_some();
-        let cols = |m: &Bf16Slice, out_rows: usize, all_cols: usize, part: usize| -> Bf16Slice {
-            assert_eq!(m.len(), out_rows * all_cols, "matrix shape");
-            if gather {
-                let mut v = Vec::with_capacity(out_rows * part);
-                for r in 0..out_rows {
-                    let base = r * all_cols + rank * part;
-                    v.extend_from_slice(&m[base..base + part]);
+        let cols =
+            |m: &Bf16Slice, out_rows: usize, all_cols: usize, part: usize| -> (Bf16Slice, usize) {
+                assert_eq!(m.len(), out_rows * all_cols, "matrix shape");
+                if gather || !m.is_mapped() {
+                    (m.column_block(out_rows, all_cols, rank * part, part), 0)
+                } else {
+                    (
+                        m.sub(rank * part, (out_rows - 1) * all_cols + part),
+                        all_cols,
+                    )
                 }
-                return Bf16Slice::from(v);
-            }
-            m.sub(rank * part, (out_rows - 1) * all_cols + part)
-        };
-        let pitch = |all_cols: usize| if gather { 0 } else { all_cols };
+            };
         let vec_part = |v: &[f32], all: usize, part: usize| -> Vec<f32> {
             if v.is_empty() {
                 return Vec::new();
@@ -679,35 +828,40 @@ impl LlamaWeights {
         let layers = self
             .layers
             .iter()
-            .map(|l| LayerTensors {
-                g1: l.g1.clone(),
-                g2: l.g2.clone(),
-                g_post_attn: l.g_post_attn.clone(),
-                g_post_mlp: l.g_post_mlp.clone(),
-                wq: rows(&l.wq, q_all, q_rows, h),
-                wk: rows(&l.wk, kv_all, kv_rows, h),
-                wv: rows(&l.wv, kv_all, kv_rows, h),
-                wo: cols(&l.wo, h, q_all, q_rows),
-                wo_pitch: pitch(q_all),
-                bq: vec_part(&l.bq, q_all, q_rows),
-                bk: vec_part(&l.bk, kv_all, kv_rows),
-                bv: vec_part(&l.bv, kv_all, kv_rows),
-                // Per-head gains (length head_dim) are the same for every
-                // head; full-width gains follow the projection rows.
-                qn: if l.qn.len() == q_all && q_all != hd {
-                    vec_part(&l.qn, q_all, q_rows)
-                } else {
-                    l.qn.clone()
-                },
-                kn: if l.kn.len() == kv_all && kv_all != hd {
-                    vec_part(&l.kn, kv_all, kv_rows)
-                } else {
-                    l.kn.clone()
-                },
-                wg: rows(&l.wg, i_all, i_rows, h),
-                wu: rows(&l.wu, i_all, i_rows, h),
-                wd: cols(&l.wd, h, i_all, i_rows),
-                wd_pitch: pitch(i_all),
+            .map(|l| {
+                let (wo, wo_pitch) = cols(&l.wo, h, q_all, q_rows);
+                let (wd, wd_pitch) = cols(&l.wd, h, i_all, i_rows);
+                LayerTensors {
+                    g1: l.g1.clone(),
+                    g2: l.g2.clone(),
+                    g_post_attn: l.g_post_attn.clone(),
+                    g_post_mlp: l.g_post_mlp.clone(),
+                    wq: rows(&l.wq, q_all, q_rows, h),
+                    wk: rows(&l.wk, kv_all, kv_rows, h),
+                    wv: rows(&l.wv, kv_all, kv_rows, h),
+                    wo,
+                    wo_pitch,
+                    bq: vec_part(&l.bq, q_all, q_rows),
+                    bk: vec_part(&l.bk, kv_all, kv_rows),
+                    bv: vec_part(&l.bv, kv_all, kv_rows),
+                    // Per-head gains (length head_dim) are the same for
+                    // every head; full-width gains follow the projection
+                    // rows.
+                    qn: if l.qn.len() == q_all && q_all != hd {
+                        vec_part(&l.qn, q_all, q_rows)
+                    } else {
+                        l.qn.clone()
+                    },
+                    kn: if l.kn.len() == kv_all && kv_all != hd {
+                        vec_part(&l.kn, kv_all, kv_rows)
+                    } else {
+                        l.kn.clone()
+                    },
+                    wg: rows(&l.wg, i_all, i_rows, h),
+                    wu: rows(&l.wu, i_all, i_rows, h),
+                    wd,
+                    wd_pitch,
+                }
             })
             .collect();
         Self {
@@ -1963,11 +2117,17 @@ mod tests {
         assert_eq!(&part[..], &a[1..3]);
         // A clone shares the data (a tied LM head costs nothing).
         assert_eq!(va.clone().as_ptr(), va.as_ptr());
-        // An odd data offset cannot be viewed as u16: converted copy.
+        // An odd data offset cannot be viewed as u16: an unaligned view
+        // that copies its elements the first time it is read, and not
+        // before.
         let (vc, shape) = tensor_bf16(src, "c").unwrap();
         assert_eq!(shape, [2]);
         assert!(!vc.is_mapped());
+        assert!(!vc.is_materialised());
+        assert_eq!(vc.len(), 2);
+        assert_eq!(vc.owned_bytes(), 4);
         assert_eq!(&vc[..], &c[..]);
+        assert!(vc.is_materialised());
         // f32 tensors are converted (and readable as f32 too).
         let (vd, _) = tensor_bf16(src, "d").unwrap();
         assert!(!vd.is_mapped());
@@ -1982,6 +2142,191 @@ mod tests {
             format!("{va:?}"),
             "Bf16Slice::Mapped(6 elements at byte 232)"
         );
+        assert_eq!(
+            format!("{vc:?}"),
+            "Bf16Slice::Unaligned(2 elements at byte 245)"
+        );
+    }
+
+    /// A safetensors file holding `mats` in the order given, each a bf16
+    /// matrix; a one-byte `U8` tensor is inserted before one whose flag
+    /// asks for an odd data offset (the header is padded to eight bytes
+    /// but the tensors inside it are not padded at all, which is how 94
+    /// tensors of the 70B distill come to start on an odd byte).
+    fn write_matrices(path: &Path, mats: &[(&str, &[usize], &[u16], bool)]) {
+        let mut data: Vec<u8> = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        for (name, shape, v, odd) in mats {
+            if *odd != (data.len() % 2 == 1) {
+                let at = data.len();
+                data.push(0);
+                parts.push(format!(
+                    "\"pad.{name}\":{{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[{at},{}]}}",
+                    data.len()
+                ));
+            }
+            let at = data.len();
+            for x in *v {
+                data.extend_from_slice(&x.to_le_bytes());
+            }
+            let dims: Vec<String> = shape.iter().map(ToString::to_string).collect();
+            parts.push(format!(
+                "\"{name}\":{{\"dtype\":\"BF16\",\"shape\":[{}],\"data_offsets\":[{at},{}]}}",
+                dims.join(","),
+                data.len()
+            ));
+        }
+        let mut header = format!("{{{}}}", parts.join(","));
+        while header.len() % 8 != 0 {
+            header.push(' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A shard of a checkpoint whose tensors start on an odd byte copies
+    /// its own rows and column block, once, and never the whole tensor.
+    #[test]
+    fn shard_of_odd_offset_tensors_copies_only_its_own_block() {
+        // hidden 4, 2 heads of head_dim 2, 2 kv heads, intermediate 4.
+        let cfg: LlamaConfig = serde_json::from_str(
+            r#"{"hidden_size": 4, "intermediate_size": 4, "num_hidden_layers": 1,
+                "num_attention_heads": 2, "num_key_value_heads": 2, "rms_norm_eps": 1e-6,
+                "vocab_size": 8, "tie_word_embeddings": true}"#,
+        )
+        .unwrap();
+        // Every matrix is [4, 4] and the embedding [8, 4]; the flag says
+        // whether the tensor starts on an odd byte.
+        let m: Vec<u16> = (0..16).collect();
+        let e: Vec<u16> = (100..132).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        write_matrices(
+            &path,
+            &[
+                ("embed", &[8, 4], &e, false),
+                ("wq", &[4, 4], &m, true),
+                ("wk", &[4, 4], &m, false),
+                ("wv", &[4, 4], &m, true),
+                ("wo", &[4, 4], &m, true),
+                ("wg", &[4, 4], &m, false),
+                ("wu", &[4, 4], &m, true),
+                ("wd", &[4, 4], &m, false),
+            ],
+        );
+        let map = map_file(&path).unwrap();
+        let st = SafeTensors::deserialize(&map).unwrap();
+        let src = Src { map: &map, st: &st };
+        let t = |n: &str| tensor_bf16(src, n).unwrap().0;
+        let embed = t("embed");
+        let full = LlamaWeights {
+            embed: embed.clone(),
+            layers: vec![LayerTensors {
+                g1: vec![1.0; 4],
+                g2: vec![1.0; 4],
+                g_post_attn: Vec::new(),
+                g_post_mlp: Vec::new(),
+                wq: t("wq"),
+                wk: t("wk"),
+                wv: t("wv"),
+                wo: t("wo"),
+                wo_pitch: 0,
+                bq: Vec::new(),
+                bk: Vec::new(),
+                bv: Vec::new(),
+                qn: Vec::new(),
+                kn: Vec::new(),
+                wg: t("wg"),
+                wu: t("wu"),
+                wd: t("wd"),
+                wd_pitch: 0,
+            }],
+            final_gamma: vec![1.0; 4],
+            // Tied: the same view, counted once by `footprint`.
+            lm_head: embed,
+        };
+        let l0 = &full.layers[0];
+        assert!(!l0.wq.is_mapped() && !l0.wo.is_mapped());
+        assert!(l0.wk.is_mapped() && l0.wd.is_mapped());
+        let s1 = full.shard(&cfg, 1, 2);
+        let l = &s1.layers[0];
+
+        // The unaligned tensors of the full model are still not copied:
+        // the shard narrowed them first.
+        assert!(!l0.wq.is_materialised() && !l0.wo.is_materialised());
+        // Rank 1's rows of q: elements 8..16, copied when they are read
+        // and only then, and only those eight.
+        assert!(!l.wq.is_materialised());
+        assert_eq!(l.wq.len(), 8);
+        assert_eq!(&l.wq[..], &m[8..]);
+        assert!(l.wq.is_materialised());
+        assert_eq!(l.wq.owned_bytes(), 16);
+        // Rank 1's columns of o, gathered into its own block rather than
+        // left as a strided view over the whole row range.
+        assert_eq!((l.wo_pitch, l.wo.len()), (0, 8));
+        assert_eq!(&l.wo[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
+        assert_eq!(l.wo.owned_bytes(), 16);
+        // The 2-aligned tensors are unchanged: a row view and a strided
+        // column view, neither of them copied.
+        assert!(l.wk.is_mapped() && l.wd.is_mapped());
+        assert_eq!((l.wk.owned_bytes(), l.wd.owned_bytes()), (0, 0));
+        assert_eq!(&l.wk[..], &m[8..]);
+        assert_eq!((l.wd_pitch, l.wd.len()), (4, 14));
+        assert_eq!(
+            reng_synapse::gather_columns(
+                &l.wd,
+                reng_synapse::Stride {
+                    rows: 4,
+                    cols: 2,
+                    pitch: 4,
+                }
+            ),
+            [2u16, 3, 6, 7, 10, 11, 14, 15]
+        );
+        // What the rank holds in buffers of its own: the four unaligned
+        // matrices' halves, 8 elements each, and nothing more. Viewed in
+        // place: the embedding (once, the head is tied), the two row
+        // views of 8 elements and the strided column view of 14.
+        assert_eq!(s1.footprint(), (64 + 16 + 16 + 28, 4 * 16));
+        // Rank 0 is the other half of the same tensors.
+        let s0 = full.shard(&cfg, 0, 2);
+        assert_eq!(&s0.layers[0].wq[..], &m[..8]);
+        assert_eq!(&s0.layers[0].wo[..], &[0u16, 1, 4, 5, 8, 9, 12, 13]);
+        assert_eq!(s0.footprint(), s1.footprint());
+    }
+
+    /// A column block reads the window and nothing else, whatever the
+    /// slice it comes from.
+    #[test]
+    fn column_block_gathers_from_every_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let m: Vec<u16> = (0..12).collect();
+        write_matrices(
+            &path,
+            &[("odd", &[3, 4], &m, true), ("even", &[3, 4], &m, false)],
+        );
+        let map = map_file(&path).unwrap();
+        let st = SafeTensors::deserialize(&map).unwrap();
+        let src = Src { map: &map, st: &st };
+        let want = [1u16, 2, 5, 6, 9, 10];
+        for name in ["odd", "even"] {
+            let v = tensor_bf16(src, name).unwrap().0;
+            let b = v.column_block(3, 4, 1, 2);
+            assert_eq!(&b[..], &want, "{name}");
+            assert_eq!(b.owned_bytes(), 12);
+        }
+        let owned = Bf16Slice::from(m.clone());
+        assert_eq!(&owned.column_block(3, 4, 1, 2)[..], &want);
+        // A sub-view of an unaligned tensor is itself unaligned, and a
+        // column block of it reads the right window.
+        let odd = tensor_bf16(src, "odd").unwrap().0;
+        let tail = odd.sub(4, 8);
+        assert!(!tail.is_materialised());
+        assert_eq!(&tail.column_block(2, 4, 2, 2)[..], &[6u16, 7, 10, 11]);
+        assert!(!tail.is_materialised());
     }
 
     #[test]
@@ -2069,23 +2414,15 @@ mod tests {
             &(8..16).map(|i| i as u16).collect::<Vec<u16>>()[..]
         );
         assert_eq!(l.bq, vec![2.0, 3.0]);
-        // o keeps columns 2..4 of every row: 2,3, 6,7, 10,11, 14,15, as a
-        // strided view from element 2 to the end with the full width as
-        // its pitch.
-        let window = reng_synapse::Stride {
-            rows: 4,
-            cols: 2,
-            pitch: 4,
-        };
-        assert_eq!((l.wo_pitch, l.wo.len()), (4, 14));
-        assert_eq!(
-            reng_synapse::gather_columns(&l.wo, window),
-            [2u16, 3, 6, 7, 10, 11, 14, 15]
-        );
-        assert_eq!(
-            reng_synapse::gather_columns(&l.wd, window),
-            [2u16, 3, 6, 7, 10, 11, 14, 15]
-        );
+        // o keeps columns 2..4 of every row: 2,3, 6,7, 10,11, 14,15.
+        // These matrices are owned buffers, not views of a mapped file,
+        // so the block is gathered (pitch 0) rather than left strided;
+        // `shard_of_odd_offset_tensors_copies_only_its_own_block` covers
+        // both forms.
+        assert_eq!((l.wo_pitch, l.wo.len()), (0, 8));
+        assert_eq!(&l.wo[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
+        assert_eq!((l.wd_pitch, l.wd.len()), (0, 8));
+        assert_eq!(&l.wd[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
         assert_eq!(l.wg.len(), 8);
         assert_eq!(
             &l.wg[..],

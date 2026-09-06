@@ -17,6 +17,9 @@ link-synapse = []
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [[bin]]
 name = "reng-hello-mme"
 path = "src/bin/hello_mme.rs"

@@ -360,7 +360,9 @@ Every model in the benchmark table fits one card (Qwen2.5-32B occupies
 parallelism over HCCL: `reng-tp` spawns one worker process per card
 (`--modules 4,1`), each holding its Megatron shard of every layer
 (`LlamaConfig::shard` / `LlamaWeights::shard`; the o/down column blocks
-stay mapped views uploaded through a strided path) and a replica of the
+stay mapped views uploaded through a strided path, and a tensor whose
+data offset is not 2-aligned, which cannot be viewed at all, is copied
+only where the rank's own rows and columns fall) and a replica of the
 norms, embedding and LM head. A layer is two recipes with an f32
 all-reduce after `o_proj` and after `down_proj`, all enqueued on the
 rank's one stream without host synchronisation; the recipes are compiled
@@ -372,14 +374,27 @@ reference file). A sequence is prefilled once, from position 0: the wide
 prefill recipe's ScatterND is out of place, so its blocks alternate
 between the sequence's cache slot and a shared scratch buffer, and a
 second prefill onto a non-empty sequence is rejected rather than silently
-overwriting the keys already there.
+overwriting the keys already there. With `--batch B` every sequence's ids
+are compared across the ranks, not sequence 0's alone.
+
+The coordinator pins the interface HCCL uses for its sideband TCP
+connections (`HCCL_SOCKET_IFNAME`): `--ifname <nic>`, or an inherited
+setting, or the interface carrying the default route. The library's own
+default is the first interface whose name is not `lo` or `docker`, which
+on this box is the BMC's virtual NIC. `--timeout <s>` bounds the run and
+the workers' waits for the coordinator's `go` and for rank 0's unique id.
+The hand-shake directory (`$TMPDIR/reng-tp-<pid>-<attempt>`) is removed
+when the run ends, however it ends, and a stale one from a reused pid is
+removed rather than joined.
 
 No rank outlives its coordinator holding a card. A watchdog thread in
 each worker polls the hand-shake directory's `abort` file and its own
 parent id; on either it calls `hcclCommAbort` and leaves through `_exit`,
 and the coordinator writes `abort` and waits out a grace period before it
-kills anything. Ctrl-C on a two-card 8B decode has both workers gone and
-both cards free within 15 s.
+kills anything. Ctrl-C is caught rather than fatal: the coordinator asks
+the ranks to abort, reaps them, removes the hand-shake directory and
+leaves with 130 (a second Ctrl-C leaves at once). Ctrl-C on a two-card 8B
+decode has both workers gone and both cards free within 15 s.
 
 DeepSeek-R1-Distill-Llama-70B (141 GB bf16) on two cards reproduces its
 f32 reference 8/8 exact (free-running and teacher-forced) and decodes at

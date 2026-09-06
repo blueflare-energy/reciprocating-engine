@@ -6,7 +6,7 @@
 //! `[r<rank>]` prefixes, and checks that every rank produced the same ids
 //! (each rank computes the argmax after the last all-reduce, so they must).
 //!
-//! `reng-tp <model_dir> <n_new> [<id> ...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]`
+//! `reng-tp <model_dir> <n_new> [<id> ...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--ifname <nic>] [--no-numa]`
 //!
 //! The prompt is the trailing ids, or `--prompt-file <json>`: the
 //! `"prompt"` array of a `generate.py` reference file (any trailing ids
@@ -18,17 +18,35 @@
 //! ref[..i]`; a mismatch within `--margin` logits of the reference's best
 //! is a near-tie, not a failure). With `--batch B` every sequence of the
 //! batch gets the prompt and advances in lockstep (the batched decode
-//! form); the ids reported are sequence 0's. With `--bench <tokens>`
+//! form); the ids reported are sequence 0's, and every sequence's ids
+//! are written and compared across the ranks. With `--bench <tokens>`
 //! every rank then times that many decode steps in the four modes of
 //! `reng_synapse::tp::Mode` and rank 0 reports the per-layer split
 //! (recipe A, the all-reduces, recipe B) that the differences give. One
 //! module id runs the same graphs on one card without a communicator.
 //!
+//! `--timeout <s>` (3600 by default) bounds the whole run, the workers'
+//! wait for `go` and their wait for rank 0's unique id. `--ifname <nic>`
+//! is the interface HCCL binds its sideband TCP connections to
+//! (`HCCL_SOCKET_IFNAME`, which the coordinator sets for every worker);
+//! without it the coordinator keeps an inherited `HCCL_SOCKET_IFNAME`, or
+//! else picks the interface carrying the default route
+//! (`reng_synapse::hccl::pick_ifname`), because the library's own default
+//! is the first interface whose name is not `lo` or `docker`, which on
+//! this box is the BMC's virtual NIC.
+//!
+//! The hand-shake directory is `$TMPDIR/reng-tp-<pid>-<attempt>`. It is
+//! removed when the run ends, however it ends (`RENG_TP_KEEP_DIR` keeps
+//! it), and one left behind by an earlier run whose pid was reused is
+//! detected and removed rather than joined.
+//!
 //! Worker (spawned by the coordinator; the same binary):
 //! `reng-tp --rank r --world n --module m --dir DIR <the coordinator's arguments>`
 
 use reng_model::{LlamaConfig, TpGenerator, load_weights};
-use reng_synapse::hccl::{EXIT_ACQUIRE, Group, Rank, abort_and_die};
+use reng_synapse::hccl::{
+    EXIT_ACQUIRE, Group, Rank, abort_and_die, catch_signals, default_ifname, interrupted,
+};
 use reng_synapse::tp::{Mode, rss_bytes};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -37,6 +55,9 @@ const DEFAULT_MARGIN: f32 = 0.5;
 const DEFAULT_ROWS: usize = 256;
 const DEFAULT_CAPACITY: usize = 1024;
 const DEFAULT_TIMEOUT_S: u64 = 3600;
+/// Exit code of a coordinator stopped by SIGINT or SIGTERM (128 + SIGINT,
+/// the shell's convention).
+const EXIT_INTERRUPTED: i32 = 130;
 
 #[derive(serde::Deserialize)]
 struct RefStep {
@@ -83,6 +104,9 @@ struct Opts {
     bench: usize,
     out_path: Option<String>,
     timeout_s: u64,
+    /// `HCCL_SOCKET_IFNAME` for the workers; `None` leaves the choice to
+    /// [`coordinate`].
+    ifname: Option<String>,
     numa: bool,
     /// Worker mode.
     rank: Option<usize>,
@@ -95,7 +119,7 @@ struct Opts {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: reng-tp <model_dir> <n_new> [<id>...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--no-numa]"
+        "usage: reng-tp <model_dir> <n_new> [<id>...] --modules 4,1 [--prompt-file <json>] [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--capacity <n>] [--batch <n>] [--bench <tokens>] [--out <out.json>] [--timeout <s>] [--ifname <nic>] [--no-numa]"
     );
     std::process::exit(2)
 }
@@ -117,6 +141,7 @@ fn parse() -> Opts {
         bench: 0,
         out_path: None,
         timeout_s: DEFAULT_TIMEOUT_S,
+        ifname: None,
         numa: true,
         rank: None,
         world: 0,
@@ -147,6 +172,7 @@ fn parse() -> Opts {
             "--bench" => o.bench = num(&value(&mut i)),
             "--out" => o.out_path = Some(value(&mut i)),
             "--timeout" => o.timeout_s = value(&mut i).parse().unwrap_or_else(|_| usage()),
+            "--ifname" => o.ifname = Some(value(&mut i)),
             "--no-numa" => o.numa = false,
             "--rank" => o.rank = Some(num(&value(&mut i))),
             "--world" => o.world = num(&value(&mut i)),
@@ -172,11 +198,13 @@ fn parse() -> Opts {
         usage();
     }
     // The workers get everything but the coordinator-only options.
+    // `--timeout` is not one of them: it bounds the workers' waits for
+    // `go` and for the unique id too.
     let mut fwd = Vec::new();
     let mut j = 0;
     while j < raw.len() {
         match raw[j].as_str() {
-            "--modules" | "--timeout" => j += 2,
+            "--modules" | "--ifname" => j += 2,
             "--no-numa" => j += 1,
             _ => {
                 fwd.push(raw[j].clone());
@@ -274,13 +302,23 @@ fn worker(o: &Opts, rank: usize) -> reng_core::Result<()> {
     if o.world == 0 {
         usage();
     }
+    // A SIGINT reaches every process of the terminal's group: leave
+    // through `hcclCommAbort` (the watchdog polls the flag) rather than
+    // dying inside a collective.
+    catch_signals();
     let reference = o.ref_path.as_deref().map(load_reference).transpose()?;
     let n_new = match &reference {
         Some(r) => o.n_new.min(r.generated.len()),
         None => o.n_new,
     };
     let t_start = Instant::now();
-    let joined = Rank::join(rank, o.world, o.module, dir)?;
+    let joined = Rank::join(
+        rank,
+        o.world,
+        o.module,
+        dir,
+        Duration::from_secs(o.timeout_s),
+    )?;
     let t_join = t_start.elapsed().as_secs_f64();
 
     let model_dir = Path::new(&o.dir);
@@ -348,23 +386,29 @@ fn generate_and_check(
     t_start: Instant,
 ) -> reng_core::Result<()> {
     let nb = o.batch;
-    let mut generated: Vec<u32> = Vec::with_capacity(n_new);
+    // One id list per sequence of the batch: the ids reported and checked
+    // against the reference are sequence 0's, and every sequence's are
+    // written for the coordinator to compare across the ranks.
+    let mut generated: Vec<Vec<u32>> = vec![Vec::with_capacity(n_new); nb];
     let mut step_ms: Vec<f64> = Vec::with_capacity(n_new);
     let mut near_ties = 0usize;
     let mut failures: Vec<String> = Vec::new();
     let t2 = Instant::now();
-    // Every sequence gets the prompt; the ids reported are sequence 0's.
-    let mut first = 0;
+    // Every sequence gets the prompt.
+    let mut firsts: Vec<u32> = Vec::with_capacity(nb);
     for b in 0..nb {
-        first = g.prefill(b, &o.ids)?;
+        firsts.push(g.prefill(b, &o.ids)?);
     }
+    let first = firsts[0];
     let ms = t2.elapsed().as_secs_f64() * 1e3 / nb as f64;
     println!(
         "rank {rank}: first token {:.2} s after start",
         t_start.elapsed().as_secs_f64()
     );
     let quiet = rank != 0;
-    generated.push(first);
+    for (b, &id) in firsts.iter().enumerate() {
+        generated[b].push(id);
+    }
     step_ms.push(ms);
     match reference {
         Some(r) => {
@@ -378,7 +422,9 @@ fn generate_and_check(
                 if !quiet {
                     verdict(r, step, ids[0], o.margin, ms, &mut near_ties, &mut failures);
                 }
-                generated.push(ids[0]);
+                for (b, seq) in generated.iter_mut().enumerate() {
+                    seq.push(ids[b]);
+                }
                 step_ms.push(ms);
             }
         }
@@ -388,14 +434,16 @@ fn generate_and_check(
             }
             if n_new > 1 {
                 let t = Instant::now();
-                let (ids, times) = g.generate(&vec![first; nb], n_new - 1)?;
+                let (ids, times) = g.generate(&firsts, n_new - 1)?;
                 let per = t.elapsed().as_secs_f64() * 1e3 / (n_new - 1) as f64;
                 for k in 0..n_new - 1 {
                     let id = ids[k * nb];
                     if !quiet {
                         println!("step {}: next id {id}  ({per:.1} ms, device loop)", k + 1);
                     }
-                    generated.push(id);
+                    for (b, seq) in generated.iter_mut().enumerate() {
+                        seq.push(ids[k * nb + b]);
+                    }
                     step_ms.push(per);
                 }
                 if !quiet {
@@ -409,10 +457,16 @@ fn generate_and_check(
             }
         }
     }
-    println!("rank {rank}: generated ids: {generated:?}");
+    println!("rank {rank}: generated ids: {:?}", generated[0]);
+    if nb > 1 {
+        let same = generated.iter().filter(|s| **s == generated[0]).count();
+        println!("rank {rank}: {same} of {nb} sequences produced sequence 0's ids");
+    }
     let ids_json = serde_json::json!({
         "prompt": &o.ids,
-        "generated": generated,
+        "generated": generated[0],
+        "sequences": generated,
+        "batch": nb,
         "teacher_forced": reference.is_some(),
         "step_ms": step_ms,
     });
@@ -424,7 +478,7 @@ fn generate_and_check(
 
     if let Some(r) = reference {
         if !quiet {
-            let exact = generated
+            let exact = generated[0]
                 .iter()
                 .zip(&r.generated)
                 .filter(|(a, b)| a == b)
@@ -501,6 +555,96 @@ fn bench(g: &mut TpGenerator<'_>, o: &Opts, rank: usize) -> reng_core::Result<()
     Ok(())
 }
 
+/// Every sequence's ids as a rank wrote them: the `sequences` array of
+/// its `rank<r>.ids`, or its single `generated` list (one sequence).
+fn rank_sequences(v: &serde_json::Value) -> Vec<Vec<u32>> {
+    let list = |x: &serde_json::Value| -> Vec<u32> {
+        x.as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|i| u32::try_from(i.as_u64().unwrap_or(u64::MAX)).unwrap_or(u32::MAX))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match v.get("sequences").and_then(|s| s.as_array()) {
+        Some(a) => a.iter().map(list).collect(),
+        None => vec![list(v.get("generated").unwrap_or(&serde_json::Value::Null))],
+    }
+}
+
+/// Compare every rank's sequences with rank 0's, the check that each rank
+/// computes the same argmax after the last all-reduce rests on. Returns
+/// whether they all agree and the lines to print (the first sequence that
+/// differs, not just the first rank).
+fn compare_ranks(ids: &[Option<serde_json::Value>]) -> (bool, Vec<String>) {
+    let mut out: Vec<String> = Vec::new();
+    let Some(v0) = ids.first().and_then(Option::as_ref) else {
+        out.push(String::from("coordinator: rank 0 produced no ids"));
+        return (false, out);
+    };
+    let s0 = rank_sequences(v0);
+    out.push(format!(
+        "generated ids: {:?}",
+        s0.first().cloned().unwrap_or_default()
+    ));
+    let mut ok = true;
+    for (r, v) in ids.iter().enumerate().skip(1) {
+        let Some(v) = v else {
+            out.push(format!("coordinator: rank {r} produced no ids"));
+            ok = false;
+            continue;
+        };
+        let s = rank_sequences(v);
+        if s == s0 {
+            continue;
+        }
+        ok = false;
+        if s.len() == s0.len() {
+            let b = (0..s.len()).find(|&b| s[b] != s0[b]).unwrap_or(0);
+            out.push(format!(
+                "coordinator: rank {r} DISAGREES on sequence {b} of {}: {:?} against rank 0's {:?}",
+                s.len(),
+                s[b],
+                s0[b]
+            ));
+        } else {
+            out.push(format!(
+                "coordinator: rank {r} wrote {} sequences, rank 0 wrote {}",
+                s.len(),
+                s0.len()
+            ));
+        }
+    }
+    if ok {
+        out.push(format!(
+            "coordinator: all {} ranks agree ({} sequence{} of {} ids)",
+            ids.len(),
+            s0.len(),
+            if s0.len() == 1 { "" } else { "s" },
+            s0.first().map_or(0, Vec::len)
+        ));
+    }
+    (ok, out)
+}
+
+/// The interface to give the workers as `HCCL_SOCKET_IFNAME`, and where
+/// it came from: `--ifname`, an inherited setting, or the interface of
+/// the default route. `None` leaves the variable unset, which is HCCL's
+/// own enumeration (the trap this exists to avoid).
+fn ifname_for_workers(explicit: Option<&str>) -> (Option<String>, &'static str) {
+    if let Some(n) = explicit {
+        return (Some(n.to_owned()), "--ifname");
+    }
+    if let Some(n) = std::env::var_os("HCCL_SOCKET_IFNAME") {
+        let n = n.to_string_lossy().into_owned();
+        if !n.is_empty() {
+            return (Some(n), "inherited HCCL_SOCKET_IFNAME");
+        }
+    }
+    (default_ifname(), "the default route")
+}
+
 /// Spawn the ranks, wait for them, and compare their ids.
 fn coordinate(o: &Opts) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|e| {
@@ -513,9 +657,20 @@ fn coordinate(o: &Opts) -> i32 {
         format!("{:?}", o.ids)
     };
     println!(
-        "coordinator: modules {:?} (rank order), model {}, {} new tokens, prompt {prompt}, rows {}, capacity {}, timeout {} s",
-        o.modules, o.dir, o.n_new, o.rows, o.capacity, o.timeout_s
+        "coordinator: modules {:?} (rank order), model {}, {} new tokens, prompt {prompt}, rows {}, capacity {}, batch {}, timeout {} s",
+        o.modules, o.dir, o.n_new, o.rows, o.capacity, o.batch, o.timeout_s
     );
+    let (ifname, whence) = ifname_for_workers(o.ifname.as_deref());
+    match &ifname {
+        Some(n) => println!("coordinator: HCCL_SOCKET_IFNAME={n} (from {whence})"),
+        None => println!(
+            "coordinator: no interface to pin; leaving HCCL_SOCKET_IFNAME to the library's enumeration"
+        ),
+    }
+    // A SIGINT or SIGTERM now stops the group through the abort file and
+    // takes the hand-shake directory with it, instead of leaving two
+    // workers on their cards.
+    catch_signals();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(o.timeout_s);
     let max_attempts = 3;
@@ -525,16 +680,21 @@ fn coordinate(o: &Opts) -> i32 {
             "coordinator: attempt {attempt}/{max_attempts}, directory {}",
             dir.display()
         );
-        let mut group = match Group::spawn(&exe, &o.modules, &o.raw, &dir, o.numa) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("{e}");
-                return 2;
-            }
-        };
+        let mut group =
+            match Group::spawn(&exe, &o.modules, &o.raw, &dir, o.numa, ifname.as_deref()) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return 2;
+                }
+            };
         if !group.wait_acquired(deadline) {
             let codes = group.wait_all(deadline);
             println!("coordinator: acquire phase failed, exit codes {codes:?}");
+            if interrupted() {
+                println!("VERDICT: FAIL (interrupted)");
+                return EXIT_INTERRUPTED;
+            }
             if group.all_exited_with(&[EXIT_ACQUIRE, 0])
                 && attempt < max_attempts
                 && Instant::now() + Duration::from_secs(60) < deadline
@@ -552,7 +712,8 @@ fn coordinate(o: &Opts) -> i32 {
             group.elapsed()
         );
         let mut verdict = if codes.iter().all(|&c| c == 0) { 0 } else { 1 };
-        // Every rank's ids must agree with rank 0's.
+        // Every rank's ids, every sequence of them, must agree with rank
+        // 0's.
         let mut ids: Vec<Option<serde_json::Value>> = Vec::new();
         for r in 0..o.modules.len() {
             let v = std::fs::read_to_string(dir.join(format!("rank{r}.ids")))
@@ -560,43 +721,112 @@ fn coordinate(o: &Opts) -> i32 {
                 .and_then(|s| serde_json::from_str(&s).ok());
             ids.push(v);
         }
-        match &ids[0] {
-            Some(v0) => {
-                let gen0 = v0.get("generated").cloned().unwrap_or_default();
-                println!("generated ids: {gen0}");
-                for (r, v) in ids.iter().enumerate().skip(1) {
-                    match v {
-                        Some(v) if v.get("generated") == Some(&gen0) => {}
-                        Some(v) => {
-                            println!(
-                                "coordinator: rank {r} DISAGREES: {}",
-                                v.get("generated").cloned().unwrap_or_default()
-                            );
-                            verdict = 1;
-                        }
-                        None => {
-                            println!("coordinator: rank {r} produced no ids");
-                            verdict = 1;
-                        }
-                    }
-                }
-                if verdict == 0 {
-                    println!("coordinator: all {} ranks agree", o.modules.len());
-                }
-                if let Some(path) = &o.out_path {
-                    if let Err(e) = std::fs::write(path, v0.to_string()) {
-                        eprintln!("{path}: {e}");
-                        verdict = 1;
-                    }
-                }
-            }
-            None => {
-                println!("coordinator: rank 0 produced no ids");
+        let (agree, lines) = compare_ranks(&ids);
+        for l in lines {
+            println!("{l}");
+        }
+        if !agree {
+            verdict = 1;
+        }
+        if let (Some(Some(v0)), Some(path)) = (ids.first(), &o.out_path) {
+            if let Err(e) = std::fs::write(path, v0.to_string()) {
+                eprintln!("{path}: {e}");
                 verdict = 1;
             }
+        }
+        if interrupted() {
+            println!("VERDICT: FAIL (interrupted)");
+            return EXIT_INTERRUPTED;
         }
         println!("VERDICT: {}", if verdict == 0 { "PASS" } else { "FAIL" });
         return verdict;
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rank_ids(sequences: &[&[u32]]) -> serde_json::Value {
+        serde_json::json!({
+            "prompt": [1, 2, 3],
+            "generated": sequences[0],
+            "sequences": sequences,
+            "batch": sequences.len(),
+            "teacher_forced": false,
+            "step_ms": [1.0],
+        })
+    }
+
+    #[test]
+    fn ranks_agree_when_every_sequence_matches() {
+        let a: &[u32] = &[10, 11, 12];
+        let b: &[u32] = &[20, 21, 22];
+        let r0 = rank_ids(&[a, b, a, b]);
+        let ids = vec![Some(r0.clone()), Some(r0.clone())];
+        let (ok, lines) = compare_ranks(&ids);
+        assert!(ok, "{lines:?}");
+        assert_eq!(lines[0], "generated ids: [10, 11, 12]");
+        assert_eq!(
+            lines[1],
+            "coordinator: all 2 ranks agree (4 sequences of 3 ids)"
+        );
+    }
+
+    #[test]
+    fn a_disagreement_in_any_sequence_is_caught() {
+        let a: &[u32] = &[10, 11, 12];
+        let b: &[u32] = &[20, 21, 22];
+        let c: &[u32] = &[20, 21, 99];
+        // Sequence 0 agrees, so the old check (sequence 0 only) passed
+        // this and every other divergence confined to another slot.
+        let ids = vec![Some(rank_ids(&[a, b, b, b])), Some(rank_ids(&[a, b, c, b]))];
+        let (ok, lines) = compare_ranks(&ids);
+        assert!(!ok);
+        assert_eq!(
+            lines[1],
+            "coordinator: rank 1 DISAGREES on sequence 2 of 4: [20, 21, 99] against rank 0's [20, 21, 22]"
+        );
+        // A rank that wrote nothing, and one that wrote a different batch.
+        let ids = vec![Some(rank_ids(&[a, b])), None];
+        assert!(!compare_ranks(&ids).0);
+        let ids = vec![Some(rank_ids(&[a, b])), Some(rank_ids(&[a]))];
+        let (ok, lines) = compare_ranks(&ids);
+        assert!(!ok);
+        assert_eq!(
+            lines[1],
+            "coordinator: rank 1 wrote 1 sequences, rank 0 wrote 2"
+        );
+        assert!(!compare_ranks(&[]).0);
+        assert!(!compare_ranks(&[None]).0);
+    }
+
+    #[test]
+    fn a_rank_that_wrote_only_generated_counts_as_one_sequence() {
+        let v = serde_json::json!({"generated": [7, 8]});
+        assert_eq!(rank_sequences(&v), vec![vec![7u32, 8]]);
+        let (ok, lines) = compare_ranks(&[Some(v.clone()), Some(v)]);
+        assert!(ok);
+        assert_eq!(
+            lines[1],
+            "coordinator: all 2 ranks agree (1 sequence of 2 ids)"
+        );
+    }
+
+    #[test]
+    fn an_explicit_ifname_wins_and_the_fallback_is_a_real_interface() {
+        assert_eq!(
+            ifname_for_workers(Some("eno1")),
+            (Some(String::from("eno1")), "--ifname")
+        );
+        // Whatever this host offers, it is never the loopback and never
+        // empty; on a host with no interfaces at all it is `None` and the
+        // variable is left unset.
+        let (name, whence) = ifname_for_workers(None);
+        assert!(whence == "the default route" || whence == "inherited HCCL_SOCKET_IFNAME");
+        if let Some(n) = name {
+            assert!(!n.is_empty() && n != "lo", "{n}");
+        }
+    }
 }

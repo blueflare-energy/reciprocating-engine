@@ -27,6 +27,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// How often a wait for a hand-shake file looks again.
+const POLL: Duration = Duration::from_millis(20);
+
+/// The default bound on a worker's waits for the coordinator's `go` and
+/// for rank 0's unique id, when the caller does not give one (the
+/// coordinator's `--timeout`).
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(180);
+
 macro_rules! syn {
     ($call:expr) => {{
         let st = unsafe { $call };
@@ -554,12 +562,25 @@ impl Rank {
     /// communicator; the hand-shake still runs so one coordinator serves
     /// both cases.
     ///
+    /// `timeout` bounds each of the two waits (for `go` and for the
+    /// unique id) and is the coordinator's own `--timeout`, so a peer
+    /// whose acquire is slow does not make an already-acquired rank give
+    /// up first; both waits also end at once when the coordinator writes
+    /// `abort` or goes away.
+    ///
     /// # Errors
     ///
     /// Returns an error whose message starts with `acquire:` when the
-    /// card cannot be acquired (the coordinator relaunches the group),
-    /// and other errors for a failed hand-shake or communicator init.
-    pub fn join(rank: usize, world: usize, module: u32, dir: &Path) -> Result<Self> {
+    /// card cannot be acquired or the acquire barrier does not complete
+    /// (the coordinator relaunches the group), and other errors for a
+    /// failed hand-shake or communicator init.
+    pub fn join(
+        rank: usize,
+        world: usize,
+        module: u32,
+        dir: &Path,
+        timeout: Duration,
+    ) -> Result<Self> {
         assert!(world >= 1 && rank < world, "rank {rank} of {world}");
         let t0 = Instant::now();
         let card = match Card::acquire(module) {
@@ -578,23 +599,7 @@ impl Rank {
             t0.elapsed().as_secs_f64()
         );
         std::fs::write(dir.join(format!("rank{rank}.acquired")), b"ok")?;
-        let ppid = std::os::unix::process::parent_id();
-        let deadline = Instant::now() + Duration::from_secs(180);
-        loop {
-            if dir.join("go").exists() {
-                break;
-            }
-            if dir.join("abort").exists() {
-                return Err(Error::Other("acquire: aborted by coordinator".into()));
-            }
-            if std::os::unix::process::parent_id() != ppid {
-                return Err(Error::Other("the coordinator went away before go".into()));
-            }
-            if Instant::now() > deadline {
-                return Err(Error::Other("no go from the coordinator in 180 s".into()));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_go(dir, std::os::unix::process::parent_id(), timeout)?;
         let comm = if world > 1 {
             let id_path = dir.join("id.bin");
             let id = if rank == 0 {
@@ -604,18 +609,7 @@ impl Rank {
                 std::fs::rename(&tmp, &id_path)?;
                 id
             } else {
-                let deadline = Instant::now() + Duration::from_secs(120);
-                loop {
-                    if let Ok(b) = std::fs::read(&id_path) {
-                        if b.len() == UniqueId::BYTES {
-                            break UniqueId::from_bytes(&b)?;
-                        }
-                    }
-                    if Instant::now() > deadline {
-                        return Err(Error::Other("no unique id from rank 0 in 120 s".into()));
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                wait_for_id(&id_path, timeout)?
             };
             let t1 = Instant::now();
             let comm = Comm::init_rank(world, &id, rank)?;
@@ -655,12 +649,74 @@ impl Rank {
     }
 }
 
+/// Wait for the coordinator's `go` in `dir`: it writes it once every rank
+/// has acquired its card. Ends early with an error when the coordinator
+/// writes `abort` instead, when it goes away (this process is reparented
+/// away from `ppid`), or after `timeout`. Every one of those messages
+/// starts with `acquire:`, so the worker leaves with [`EXIT_ACQUIRE`] and
+/// the coordinator can relaunch the group rather than treating the rank
+/// as a failed run.
+///
+/// # Errors
+///
+/// Returns an error if `go` does not arrive.
+fn wait_for_go(dir: &Path, ppid: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if dir.join("go").exists() {
+            return Ok(());
+        }
+        if dir.join("abort").exists() {
+            return Err(Error::Other("acquire: aborted by coordinator".into()));
+        }
+        if std::os::unix::process::parent_id() != ppid {
+            return Err(Error::Other(
+                "acquire: the coordinator went away before go".into(),
+            ));
+        }
+        if Instant::now() > deadline {
+            return Err(Error::Other(format!(
+                "acquire: no go from the coordinator in {:.0} s",
+                timeout.as_secs_f64()
+            )));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// Wait for rank 0 to leave its unique id at `id_path` (it renames the
+/// file into place, so a short read is a partial write from an earlier
+/// run and is read again).
+///
+/// # Errors
+///
+/// Returns an error if no id of the right size arrives within `timeout`.
+fn wait_for_id(id_path: &Path, timeout: Duration) -> Result<UniqueId> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(b) = std::fs::read(id_path) {
+            if b.len() == UniqueId::BYTES {
+                return UniqueId::from_bytes(&b);
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(Error::Other(format!(
+                "no unique id from rank 0 in {:.0} s",
+                timeout.as_secs_f64()
+            )));
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Watch the coordinator from a background thread: once a rank is
 /// running, nothing else notices that the coordinator asked the group to
 /// stop (`dir/abort`) or died (Ctrl-C, a kill), and a worker that keeps
 /// its card until it finishes on its own is exactly the "already
-/// acquired by PID" condition on a shared box. On either the rank aborts
-/// its communicator and leaves through [`abort_and_die`].
+/// acquired by PID" condition on a shared box. A SIGINT of its own (the
+/// terminal signals the whole process group) counts the same way: the
+/// rank aborts its communicator and leaves through [`abort_and_die`]
+/// rather than dying inside a collective.
 fn watch_coordinator(dir: &Path, rank: usize) {
     use std::io::Write;
     let abort = dir.join("abort");
@@ -669,7 +725,7 @@ fn watch_coordinator(dir: &Path, rank: usize) {
         loop {
             std::thread::sleep(Duration::from_millis(100));
             let orphan = std::os::unix::process::parent_id() != ppid;
-            if !orphan && !abort.exists() {
+            if !orphan && !interrupted() && !abort.exists() {
                 continue;
             }
             // Not `println!`: when the coordinator is gone the pipe is
@@ -680,6 +736,8 @@ fn watch_coordinator(dir: &Path, rank: usize) {
                 "rank {rank}: {}, aborting the communicator and leaving",
                 if orphan {
                     "the coordinator went away"
+                } else if interrupted() {
+                    "interrupted"
                 } else {
                     "the coordinator asked the group to stop"
                 }
@@ -687,6 +745,208 @@ fn watch_coordinator(dir: &Path, rank: usize) {
             abort_and_die(EXIT_ABORTED);
         }
     });
+}
+
+/// One network interface as `/sys/class/net` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Iface {
+    pub name: String,
+    /// `operstate`: `up`, `down`, or `unknown` for an interface whose
+    /// driver does not report one (the BMC's virtual NIC, and `lo`).
+    pub operstate: String,
+    /// `type` 772: the loopback.
+    pub loopback: bool,
+}
+
+impl Iface {
+    /// Whether the interface could carry a connection at all.
+    fn usable(&self) -> bool {
+        !self.loopback && matches!(self.operstate.as_str(), "up" | "unknown")
+    }
+
+    /// How good a guess this interface is when no route names one: a
+    /// reported `up` beats an `unknown`, and a MAC-named USB device (a
+    /// BMC's NIC is one) comes last.
+    fn rank(&self) -> (bool, bool, &str) {
+        (
+            self.operstate != "up",
+            self.name.starts_with("enx"),
+            &self.name,
+        )
+    }
+}
+
+/// Name prefixes of interfaces that are not a way off this host: the
+/// loopback, container and bridge devices, and virtual pairs.
+const VIRTUAL_PREFIXES: [&str; 8] = ["lo", "docker", "veth", "br-", "virbr", "tun", "tap", "vnet"];
+
+/// The interface HCCL should bind its sideband TCP connections to
+/// (`HCCL_SOCKET_IFNAME`), chosen from the kernel's route table and the
+/// interface list: the interface carrying the default route (the route to
+/// a peer on another host, and on this one-host group the interface that
+/// is really wired), and failing
+/// that the best of the interfaces that could carry a connection - not
+/// the loopback, not down, not virtual ([`VIRTUAL_PREFIXES`]), preferring
+/// one that reports `up` over one whose state is `unknown` and any name
+/// over a MAC-named USB device (`enx...`, which is what a BMC's virtual
+/// NIC appears as; it has an address and no gateway, and HCCL's own
+/// default - the first interface whose name is not `lo` or `docker` -
+/// picks it).
+///
+/// `route` is `/proc/net/route`, whose default entry is the one with a
+/// zero destination; ties go to the lowest metric.
+#[must_use]
+pub fn pick_ifname(route: &str, ifaces: &[Iface]) -> Option<String> {
+    let usable = |name: &str| ifaces.iter().any(|i| i.name == name && i.usable());
+    let mut best: Option<(u32, &str)> = None;
+    for line in route.lines().skip(1) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 || f[1] != "00000000" {
+            continue;
+        }
+        let metric: u32 = f[6].parse().unwrap_or(u32::MAX);
+        if usable(f[0]) && best.is_none_or(|(m, _)| metric < m) {
+            best = Some((metric, f[0]));
+        }
+    }
+    if let Some((_, name)) = best {
+        return Some(name.to_owned());
+    }
+    let mut rest: Vec<&Iface> = ifaces
+        .iter()
+        .filter(|i| i.usable() && !VIRTUAL_PREFIXES.iter().any(|p| i.name.starts_with(p)))
+        .collect();
+    rest.sort_by_key(|i| i.rank());
+    rest.first().map(|i| i.name.clone())
+}
+
+/// The interfaces of this host, from `/sys/class/net`.
+#[must_use]
+pub fn host_ifaces() -> Vec<Iface> {
+    let mut v = Vec::new();
+    let Ok(d) = std::fs::read_dir("/sys/class/net") else {
+        return v;
+    };
+    for e in d.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let state = std::fs::read_to_string(p.join("operstate")).unwrap_or_default();
+        let kind = std::fs::read_to_string(p.join("type")).unwrap_or_default();
+        let state = state.trim();
+        v.push(Iface {
+            name,
+            operstate: if state.is_empty() {
+                String::from("unknown")
+            } else {
+                state.to_owned()
+            },
+            loopback: kind.trim() == "772",
+        });
+    }
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
+/// [`pick_ifname`] over this host's route table and interfaces.
+#[must_use]
+pub fn default_ifname() -> Option<String> {
+    let route = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    pick_ifname(&route, &host_ifaces())
+}
+
+/// Make the hand-shake directory `dir`, and report whether one was
+/// already there. The name carries the coordinator's pid and its attempt
+/// number, so a directory that exists before the run starts is a stale
+/// one from an earlier run whose pid the kernel has since reused: its
+/// `go`, `abort` or `id.bin` would be read as this run's (a stale `go`
+/// skips the acquire barrier, a stale `id.bin` names a dead HCCL
+/// coordinator), so it is removed rather than joined.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be made.
+pub fn prepare_dir(dir: &Path) -> Result<bool> {
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            println!(
+                "coordinator: {} is left over from an earlier run of pid {} (the pid was reused); removing it",
+                dir.display(),
+                std::process::id()
+            );
+            std::fs::remove_dir_all(dir)?;
+            std::fs::create_dir(dir)?;
+            Ok(true)
+        }
+        Err(e) => Err(Error::Other(format!("{}: {e}", dir.display()))),
+    }
+}
+
+/// Remove a hand-shake directory and everything under it (`id.bin`, the
+/// `rank<r>.*` files and the workers' `HABANA_LOGS` trees), unless
+/// `RENG_TP_KEEP_DIR` is set. Returns whether anything is left behind.
+pub fn remove_dir(dir: &Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    if std::env::var_os("RENG_TP_KEEP_DIR").is_some() {
+        println!(
+            "coordinator: keeping the hand-shake directory {} (RENG_TP_KEEP_DIR)",
+            dir.display()
+        );
+        return true;
+    }
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {
+            println!(
+                "coordinator: removed the hand-shake directory {}",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            println!(
+                "coordinator: cannot remove the hand-shake directory {}: {e}",
+                dir.display()
+            );
+            true
+        }
+    }
+}
+
+/// SIGINT and SIGTERM seen by this process so far.
+static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn on_signal(_sig: c_int) {
+    // Async-signal-safe: an atomic add, and `_exit` on the second signal
+    // so a coordinator that will not stop can still be stopped.
+    if SIGNALS.fetch_add(1, Ordering::SeqCst) > 0 {
+        // SAFETY: `_exit` never returns and is async-signal-safe.
+        unsafe { _exit(130) }
+    }
+}
+
+/// Catch SIGINT and SIGTERM so that the coordinator's wait loops notice
+/// them ([`interrupted`]), ask the ranks to abort their communicators and
+/// remove the hand-shake directory, instead of the process dying on the
+/// spot with two workers still holding their cards. A second signal
+/// leaves at once.
+pub fn catch_signals() {
+    // SAFETY: `signal` takes the handler by pointer and returns the
+    // previous one, which we do not need.
+    unsafe {
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+    }
+}
+
+/// Whether a SIGINT or SIGTERM has arrived since [`catch_signals`].
+#[must_use]
+pub fn interrupted() -> bool {
+    SIGNALS.load(Ordering::SeqCst) > 0
 }
 
 /// The coordinator side of a rank group: one child process per module id,
@@ -723,8 +983,10 @@ pub const EXIT_ACQUIRE: i32 = 75;
 impl Group {
     /// Spawn `exe` once per module id (in rank order) with `--rank r
     /// --world n --module m --dir DIR` followed by `args`, `RENG_MODULE_ID`
-    /// set to the module, `HABANA_LOGS` under `dir`, and (with `numa`)
-    /// under `numactl` on the card's NUMA node.
+    /// set to the module, `HABANA_LOGS` under `dir`, `HCCL_SOCKET_IFNAME`
+    /// set to `ifname` when there is one, and (with `numa`) under
+    /// `numactl` on the card's NUMA node. `dir` is made here, and a stale
+    /// directory of the same name is removed first ([`prepare_dir`]).
     ///
     /// # Errors
     ///
@@ -735,8 +997,9 @@ impl Group {
         args: &[String],
         dir: &Path,
         numa: bool,
+        ifname: Option<&str>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        prepare_dir(dir)?;
         let numactl = numa
             && std::process::Command::new("numactl")
                 .arg("--hardware")
@@ -771,6 +1034,9 @@ impl Group {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            if let Some(n) = ifname {
+                cmd.env("HCCL_SOCKET_IFNAME", n);
+            }
             let mut child = cmd
                 .spawn()
                 .map_err(|e| Error::Other(format!("cannot spawn rank {rank}: {e}")))?;
@@ -830,7 +1096,10 @@ impl Group {
                 );
                 return true;
             }
-            if failed > 0 || Instant::now() > deadline {
+            if failed > 0 || interrupted() || Instant::now() > deadline {
+                if interrupted() {
+                    println!("coordinator: interrupted during the acquire phase");
+                }
                 let _ = std::fs::write(self.dir.join("abort"), b"abort");
                 return false;
             }
@@ -866,10 +1135,12 @@ impl Group {
                     }
                 }
             }
-            if Instant::now() > deadline {
+            if interrupted() || Instant::now() > deadline {
                 println!(
                     "coordinator: {}, asking the remaining ranks to abort their communicators",
-                    if peer_failed {
+                    if interrupted() {
+                        "interrupted"
+                    } else if peer_failed {
                         "peer failed"
                     } else {
                         "TIMEOUT"
@@ -934,7 +1205,9 @@ impl Group {
 impl Drop for Group {
     /// `std::process::Child` does not kill on drop, so without this an
     /// early return, a `?` or a panic in the coordinator would leave the
-    /// workers holding their cards until they finished on their own.
+    /// workers holding their cards until they finished on their own. The
+    /// hand-shake directory goes with the group, whether the run passed,
+    /// failed or was interrupted (see [`remove_dir`]).
     fn drop(&mut self) {
         for r in &mut self.ranks {
             r.poll();
@@ -948,6 +1221,9 @@ impl Drop for Group {
                 let _ = h.join();
             }
         }
+        // Every rank has exited, so nothing is reading the hand-shake
+        // files any more.
+        remove_dir(&self.dir);
     }
 }
 
@@ -1043,19 +1319,11 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
     std::fs::write(a.dir.join(format!("rank{r}.acquired")), b"ok")?;
     // The coordinator says go once every rank holds its card, or abort when
     // one could not (that rank exits and the group is relaunched).
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        if a.dir.join("go").exists() {
-            break;
-        }
-        if a.dir.join("abort").exists() {
-            return Err(Error::Other("acquire: aborted by coordinator".into()));
-        }
-        if Instant::now() > deadline {
-            return Err(Error::Other("no go from the coordinator in 180 s".into()));
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_go(
+        a.dir,
+        std::os::unix::process::parent_id(),
+        DEFAULT_HANDSHAKE_TIMEOUT,
+    )?;
 
     // Unique id: made by rank 0 after its acquire, carried by file.
     let id_path = a.dir.join("id.bin");
@@ -1071,18 +1339,7 @@ pub fn run_worker(a: &WorkerArgs<'_>) -> Result<usize> {
         );
         id
     } else if a.id_file {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            if let Ok(b) = std::fs::read(&id_path) {
-                if b.len() == UniqueId::BYTES {
-                    break UniqueId::from_bytes(&b)?;
-                }
-            }
-            if Instant::now() > deadline {
-                return Err(Error::Other("no unique id from rank 0 in 120 s".into()));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_id(&id_path, DEFAULT_HANDSHAKE_TIMEOUT)?
     } else {
         println!("unique-id: zeroed (env mode, HCCL_COMM_ID must be set)");
         UniqueId::zeroed()
@@ -1935,4 +2192,195 @@ pub fn numa_node_of(module: u32) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iface(name: &str, operstate: &str, loopback: bool) -> Iface {
+        Iface {
+            name: name.to_owned(),
+            operstate: operstate.to_owned(),
+            loopback,
+        }
+    }
+
+    /// The box, as `/sys/class/net` has it: `enxf8e43bd2a69c` is the
+    /// wired NIC and carries the default route, `enxbe3af2b6059f` is the
+    /// BMC's virtual one (an address, no gateway, `operstate` unknown)
+    /// that HCCL's own default picks, and the scale-out ports are down.
+    fn box_ifaces() -> Vec<Iface> {
+        vec![
+            iface("docker0", "down", false),
+            iface("enp179s0d8", "down", false),
+            iface("enxbe3af2b6059f", "unknown", false),
+            iface("enxf8e43bd2a69c", "up", false),
+            iface("lo", "unknown", true),
+        ]
+    }
+
+    const HEADER: &str =
+        "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n";
+
+    #[test]
+    fn ifname_follows_the_default_route() {
+        // The box's own table: the BMC's NIC has a subnet route and the
+        // wired NIC the default one.
+        let route = format!(
+            "{HEADER}\
+             enxf8e43bd2a69c\t00000000\t0101FF0A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+             enxbe3af2b6059f\t0000A9FE\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n\
+             enxf8e43bd2a69c\t0001FF0A\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+        );
+        assert_eq!(
+            pick_ifname(&route, &box_ifaces()).as_deref(),
+            Some("enxf8e43bd2a69c")
+        );
+        // The lowest metric wins, and an interface that is down is not a
+        // candidate however good its route looks.
+        let route = format!(
+            "{HEADER}\
+             enp179s0d8\t00000000\t0101FF0A\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+             enxbe3af2b6059f\t00000000\t0264A8C0\t0003\t0\t0\t900\t00000000\t0\t0\t0\n\
+             enxf8e43bd2a69c\t00000000\t0101FF0A\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+        );
+        assert_eq!(
+            pick_ifname(&route, &box_ifaces()).as_deref(),
+            Some("enxf8e43bd2a69c")
+        );
+    }
+
+    #[test]
+    fn ifname_without_a_default_route_skips_the_virtual_ones() {
+        // No default route: the interface that reports `up`, not the
+        // BMC's, whose state is unknown and whose name sorts first.
+        assert_eq!(
+            pick_ifname(HEADER, &box_ifaces()).as_deref(),
+            Some("enxf8e43bd2a69c")
+        );
+        // A named port beats a MAC-named USB one in the same state.
+        let mut named = box_ifaces();
+        named.push(iface("eno1", "up", false));
+        assert_eq!(pick_ifname(HEADER, &named).as_deref(), Some("eno1"));
+        // With nothing else, the BMC's NIC is better than nothing.
+        let only_bmc = vec![
+            iface("docker0", "up", false),
+            iface("enxbe3af2b6059f", "unknown", false),
+            iface("lo", "unknown", true),
+        ];
+        assert_eq!(
+            pick_ifname(HEADER, &only_bmc).as_deref(),
+            Some("enxbe3af2b6059f")
+        );
+        // Nothing usable: leave the variable unset rather than guess.
+        assert_eq!(
+            pick_ifname(
+                HEADER,
+                &[iface("lo", "unknown", true), iface("eno1", "down", false)]
+            ),
+            None
+        );
+        assert_eq!(pick_ifname("", &[]), None);
+    }
+
+    #[test]
+    fn go_wait_honours_its_timeout_abort_and_orphaning() {
+        let d = tempfile::tempdir().unwrap();
+        let ppid = std::os::unix::process::parent_id();
+        // The timeout is the caller's, and the message is an `acquire:`
+        // one so the coordinator relaunches the group instead of taking
+        // it for a failed run.
+        let t = Instant::now();
+        let e = wait_for_go(d.path(), ppid, Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("acquire: no go from the coordinator"), "{e}");
+        assert!(t.elapsed() >= Duration::from_millis(300), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10), "{e}");
+        // A coordinator that went away is noticed at once.
+        let t = Instant::now();
+        let e = wait_for_go(d.path(), u32::MAX, Duration::from_secs(600))
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("acquire: the coordinator went away"), "{e}");
+        assert!(t.elapsed() < Duration::from_secs(10));
+        // So is an abort.
+        std::fs::write(d.path().join("abort"), b"abort").unwrap();
+        let e = wait_for_go(d.path(), ppid, Duration::from_secs(600))
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("acquire: aborted by coordinator"), "{e}");
+        // `go` wins over a stale abort and returns at once.
+        std::fs::write(d.path().join("go"), b"go").unwrap();
+        let t = Instant::now();
+        wait_for_go(d.path(), ppid, Duration::from_secs(600)).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn id_wait_honours_its_timeout_and_takes_only_a_whole_id() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("id.bin");
+        let t = Instant::now();
+        let e = match wait_for_id(&path, Duration::from_millis(300)) {
+            Ok(_) => panic!("an id appeared in an empty directory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.starts_with("no unique id from rank 0"), "{e}");
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        // A short file is a partial write, not an id.
+        std::fs::write(&path, [7u8; 8]).unwrap();
+        assert!(wait_for_id(&path, Duration::from_millis(200)).is_err());
+        // The whole 1032 bytes are read back as written.
+        let mut bytes = vec![0u8; UniqueId::BYTES];
+        bytes[..4].copy_from_slice(b"addr");
+        bytes[HCCL_UNIQUE_ID_MAX_BYTES..].copy_from_slice(&16u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let id = wait_for_id(&path, Duration::from_secs(5)).unwrap();
+        assert_eq!(id.length(), 16);
+        assert_eq!(id.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn stale_hand_shake_directory_is_detected_and_removed() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("reng-tp-4242-1");
+        // A fresh directory is not reported as stale.
+        assert!(!prepare_dir(&dir).unwrap());
+        assert!(dir.is_dir());
+        // A directory of the same name from an earlier run of a reused
+        // pid is: its `go` would skip this run's acquire barrier.
+        std::fs::write(dir.join("go"), b"go").unwrap();
+        std::fs::write(dir.join("id.bin"), b"stale").unwrap();
+        std::fs::create_dir(dir.join("logs-r0")).unwrap();
+        std::fs::write(dir.join("logs-r0").join("synapse.log"), b"old").unwrap();
+        assert!(prepare_dir(&dir).unwrap());
+        assert!(dir.is_dir());
+        assert!(!dir.join("go").exists());
+        assert!(!dir.join("id.bin").exists());
+        assert!(!dir.join("logs-r0").exists());
+        // Removal takes the whole tree, and asking twice is not an error.
+        std::fs::create_dir(dir.join("logs-r1")).unwrap();
+        std::fs::write(dir.join("logs-r1").join("synapse.log"), b"new").unwrap();
+        assert!(!remove_dir(&dir));
+        assert!(!dir.exists());
+        assert!(!remove_dir(&dir));
+    }
+
+    #[test]
+    fn an_interrupt_sets_the_flag_instead_of_killing_the_coordinator() {
+        assert!(!interrupted());
+        catch_signals();
+        // SAFETY: `raise` sends the signal to this process, where the
+        // handler installed above sets the flag and returns.
+        assert_eq!(unsafe { raise(SIGINT) }, 0);
+        for _ in 0..100 {
+            if interrupted() {
+                break;
+            }
+            std::thread::sleep(POLL);
+        }
+        assert!(interrupted());
+    }
 }

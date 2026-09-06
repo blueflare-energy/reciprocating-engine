@@ -95,8 +95,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the 8B distill reproduces the single card's ids over a 1000-token
   prompt (four prefill blocks) as well as a five-token one; world 1
   reproduces `reng-generate`'s ids exactly.
+- Multi-card hand-shake and interfaces: the coordinator sets
+  `HCCL_SOCKET_IFNAME` for every worker rather than leaving the choice to
+  the library, whose default is the first interface not named `lo` or
+  `docker` (on this box the BMC's virtual NIC). `reng-tp --ifname <nic>`
+  names it; otherwise an inherited setting stands, and failing that the
+  interface carrying the default route is used
+  (`reng_synapse::hccl::pick_ifname`, which skips interfaces that are
+  down, the loopback, `docker`/`veth`/`br-`/`virbr`/`tun`/`tap`/`vnet`
+  devices and, unless nothing else is left, MAC-named USB ones). The
+  hand-shake directory is removed when the run ends, whether it passed,
+  failed or was interrupted (`RENG_TP_KEEP_DIR` keeps it), and one left
+  behind by an earlier run whose pid the kernel reused is detected and
+  removed rather than joined, where before its stale `go` would skip this
+  run's acquire barrier and its stale `id.bin` would name a dead HCCL
+  coordinator. A worker's waits for `go` and for the unique id are bounded
+  by `--timeout` (forwarded to the workers) instead of a fixed 180 s and
+  120 s, and a rank that gives up waiting for `go` now exits with
+  `EXIT_ACQUIRE`, which is what makes the coordinator relaunch the group.
+  At `--batch B` every sequence's ids are written to `rank<r>.ids` and
+  compared across the ranks, not sequence 0's alone.
 - Multi-card lifecycle: a rank never outlives its coordinator holding a
-  card. Each worker runs a watchdog thread that polls the hand-shake
+  card. SIGINT and SIGTERM are caught: the coordinator asks the ranks to
+  abort their communicators, reaps them, removes the hand-shake directory
+  and leaves with 130, and a worker signalled with its coordinator (the
+  terminal signals the whole process group) aborts its communicator
+  instead of dying inside a collective. Each worker runs a watchdog thread that polls the hand-shake
   directory's `abort` file and its own parent id, and on either aborts the
   communicator (`hcclCommAbort`) and leaves through `_exit`;
   `Group::wait_all` writes `abort` and waits out a 10 s grace before it
@@ -115,10 +139,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `wd_pitch`, `LayerWeights::wo_pitch`, `wd_pitch`) instead of gathering
   the 24 GB they come to per rank of the 70B. `RENG_SHARD_GATHER` restores
   the copies for comparison: 32 GB owned and 31 s to load against 14 GB
-  and 23 s, an 18 GB saving rather than the full 24 GB, because the 94
-  odd-offset tensors still copy nearly their whole row range for the
-  shard. An odd-offset safetensors tensor (94 of the 70B distill's,
-  19 GB) is converted with one memcpy instead of a per-element loop.
+  and 23 s.
+- A safetensors tensor whose data offset is not 2-aligned (94 of the 70B
+  distill's 723, 19.2 GB) cannot be read in place as `[u16]`. It is now a
+  view that copies when it is first read (`Bf16Slice::Unaligned`) rather
+  than a copy of the whole tensor made while the checkpoint is loaded, and
+  a shard narrows it first: `Bf16Slice::sub` keeps an unaligned view
+  unaligned, and `Bf16Slice::column_block` gathers a column window
+  straight out of the map, which `LlamaWeights::shard` uses for the o and
+  down projections of such a tensor (`wo_pitch` / `wd_pitch` 0) instead of
+  a strided view whose read would copy the whole row range. A rank now
+  copies `1 / world` of an unaligned tensor, once: 10.7 GB owned per rank
+  of the 70B at world 2 against 13.7 GB, and 10.7 GB copied over the run
+  against 32.9 GB (19.2 at load, 13.7 at the shard).
+  `LlamaWeights::footprint` counts an unaligned view without reading it.
 - The attention scale is applied to `wq` while the rows are staged for
   the upload (`Gb::input_bf16_scaled`, an f32 product rounded to bf16
   exactly as the old host copy was) instead of by a scaled copy of every
