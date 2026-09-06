@@ -137,6 +137,16 @@ recompiling and copying the used rows across. Single-sequence decode is
 bound by per-node dispatch across the recipe, which is where the
 performance work continues.
 
+Every model above fits one card (Qwen2.5-32B occupies 65 GB of the
+96 GB). Larger models will run across cards: the HCCL bindings and a
+two-process all-reduce probe (`reng-hccl-test`) are in the tree and pass
+on this box (about 62 us per small all-reduce chained on one stream,
+48 us with events between streams; the box needs the kernel option
+`iommu=pt`, without which the scheduler's completion counters never
+reach the host), and `LlamaConfig::shard` / `LlamaWeights::shard` give a
+card its Megatron slice of the weights. The tensor-parallel decode
+path itself is the next piece of work.
+
 ## Layout
 
 | Path        | Purpose                                                        |
