@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Tensor-parallel shards of a model: `LlamaConfig::shard(rank, world)`
+  and `LlamaWeights::shard(cfg, rank, world)` give one card's slice of a
+  Megatron split (this rank's query and KV heads and MLP columns as views
+  into the mapped checkpoint for the q/k/v and gate/up projections,
+  gathered column blocks of the o and down projections, sliced biases
+  and full-width q/k gains, shared norms, embedding and LM head), for the
+  coming multi-card path over HCCL.
 - `reng-synapse`: HCCL bindings (`ffi.rs`: the `hccl.h` collectives, the
   1032-byte `hcclUniqueId` passed by value, `synEventElapsedTime`) and a
   `hccl` module with one card per process (`Card`), a communicator

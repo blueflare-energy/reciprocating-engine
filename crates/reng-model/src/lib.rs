@@ -388,6 +388,36 @@ impl LlamaConfig {
     pub fn post_norm(&self) -> bool {
         self.model_type.as_deref() == Some("olmo2")
     }
+
+    /// The config of one tensor-parallel shard: `world` cards each hold
+    /// `num_attention_heads / world` query heads, `n_kv_heads / world` KV
+    /// heads (whole GQA groups) and `intermediate_size / world` MLP
+    /// columns; the hidden size, the norms, the embedding and the LM head
+    /// are replicated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `world` does not divide the head counts and the
+    /// intermediate size, or if `rank >= world`.
+    #[must_use]
+    pub fn shard(&self, rank: usize, world: usize) -> Self {
+        assert!(world >= 1 && rank < world, "rank {rank} of {world}");
+        let n_kv = self.n_kv_heads();
+        assert!(
+            self.num_attention_heads % world == 0
+                && n_kv % world == 0
+                && self.intermediate_size % world == 0,
+            "heads {} / kv heads {n_kv} / intermediate {} are not divisible by {world}",
+            self.num_attention_heads,
+            self.intermediate_size
+        );
+        let mut c = self.clone();
+        c.head_dim = Some(self.head_dim());
+        c.num_attention_heads = self.num_attention_heads / world;
+        c.num_key_value_heads = Some(n_kv / world);
+        c.intermediate_size = self.intermediate_size / world;
+        c
+    }
 }
 
 /// The bf16 elements of a weight tensor: a view into a memory-mapped
@@ -574,6 +604,85 @@ impl LlamaWeights {
             }
         }
         (mapped, owned)
+    }
+
+    /// The weights of tensor-parallel shard `rank` of `world` (Megatron
+    /// split): the q/k/v and gate/up projections keep the rows of this
+    /// rank's heads and MLP columns (views into the mapped checkpoint,
+    /// since `[out, in]` rows are contiguous), the o and down projections
+    /// keep the matching columns (gathered into owned copies), the biases
+    /// and the OLMo-2 full-width q/k gains are sliced the same way, and
+    /// the norms, the embedding and the LM head are shared. `cfg` is the
+    /// unsharded config; the shard's config is [`LlamaConfig::shard`].
+    ///
+    /// # Panics
+    ///
+    /// As [`LlamaConfig::shard`], or if a matrix does not have the shape
+    /// the config implies.
+    #[must_use]
+    pub fn shard(&self, cfg: &LlamaConfig, rank: usize, world: usize) -> Self {
+        let sc = cfg.shard(rank, world);
+        let (h, hd) = (cfg.hidden_size, cfg.head_dim());
+        let (q_rows, kv_rows, i_rows) = (sc.q_dim(), sc.n_kv_heads() * hd, sc.intermediate_size);
+        let (q_all, kv_all, i_all) = (cfg.q_dim(), cfg.n_kv_heads() * hd, cfg.intermediate_size);
+        let rows = |m: &Bf16Slice, all_rows: usize, part: usize, cols: usize| -> Bf16Slice {
+            assert_eq!(m.len(), all_rows * cols, "matrix shape");
+            m.sub(rank * part * cols, part * cols)
+        };
+        let cols = |m: &Bf16Slice, out_rows: usize, all_cols: usize, part: usize| -> Bf16Slice {
+            assert_eq!(m.len(), out_rows * all_cols, "matrix shape");
+            let mut v = Vec::with_capacity(out_rows * part);
+            for r in 0..out_rows {
+                let base = r * all_cols + rank * part;
+                v.extend_from_slice(&m[base..base + part]);
+            }
+            Bf16Slice::from(v)
+        };
+        let vec_part = |v: &[f32], all: usize, part: usize| -> Vec<f32> {
+            if v.is_empty() {
+                return Vec::new();
+            }
+            assert_eq!(v.len(), all, "vector length");
+            v[rank * part..(rank + 1) * part].to_vec()
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|l| LayerTensors {
+                g1: l.g1.clone(),
+                g2: l.g2.clone(),
+                g_post_attn: l.g_post_attn.clone(),
+                g_post_mlp: l.g_post_mlp.clone(),
+                wq: rows(&l.wq, q_all, q_rows, h),
+                wk: rows(&l.wk, kv_all, kv_rows, h),
+                wv: rows(&l.wv, kv_all, kv_rows, h),
+                wo: cols(&l.wo, h, q_all, q_rows),
+                bq: vec_part(&l.bq, q_all, q_rows),
+                bk: vec_part(&l.bk, kv_all, kv_rows),
+                bv: vec_part(&l.bv, kv_all, kv_rows),
+                // Per-head gains (length head_dim) are the same for every
+                // head; full-width gains follow the projection rows.
+                qn: if l.qn.len() == q_all && q_all != hd {
+                    vec_part(&l.qn, q_all, q_rows)
+                } else {
+                    l.qn.clone()
+                },
+                kn: if l.kn.len() == kv_all && kv_all != hd {
+                    vec_part(&l.kn, kv_all, kv_rows)
+                } else {
+                    l.kn.clone()
+                },
+                wg: rows(&l.wg, i_all, i_rows, h),
+                wu: rows(&l.wu, i_all, i_rows, h),
+                wd: cols(&l.wd, h, i_all, i_rows),
+            })
+            .collect();
+        Self {
+            embed: self.embed.clone(),
+            layers,
+            final_gamma: self.final_gamma.clone(),
+            lm_head: self.lm_head.clone(),
+        }
     }
 }
 
@@ -1754,5 +1863,68 @@ mod tests {
     fn argmax_rows_picks_max() {
         let l = [0.1, 0.9, 0.3, 2.0, -1.0, 0.0];
         assert_eq!(argmax_rows(&l, 3), vec![1, 0]);
+    }
+    #[test]
+    fn tensor_parallel_shard_takes_rows_and_columns() {
+        // hidden 4, 2 heads of head_dim 2, 2 kv heads, intermediate 4; two shards.
+        let cfg: LlamaConfig = serde_json::from_str(
+            r#"{"hidden_size": 4, "intermediate_size": 4, "num_hidden_layers": 1,
+                "num_attention_heads": 2, "num_key_value_heads": 2, "rms_norm_eps": 1e-6,
+                "vocab_size": 8, "tie_word_embeddings": true}"#,
+        )
+        .unwrap();
+        let mat = |rows: usize, cols: usize| -> Bf16Slice {
+            Bf16Slice::from((0..rows * cols).map(|i| i as u16).collect::<Vec<u16>>())
+        };
+        let layer = LayerTensors {
+            g1: vec![1.0; 4],
+            g2: vec![1.0; 4],
+            g_post_attn: Vec::new(),
+            g_post_mlp: Vec::new(),
+            wq: mat(4, 4),
+            wk: mat(4, 4),
+            wv: mat(4, 4),
+            wo: mat(4, 4),
+            bq: (0..4).map(|i| i as f32).collect(),
+            bk: Vec::new(),
+            bv: Vec::new(),
+            qn: Vec::new(),
+            kn: Vec::new(),
+            wg: mat(4, 4),
+            wu: mat(4, 4),
+            wd: mat(4, 4),
+        };
+        let w = LlamaWeights {
+            embed: mat(8, 4),
+            layers: vec![layer],
+            final_gamma: vec![1.0; 4],
+            lm_head: mat(8, 4),
+        };
+        let s1 = w.shard(&cfg, 1, 2);
+        let c1 = cfg.shard(1, 2);
+        assert_eq!(
+            (
+                c1.num_attention_heads,
+                c1.n_kv_heads(),
+                c1.intermediate_size
+            ),
+            (1, 1, 2)
+        );
+        let l = &s1.layers[0];
+        // Rank 1 keeps rows 2..4 of q (its head): elements 8..16.
+        assert_eq!(
+            &l.wq[..],
+            &(8..16).map(|i| i as u16).collect::<Vec<u16>>()[..]
+        );
+        assert_eq!(l.bq, vec![2.0, 3.0]);
+        // o keeps columns 2..4 of every row: 2,3, 6,7, 10,11, 14,15.
+        assert_eq!(&l.wo[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
+        assert_eq!(&l.wd[..], &[2u16, 3, 6, 7, 10, 11, 14, 15]);
+        assert_eq!(l.wg.len(), 8);
+        assert_eq!(
+            &l.wg[..],
+            &(8..16).map(|i| i as u16).collect::<Vec<u16>>()[..]
+        );
+        assert_eq!(s1.embed.len(), 32);
     }
 }
