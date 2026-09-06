@@ -69,6 +69,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counts, or the layer form `TpModel::new` rejects); the ceilings block
   beside it gives all three terms per world, so a reader can see which
   floor binds.
+- RoPE scaling types `linear`, `yarn` and `longrope` next to `llama3`
+  (`rope_spec`: transformers' inverse-frequency vector and attention
+  factor, the factor multiplied into the sin/cos tables). longrope picks
+  its short or long factor list from the length of the sequence the
+  tables serve (the prompt length of a prefill,
+  `LlamaConfig::rope_caches_for`; the cache capacity of a generator), the
+  config's top-level `max_position_embeddings` and
+  `original_max_position_embeddings` feed the derived factors, and
+  Phi-3's legacy `su` / `yarn` type names mean longrope. The `llama3` and
+  unscaled tables are unchanged bit for bit, which a test pins against a
+  copy of the original recipe. Measured on Gaudi2 with these tables,
+  Phi-3.5-mini-instruct against its f32 reference at 300, 2000, 4096
+  (short factors) and 4500 (long factors) tokens: argmax agreement 94 to
+  97.5 percent with last-logits cosine 1.0000, where the unscaled tables
+  gave 82, 86, 55 and 50 percent.
+- `tools/oracle/rope_reference.py` writes the inverse frequencies,
+  attention factors and `cos` / `sin` rows transformers 5.16 computes for
+  Phi-3.5-mini-instruct, Phi-4-mini-instruct, google/gemma-3-4b-pt and
+  three yarn configurations into
+  `crates/reng-model/testdata/rope_reference.json`; a unit test parses
+  each checkpoint's own `config.json` and compares the engine's tables
+  against that reference at positions on both sides of the pretraining
+  length.
+- Multimodal Gemma-3 checkpoints (`model_type: gemma3`, the 4B and up):
+  `LlamaConfig::from_json` flattens the `text_config`, fills
+  `Gemma3TextConfig`'s defaults for the keys the files leave out, and
+  the loader reads the weights under `language_model.model.` (the vision
+  tower is skipped). Gemma-3-4B: greedy 8/8 and prefill agreement 97 to
+  98 percent at 300 to 4500 tokens, cosine 1.0000.
+- Partial rotations (`partial_rotary_factor`: Phi-4-mini rotates 96 of
+  its 128 head dims, pairing `i` with `i + 48` and passing the rest
+  through) need no graph change. The loader permutes each head's q and k
+  rows so that HF's rotary pairs sit on the kernel's `j, j + head_dim / 2`
+  pairs and the tables give the pass-through pairs cos 1 / sin 0; `q . k`
+  does not depend on the order of the head dims, and `v` and `o_proj` are
+  untouched. A `partial_rotary_factor` that does not give a whole number
+  of rotary pairs, and a longrope factor list of the wrong length, are
+  refused at config load.
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds

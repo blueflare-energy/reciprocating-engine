@@ -27,7 +27,24 @@
 //! sliding layers get the sliding window and, for Gemma-3, the local RoPE
 //! table (`rope_local_base_freq`) while the full layers get `rope_theta`;
 //! and `tie_word_embeddings` defaults to true (the key is absent from the
-//! configs).
+//! configs). A multimodal Gemma-3 config (`model_type: gemma3`, the 4B
+//! and up) is flattened to its `text_config` by [`LlamaConfig::from_json`]
+//! and its weights are read under `language_model.model.`; the vision
+//! tower and projector are never touched.
+//!
+//! RoPE scaling (`rope_scaling`): the `llama3`, `linear`, `yarn` and
+//! `longrope` types are host-side table recipes ([`rope_spec`]: an
+//! inverse-frequency vector and an attention factor on the tables).
+//! longrope picks its short or long factor list from the length of the
+//! sequence the tables serve, so a prefill passes its prompt length
+//! ([`LlamaConfig::rope_caches_for`]) and the cached decoders their
+//! capacity. A partial rotation (`partial_rotary_factor`; Phi-4-mini
+//! rotates 96 of its 128 head dims, HF pairing `i, i + 48` and passing
+//! the rest through) needs no graph change: the loader permutes each
+//! head's q and k rows so that HF's rotary pairs sit on the kernel's
+//! `j, j + head_dim / 2` pairs ([`rope_head_perm`]) and the tables give
+//! the pass-through pairs cos 1 / sin 0. `q . k` does not depend on the
+//! order of the head dims, and `v` and `o_proj` are untouched.
 //!
 //! The safetensors files are memory-mapped and never read into heap
 //! buffers: a bf16 tensor is a [`Bf16Slice`] viewing the checkpoint bytes
@@ -76,10 +93,27 @@ pub struct LlamaConfig {
     pub rms_norm_eps: f32,
     #[serde(default = "default_theta")]
     pub rope_theta: f32,
-    /// HF `rope_scaling`; only the `llama3` type is applied (the others are
-    /// reported as unsupported by [`LlamaConfig::load`]).
+    /// HF `rope_scaling`: the `llama3`, `linear`, `yarn` and `longrope`
+    /// types are applied (see [`rope_spec`]); any other is reported by
+    /// [`LlamaConfig::load`] and ignored.
     #[serde(default)]
     pub rope_scaling: Option<RopeScaling>,
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    /// Phi-3: the pretraining length, kept at the top level of the config
+    /// (it takes priority over a copy inside `rope_scaling`).
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    /// The fraction of each head that RoPE rotates (Phi-4-mini 0.75: dims
+    /// 0..96 of 128, paired `i, i + 48`; the rest pass through); see
+    /// [`LlamaConfig::rotary_dim`].
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
+    /// Where the language model's tensors live in the checkpoint:
+    /// `language_model.model.` for a multimodal `gemma3` config (set by
+    /// [`LlamaConfig::from_json`]), `model.` otherwise.
+    #[serde(skip)]
+    pub weight_prefix: Option<String>,
     pub vocab_size: usize,
     /// Absent in every Gemma config, whose HF config classes default it to
     /// true; see [`LlamaConfig::tied`].
@@ -148,9 +182,11 @@ pub struct LlamaConfig {
     pub attn_logit_softcapping: Option<f32>,
 }
 
-/// The `rope_scaling` object of a HF config. Llama 3.1 style scaling
-/// rescales the low-frequency rotary dims (see [`rope_caches_scaled`]).
-#[derive(Debug, Clone, Deserialize)]
+/// The `rope_scaling` object of a HF config (`rope_parameters` in
+/// transformers 5). [`rope_spec`] applies the `llama3`, `linear`, `yarn`
+/// and `longrope` types; `dynamic` (a sequence-length dependent base) is
+/// reported by [`LlamaConfig::load`] and ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RopeScaling {
     /// `rope_type` (newer configs) or `type` (older ones).
     #[serde(default, alias = "type")]
@@ -161,8 +197,39 @@ pub struct RopeScaling {
     pub low_freq_factor: Option<f32>,
     #[serde(default)]
     pub high_freq_factor: Option<f32>,
+    /// The pretraining length. Phi-3 keeps it at the top level of the
+    /// config, which takes priority; [`LlamaConfig::load`] copies it here.
     #[serde(default)]
     pub original_max_position_embeddings: Option<usize>,
+    /// longrope: one divisor per rotary pair for sequences up to
+    /// `original_max_position_embeddings` (`short_factor`) and beyond it
+    /// (`long_factor`).
+    #[serde(default)]
+    pub short_factor: Option<Vec<f32>>,
+    #[serde(default)]
+    pub long_factor: Option<Vec<f32>>,
+    /// longrope, yarn: the multiplier on the sin and cos tables; derived
+    /// from `factor` (and yarn's `mscale`s) when absent.
+    #[serde(default)]
+    pub attention_factor: Option<f32>,
+    /// yarn: the rotation counts bounding the interpolation ramp (32 and
+    /// 1 when absent), the `mscale` pair and whether the ramp bounds are
+    /// rounded to whole dims (true when absent).
+    #[serde(default)]
+    pub beta_fast: Option<f32>,
+    #[serde(default)]
+    pub beta_slow: Option<f32>,
+    #[serde(default)]
+    pub mscale: Option<f32>,
+    #[serde(default)]
+    pub mscale_all_dim: Option<f32>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
+    /// The config's top-level `max_position_embeddings`, copied here by
+    /// [`LlamaConfig::load`]: longrope and yarn derive `factor` from its
+    /// ratio to the pretraining length when the key is absent.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
 }
 
 /// RoPE caches of a model for `positions` positions: the tables every
@@ -311,20 +378,39 @@ impl LlamaConfig {
         self.model_type.as_deref() == Some("gemma3_text") && self.sliding(li)
     }
 
+    /// RoPE caches for `positions` positions serving a sequence of
+    /// `positions` tokens; see [`LlamaConfig::rope_caches_for`].
+    #[must_use]
+    pub fn rope_caches(&self, positions: usize) -> RopeCaches {
+        self.rope_caches_for(positions, positions)
+    }
+
     /// RoPE caches for `positions` positions: the global table from
     /// `rope_theta` (with `rope_scaling`, which applies to the full layers
     /// only) and, for Gemma-3, the local one from `rope_local_base_freq`.
+    /// `seq_len` is the length of the sequence the tables serve (the
+    /// prompt length of a prefill; a padded table has more positions than
+    /// that): `longrope` selects its long factors from it (see
+    /// [`rope_spec`]).
     #[must_use]
-    pub fn rope_caches(&self, positions: usize) -> RopeCaches {
-        let hd = self.head_dim();
-        let (sin, cos) =
-            rope_caches_scaled(positions, hd, self.rope_theta, self.rope_scaling.as_ref());
+    pub fn rope_caches_for(&self, positions: usize, seq_len: usize) -> RopeCaches {
+        let (hd, rd) = (self.head_dim(), self.rotary_dim());
+        let (sin, cos) = rope_caches_partial(
+            positions,
+            hd,
+            rd,
+            self.rope_theta,
+            self.rope_scaling.as_ref(),
+            seq_len,
+        );
         let (sin_local, cos_local) = if (0..self.num_hidden_layers).any(|li| self.local_rope(li)) {
-            rope_caches_scaled(
+            rope_caches_partial(
                 positions,
                 hd,
+                rd,
                 self.rope_local_base_freq.unwrap_or(1e4),
                 None,
+                positions,
             )
         } else {
             (Vec::new(), Vec::new())
@@ -337,7 +423,8 @@ impl LlamaConfig {
         }
     }
 
-    /// Read `config.json` from a model directory.
+    /// Read `config.json` from a model directory (see
+    /// [`LlamaConfig::from_json`]).
     ///
     /// # Errors
     ///
@@ -345,15 +432,100 @@ impl LlamaConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(dir.join("config.json"))
             .map_err(|e| Error::Other(format!("config.json: {e}")))?;
-        let cfg: Self =
-            serde_json::from_str(&text).map_err(|e| Error::Other(format!("config.json: {e}")))?;
-        if let Some(t) = cfg
+        Self::from_json(&text)
+    }
+
+    /// Parse the text of a `config.json`. A multimodal Gemma-3 config
+    /// (`model_type: gemma3`, weights under `language_model.model.`) is
+    /// flattened to its `text_config`, completed with `Gemma3TextConfig`'s
+    /// defaults for the keys the file leaves out (the 4B and 12B files
+    /// carry six). The `rope_scaling` gets the top-level lengths it
+    /// derives its factors from (`standardize_rope_params`), and Phi-3's
+    /// legacy `su` / `yarn` type names mean `longrope` (`Phi3Config`). A
+    /// `dynamic` or unknown rope type is reported on stderr and ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text cannot be parsed, the activation is
+    /// unknown, `partial_rotary_factor` does not give an even rotary width
+    /// between 2 and `head_dim`, or a longrope factor list does not hold
+    /// one entry per rotary pair.
+    pub fn from_json(text: &str) -> Result<Self> {
+        let err = |e: serde_json::Error| Error::Other(format!("config.json: {e}"));
+        let mut v: serde_json::Value = serde_json::from_str(text).map_err(err)?;
+        let mut prefix = None;
+        if v.get("model_type").and_then(serde_json::Value::as_str) == Some("gemma3") {
+            let Some(mut text_cfg) = v.get("text_config").cloned() else {
+                return Err(Error::Other(
+                    "config.json: gemma3 without text_config".into(),
+                ));
+            };
+            let defaults = serde_json::json!({
+                "model_type": "gemma3_text", "vocab_size": 262_208, "hidden_size": 2304,
+                "intermediate_size": 9216, "num_hidden_layers": 26, "num_attention_heads": 8,
+                "num_key_value_heads": 4, "head_dim": 256, "hidden_activation": "gelu_pytorch_tanh",
+                "max_position_embeddings": 131_072, "rms_norm_eps": 1e-6, "tie_word_embeddings": true,
+                "query_pre_attn_scalar": 256, "sliding_window": 4096, "sliding_window_pattern": 6,
+                "rope_theta": 1_000_000.0, "rope_local_base_freq": 10_000.0
+            });
+            if let (Some(obj), Some(d)) = (text_cfg.as_object_mut(), defaults.as_object()) {
+                for (k, dv) in d {
+                    obj.entry(k.clone()).or_insert_with(|| dv.clone());
+                }
+            }
+            v = text_cfg;
+            prefix = Some("language_model.model.".to_owned());
+        }
+        let mut cfg: Self = serde_json::from_value(v).map_err(err)?;
+        cfg.weight_prefix = prefix;
+        let phi3 = cfg.model_type.as_deref() == Some("phi3");
+        let (max_pos, orig) = (
+            cfg.max_position_embeddings,
+            cfg.original_max_position_embeddings,
+        );
+        if let Some(s) = cfg.rope_scaling.as_mut() {
+            if phi3 && matches!(s.rope_type.as_deref(), Some("su" | "yarn")) {
+                s.rope_type = Some("longrope".to_owned());
+            }
+            s.max_position_embeddings = max_pos;
+            if orig.is_some() {
+                s.original_max_position_embeddings = orig;
+            } else if s.original_max_position_embeddings.is_none() {
+                s.original_max_position_embeddings = max_pos;
+            }
+            let t = s.rope_type.as_deref().unwrap_or("default");
+            if !matches!(t, "default" | "llama3" | "linear" | "yarn" | "longrope") {
+                eprintln!("config.json: rope_scaling type {t} is not applied");
+            }
+        }
+        if let Some(f) = cfg.partial_rotary_factor {
+            let rd = cfg.rotary_dim();
+            if !(f > 0.0 && f <= 1.0) || rd == 0 || rd % 2 != 0 {
+                return Err(Error::Other(format!(
+                    "config.json: partial_rotary_factor {f} rotates {rd} of {} head dims",
+                    cfg.head_dim()
+                )));
+            }
+        }
+        // longrope divides one rotary pair per factor-list entry
+        // (transformers `validate_rope`); a list of another length would
+        // panic in [`rope_spec`].
+        if let Some(s) = cfg
             .rope_scaling
             .as_ref()
-            .and_then(|s| s.rope_type.as_deref())
+            .filter(|s| s.rope_type.as_deref() == Some("longrope"))
         {
-            if t != "llama3" && t != "default" {
-                eprintln!("config.json: rope_scaling type {t} is not applied");
+            let half = cfg.rotary_dim() / 2;
+            for (name, list) in [
+                ("short_factor", s.short_factor.as_ref()),
+                ("long_factor", s.long_factor.as_ref()),
+            ] {
+                let n = list.map_or(0, Vec::len);
+                if n != half {
+                    return Err(Error::Other(format!(
+                        "config.json: rope_scaling.{name} has {n} entries for {half} rotary pairs"
+                    )));
+                }
             }
         }
         cfg.activation()?;
@@ -369,6 +541,17 @@ impl LlamaConfig {
     pub fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// The head dims RoPE rotates: `int(head_dim * partial_rotary_factor)`
+    /// (transformers), the whole head without the key.
+    #[must_use]
+    pub fn rotary_dim(&self) -> usize {
+        let hd = self.head_dim();
+        match self.partial_rotary_factor {
+            Some(f) => (hd as f32 * f) as usize,
+            None => hd,
+        }
     }
 
     /// Width of the query projection, `num_attention_heads * head_dim`.
@@ -694,7 +877,9 @@ pub struct LayerTensors {
     pub g_post_attn: Vec<f32>,
     pub g_post_mlp: Vec<f32>,
     /// Projections as stored, bf16 `[out, in]`; `wo` (and `wd`) carry the
-    /// config's `residual_multiplier` when it has one.
+    /// config's `residual_multiplier` when it has one. Under a partial
+    /// rotation the rows of `wq` and `wk` (and `bq`, `bk`, `qn`, `kn`)
+    /// are in [`rope_head_perm`] order within each head.
     pub wq: Bf16Slice,
     pub wk: Bf16Slice,
     pub wv: Bf16Slice,
@@ -1122,8 +1307,9 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
     let (hd, qd) = (cfg.head_dim(), cfg.q_dim());
     let kvd = cfg.n_kv_heads() * hd;
 
-    let (embed, eshape) =
-        tensor_bf16(st("model.embed_tokens.weight"), "model.embed_tokens.weight")?;
+    let pre = cfg.weight_prefix.as_deref().unwrap_or("model.");
+    let embed_name = format!("{pre}embed_tokens.weight");
+    let (embed, eshape) = tensor_bf16(st(&embed_name), &embed_name)?;
     if eshape != [v, h] {
         return Err(Error::Other(format!(
             "embed_tokens shape {eshape:?}, expected [{v}, {h}]"
@@ -1140,9 +1326,11 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
         }
         v
     };
+    // A partial rotation: q and k head dims go into the kernel's pair order.
+    let rotary_perm = (cfg.rotary_dim() < hd).then(|| rope_head_perm(hd, cfg.rotary_dim()));
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
     for l in 0..cfg.num_hidden_layers {
-        let p = |s: &str| format!("model.layers.{l}.{s}");
+        let p = |s: &str| format!("{pre}layers.{l}.{s}");
         let g = |name: &str| -> Result<Vec<f32>> {
             let n = p(name);
             Ok(plus_one(tensor_f32(st(&n), &n)?.0))
@@ -1235,6 +1423,20 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
                 None => w,
             }
         };
+        let (mut wq, mut wk) = (wq, wk);
+        let mut bq = opt("self_attn.q_proj.bias", &[qd])?;
+        let mut bk = opt("self_attn.k_proj.bias", &[kvd])?;
+        // Per head (Qwen3, Gemma-3) or over the whole projection (OLMo-2).
+        let mut qn = plus_one(opt("self_attn.q_norm.weight", &[hd, qd])?);
+        let mut kn = plus_one(opt("self_attn.k_norm.weight", &[hd, kvd])?);
+        if let Some(perm) = rotary_perm.as_deref() {
+            wq = permute_head_rows(&wq, h, hd, perm);
+            wk = permute_head_rows(&wk, h, hd, perm);
+            bq = permute_head_vec(&bq, hd, perm);
+            bk = permute_head_vec(&bk, hd, perm);
+            qn = permute_head_vec(&qn, hd, perm);
+            kn = permute_head_vec(&kn, hd, perm);
+        }
         layers.push(LayerTensors {
             g1,
             g2,
@@ -1245,20 +1447,19 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
             wv,
             wo: residual(lin("self_attn.o_proj.weight", h, qd)?),
             wo_pitch: 0,
-            bq: opt("self_attn.q_proj.bias", &[qd])?,
-            bk: opt("self_attn.k_proj.bias", &[kvd])?,
+            bq,
+            bk,
             bv: opt("self_attn.v_proj.bias", &[kvd])?,
-            // Per head (Qwen3, Gemma-3) or over the whole projection
-            // (OLMo-2).
-            qn: plus_one(opt("self_attn.q_norm.weight", &[hd, qd])?),
-            kn: plus_one(opt("self_attn.k_norm.weight", &[hd, kvd])?),
+            qn,
+            kn,
             wg,
             wu,
             wd: residual(lin("mlp.down_proj.weight", h, i)?),
             wd_pitch: 0,
         });
     }
-    let mut final_gamma = plus_one(tensor_f32(st("model.norm.weight"), "model.norm.weight")?.0);
+    let norm_name = format!("{pre}norm.weight");
+    let mut final_gamma = plus_one(tensor_f32(st(&norm_name), &norm_name)?.0);
     // Gemma-2: the head applies `tanh(logits / cap) * cap`; the division
     // rides on the final norm gain.
     if let Some(cap) = cfg.final_softcap() {
@@ -1297,17 +1498,176 @@ pub fn rope_caches(tokens: usize, head_dim: usize, theta: f32) -> (Vec<f32>, Vec
     rope_caches_scaled(tokens, head_dim, theta, None)
 }
 
-/// Rotate-half RoPE caches `[tokens, head_dim]` with the config's
-/// `rope_scaling` applied: for the `llama3` type each inverse frequency
-/// whose wavelength exceeds `original_max_position_embeddings /
-/// low_freq_factor` is divided by `factor`, those below `original /
-/// high_freq_factor` are kept, and the band between is blended linearly
-/// (`transformers` `_compute_llama3_parameters`). Other types are
-/// ignored. Diagnostic `RENG_NO_ROPE_SCALING` ignores every type.
+/// HF's `(inv_freq, attention_factor)` pair for one rotary table: the
+/// inverse frequency of each of the `head_dim / 2` rotary pairs from
+/// `theta`, with the config's `rope_scaling` applied, and the factor that
+/// multiplies the sin and cos tables (transformers 5.16
+/// `modeling_rope_utils.py`, `ROPE_INIT_FUNCTIONS`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RopeSpec {
+    pub inv_freq: Vec<f32>,
+    pub attention_factor: f32,
+}
+
+/// The [`RopeSpec`] of a `rotary_dim`-wide rotation (the head, or the
+/// rotated part of it under a partial rotation) with base `theta` under
+/// `scaling`, for a sequence of `seq_len` tokens (its largest position
+/// plus one):
+///
+/// - `llama3`: each inverse frequency whose wavelength exceeds
+///   `original_max_position_embeddings / low_freq_factor` is divided by
+///   `factor`, those below `original / high_freq_factor` are kept, and the
+///   band between is blended linearly (`_compute_llama3_parameters`);
+/// - `linear`: every inverse frequency is divided by `factor`
+///   (`_compute_linear_scaling_rope_parameters`);
+/// - `yarn`: the pairs below the dim that completes `beta_fast` rotations
+///   over the pretraining length are kept, those above the `beta_slow`
+///   dim are divided by `factor`, the ramp between is blended, and the
+///   attention factor is `0.1 * ln(factor) + 1` (or the ratio of the two
+///   `mscale` forms of it) (`_compute_yarn_parameters`);
+/// - `longrope`: each inverse frequency is divided by the matching
+///   `short_factor` entry, or the `long_factor` one when `seq_len` exceeds
+///   `original_max_position_embeddings`, and the attention factor is
+///   `sqrt(1 + ln(factor) / ln(original))` (`_compute_longrope_parameters`;
+///   `factor` defaults to `max_position_embeddings / original`).
+///
+/// Other types leave the default table. Diagnostic `RENG_NO_ROPE_SCALING`
+/// ignores every type.
 ///
 /// # Panics
 ///
-/// Panics if a `llama3` scaling lacks one of its four parameters.
+/// Panics if a scaling lacks a parameter its type requires, or a longrope
+/// factor list has the wrong length.
+#[must_use]
+pub fn rope_spec(
+    rotary_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScaling>,
+    seq_len: usize,
+) -> RopeSpec {
+    let half = rotary_dim / 2;
+    let mut inv: Vec<f32> = (0..half)
+        .map(|i| theta.powf(-2.0 * (i as f32) / rotary_dim as f32))
+        .collect();
+    let mut attention_factor = 1.0f32;
+    let scaling = scaling.filter(|_| std::env::var("RENG_NO_ROPE_SCALING").is_err());
+    let Some(s) = scaling else {
+        return RopeSpec {
+            inv_freq: inv,
+            attention_factor,
+        };
+    };
+    let orig = || {
+        s.original_max_position_embeddings
+            .expect("rope_scaling.original_max_position_embeddings") as f32
+    };
+    // longrope and yarn: `max_position_embeddings / original` when the key is absent.
+    let factor_or_ratio = || {
+        s.factor.unwrap_or_else(|| {
+            s.max_position_embeddings.expect("max_position_embeddings") as f32 / orig()
+        })
+    };
+    match s.rope_type.as_deref().unwrap_or("default") {
+        "llama3" => {
+            let factor = s.factor.expect("rope_scaling.factor");
+            let low = s.low_freq_factor.expect("rope_scaling.low_freq_factor");
+            let high = s.high_freq_factor.expect("rope_scaling.high_freq_factor");
+            let orig = orig();
+            let (low_wavelen, high_wavelen) = (orig / low, orig / high);
+            for f in &mut inv {
+                let wavelen = 2.0 * std::f32::consts::PI / *f;
+                if wavelen > low_wavelen {
+                    *f /= factor;
+                } else if wavelen >= high_wavelen {
+                    let smooth = (orig / wavelen - low) / (high - low);
+                    *f = (1.0 - smooth) * *f / factor + smooth * *f;
+                }
+            }
+        }
+        "linear" => {
+            let factor = s.factor.expect("rope_scaling.factor");
+            for f in &mut inv {
+                *f /= factor;
+            }
+        }
+        "yarn" => {
+            let orig = orig();
+            let factor = factor_or_ratio();
+            let mscale = |scale: f32, m: f32| {
+                if scale <= 1.0 {
+                    1.0
+                } else {
+                    0.1 * m * scale.ln() + 1.0
+                }
+            };
+            attention_factor =
+                s.attention_factor
+                    .unwrap_or_else(|| match (s.mscale, s.mscale_all_dim) {
+                        (Some(m), Some(a)) if m != 0.0 && a != 0.0 => {
+                            mscale(factor, m) / mscale(factor, a)
+                        }
+                        _ => mscale(factor, 1.0),
+                    });
+            let beta_fast = s.beta_fast.filter(|&b| b != 0.0).unwrap_or(32.0);
+            let beta_slow = s.beta_slow.filter(|&b| b != 0.0).unwrap_or(1.0);
+            let dim = rotary_dim as f32;
+            // The dim whose wavelength is `orig / rotations`.
+            let corr = |rot: f32| {
+                dim * (orig / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * theta.ln())
+            };
+            let (mut low, mut high) = (corr(beta_fast), corr(beta_slow));
+            if s.truncate.unwrap_or(true) {
+                low = low.floor();
+                high = high.ceil();
+            }
+            let low = low.max(0.0);
+            let mut high = high.min(dim - 1.0);
+            if low == high {
+                high += 0.001;
+            }
+            for (i, f) in inv.iter_mut().enumerate() {
+                let ramp = ((i as f32 - low) / (high - low)).clamp(0.0, 1.0);
+                *f = *f / factor * ramp + *f * (1.0 - ramp);
+            }
+        }
+        "longrope" => {
+            let orig_len = s
+                .original_max_position_embeddings
+                .expect("rope_scaling.original_max_position_embeddings");
+            let factor = factor_or_ratio();
+            attention_factor = s.attention_factor.unwrap_or_else(|| {
+                if factor <= 1.0 {
+                    1.0
+                } else {
+                    (1.0 + factor.ln() / (orig_len as f32).ln()).sqrt()
+                }
+            });
+            let ext = if seq_len > orig_len {
+                s.long_factor.as_ref().expect("rope_scaling.long_factor")
+            } else {
+                s.short_factor.as_ref().expect("rope_scaling.short_factor")
+            };
+            assert_eq!(
+                ext.len(),
+                half,
+                "rope_scaling factors: {} entries for {half} rotary pairs",
+                ext.len()
+            );
+            for (f, e) in inv.iter_mut().zip(ext) {
+                *f /= e;
+            }
+        }
+        _ => {}
+    }
+    RopeSpec {
+        inv_freq: inv,
+        attention_factor,
+    }
+}
+
+/// Rotate-half RoPE caches `[tokens, head_dim]` for positions `0..tokens`
+/// with the config's `rope_scaling` applied for a sequence of `tokens`
+/// tokens; see [`rope_caches_len`].
 #[must_use]
 pub fn rope_caches_scaled(
     tokens: usize,
@@ -1315,41 +1675,131 @@ pub fn rope_caches_scaled(
     theta: f32,
     scaling: Option<&RopeScaling>,
 ) -> (Vec<f32>, Vec<f32>) {
-    let half = head_dim / 2;
-    let mut inv: Vec<f32> = (0..half)
-        .map(|i| theta.powf(-2.0 * (i as f32) / head_dim as f32))
-        .collect();
-    let llama3 = scaling.filter(|s| {
-        s.rope_type.as_deref() == Some("llama3") && std::env::var("RENG_NO_ROPE_SCALING").is_err()
-    });
-    if let Some(s) = llama3 {
-        let factor = s.factor.expect("rope_scaling.factor");
-        let low = s.low_freq_factor.expect("rope_scaling.low_freq_factor");
-        let high = s.high_freq_factor.expect("rope_scaling.high_freq_factor");
-        let orig = s
-            .original_max_position_embeddings
-            .expect("rope_scaling.original_max_position_embeddings") as f32;
-        let (low_wavelen, high_wavelen) = (orig / low, orig / high);
-        for f in &mut inv {
-            let wavelen = 2.0 * std::f32::consts::PI / *f;
-            if wavelen > low_wavelen {
-                *f /= factor;
-            } else if wavelen >= high_wavelen {
-                let smooth = (orig / wavelen - low) / (high - low);
-                *f = (1.0 - smooth) * *f / factor + smooth * *f;
+    rope_caches_len(tokens, head_dim, theta, scaling, tokens)
+}
+
+/// Rotate-half RoPE caches `[tokens, head_dim]` for positions `0..tokens`
+/// from the [`rope_spec`] of `scaling` at `seq_len`: `sin(p * inv_freq[d %
+/// half]) * attention_factor` and the cosine likewise (every dim of a
+/// rotary pair gets the same angle). The factor on both tables scales
+/// every `q . k` score by its square, which is what HF's rotary module
+/// does (`cos = cos * attention_scaling`).
+///
+/// # Panics
+///
+/// Panics where [`rope_spec`] does.
+#[must_use]
+pub fn rope_caches_len(
+    tokens: usize,
+    head_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScaling>,
+    seq_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    rope_caches_partial(tokens, head_dim, head_dim, theta, scaling, seq_len)
+}
+
+/// [`rope_caches_len`] for a rotation of `rotary_dim` of the `head_dim`
+/// dims: the tables are `[tokens, head_dim]` in the kernel's pair order
+/// (see [`rope_head_perm`]), the first `rotary_dim / 2` pairs carry the
+/// angles of a `rotary_dim`-wide [`rope_spec`] with the attention factor,
+/// and the remaining pairs read cos 1 / sin 0 (the pass-through dims, not
+/// scaled by the factor, as HF leaves `q_pass` alone). With `rotary_dim ==
+/// head_dim` the tables are those of [`rope_caches_len`].
+///
+/// # Panics
+///
+/// Panics if `rotary_dim` is odd or exceeds `head_dim`, or where
+/// [`rope_spec`] does.
+#[must_use]
+pub fn rope_caches_partial(
+    tokens: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    theta: f32,
+    scaling: Option<&RopeScaling>,
+    seq_len: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(
+        rotary_dim <= head_dim && rotary_dim % 2 == 0,
+        "rotary width {rotary_dim} of {head_dim}"
+    );
+    let (half, rot_half) = (head_dim / 2, rotary_dim / 2);
+    let spec = rope_spec(rotary_dim, theta, scaling, seq_len);
+    let af = spec.attention_factor;
+    let mut sin = vec![0.0f32; tokens * head_dim];
+    let mut cos = vec![1.0f32; tokens * head_dim];
+    for p in 0..tokens {
+        for d in 0..head_dim {
+            let j = d % half;
+            if j < rot_half {
+                let ang = p as f32 * spec.inv_freq[j];
+                sin[p * head_dim + d] = ang.sin() * af;
+                cos[p * head_dim + d] = ang.cos() * af;
             }
         }
     }
-    let mut sin = vec![0.0f32; tokens * head_dim];
-    let mut cos = vec![0.0f32; tokens * head_dim];
-    for p in 0..tokens {
-        for d in 0..head_dim {
-            let ang = p as f32 * inv[d % half];
-            sin[p * head_dim + d] = ang.sin();
-            cos[p * head_dim + d] = ang.cos();
+    (sin, cos)
+}
+
+/// The head-dim order the loader gives q and k under a partial rotation:
+/// entry `e` is the HF dim that engine dim `e` holds. HF rotates dims
+/// `0..rotary_dim` in rotate-half pairs `(i, i + rotary_dim / 2)` and
+/// passes `rotary_dim..head_dim` through; the kernel rotates every pair
+/// `(j, j + head_dim / 2)`. So the rotary pairs go to `j < rotary_dim /
+/// 2` and the pass-through dims fill the pairs after them, whose table
+/// entries are the identity (see [`rope_caches_partial`]). The identity
+/// permutation when `rotary_dim == head_dim`.
+///
+/// # Panics
+///
+/// Panics if `rotary_dim` is odd or exceeds `head_dim`.
+#[must_use]
+pub fn rope_head_perm(head_dim: usize, rotary_dim: usize) -> Vec<usize> {
+    assert!(
+        rotary_dim <= head_dim && rotary_dim % 2 == 0,
+        "rotary width {rotary_dim} of {head_dim}"
+    );
+    let (half, rot_half) = (head_dim / 2, rotary_dim / 2);
+    let pass = half - rot_half;
+    (0..head_dim)
+        .map(|e| {
+            let (j, second) = (e % half, e >= half);
+            if j < rot_half {
+                // Rotary pair j: HF dims j and j + rotary_dim / 2.
+                j + if second { rot_half } else { 0 }
+            } else {
+                // Pass-through dims, in order: rotary_dim + (j - rot_half)
+                // for the first half, the same plus `pass` for the second.
+                rotary_dim + (j - rot_half) + if second { pass } else { 0 }
+            }
+        })
+        .collect()
+}
+
+/// `m` (`[rows, cols]`, `rows` a multiple of `hd`) with the rows of every
+/// `hd`-row head block reordered so that row `e` of the block is the
+/// block's row `perm[e]`: an owned copy.
+fn permute_head_rows(m: &Bf16Slice, cols: usize, hd: usize, perm: &[usize]) -> Bf16Slice {
+    let rows = m.len() / cols;
+    assert!(rows * cols == m.len() && rows % hd == 0, "matrix shape");
+    let mut v = Vec::with_capacity(m.len());
+    for head in 0..rows / hd {
+        for &src in perm {
+            let r = head * hd + src;
+            v.extend_from_slice(&m[r * cols..(r + 1) * cols]);
         }
     }
-    (sin, cos)
+    Bf16Slice::from(v)
+}
+
+/// A per-row vector (a bias, or a per-head or full-width gain; a multiple
+/// of `hd` long, or empty) reordered like [`permute_head_rows`].
+fn permute_head_vec(v: &[f32], hd: usize, perm: &[usize]) -> Vec<f32> {
+    assert!(v.len() % hd == 0, "vector length");
+    v.chunks_exact(hd)
+        .flat_map(|head| perm.iter().map(|&src| head[src]))
+        .collect()
 }
 
 /// Host-side embedding gather: `[tokens, hidden]` for the given ids, times
@@ -1489,7 +1939,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     let tokens = real.max(MIN_PREFILL_TOKENS);
     let mut padded: Vec<u32> = ids.to_vec();
     padded.resize(tokens, 0);
-    let rope = cfg.rope_caches(tokens);
+    let rope = cfg.rope_caches_for(tokens, real);
     let x = embed_tokens(w, cfg, &padded);
     let m = layer_views(w, cfg, &rope.tables());
     let mut logits = reng_synapse::model_forward_bf16(
@@ -1521,7 +1971,11 @@ pub struct Generator<'a> {
 impl<'a> Generator<'a> {
     /// Compile for prompt blocks of `rows` tokens and decode blocks of
     /// `decode_rows` tokens (0: one recipe for both) over a cache of
-    /// `capacity` positions, and upload the weights.
+    /// `capacity` positions, and upload the weights. The RoPE tables serve
+    /// a sequence of `capacity` tokens: a longrope model reads its long
+    /// factors when that exceeds its pretraining length (HF switches at
+    /// the first forward past it and recomputes the cache), so size the
+    /// cache for the run's total length.
     ///
     /// # Errors
     ///
@@ -1935,6 +2389,7 @@ mod tests {
             low_freq_factor: Some(1.0),
             high_freq_factor: Some(4.0),
             original_max_position_embeddings: Some(8192),
+            ..RopeScaling::default()
         };
         let (sin_a, _) = rope_caches_scaled(2, 128, 500000.0, None);
         let (sin_b, _) = rope_caches_scaled(2, 128, 500000.0, Some(&s));
@@ -1943,6 +2398,508 @@ mod tests {
         let ang_a = sin_a[128 + 63].asin();
         let ang_b = sin_b[128 + 63].asin();
         assert!((ang_a / ang_b - 8.0).abs() < 1e-3, "{ang_a} {ang_b}");
+    }
+
+    fn scaling(json: &str) -> RopeScaling {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn linear_scaling_divides_every_frequency() {
+        // Gemma-3-4B global layers: head_dim 256, theta 1e6, factor 8.
+        let s = scaling(r#"{"factor": 8.0, "rope_type": "linear"}"#);
+        let a = rope_spec(256, 1e6, None, 16);
+        let b = rope_spec(256, 1e6, Some(&s), 16);
+        assert_eq!(b.attention_factor, 1.0);
+        assert_eq!(b.inv_freq[0], 0.125);
+        for (x, y) in a.inv_freq.iter().zip(&b.inv_freq) {
+            assert!((x / y - 8.0).abs() < 1e-4, "{x} {y}");
+        }
+    }
+
+    #[test]
+    fn yarn_ramps_between_the_correction_dims() {
+        // DeepSeek-V2-Lite: rotary dim 64, base 1e4, factor 40, pretrained
+        // at 4096, beta 32/1, mscale 0.707 / 0.707. transformers 5.16
+        // gives the correction range (10, 23) and an attention factor of
+        // 1 (the two mscale forms cancel).
+        let s = scaling(
+            r#"{"rope_type": "yarn", "factor": 40, "original_max_position_embeddings": 4096,
+            "beta_fast": 32, "beta_slow": 1, "mscale": 0.707, "mscale_all_dim": 0.707}"#,
+        );
+        let a = rope_spec(64, 1e4, None, 16);
+        let b = rope_spec(64, 1e4, Some(&s), 16);
+        assert_eq!(b.attention_factor, 1.0);
+        for i in 0..=10 {
+            assert_eq!(a.inv_freq[i], b.inv_freq[i], "dim {i} is extrapolated");
+        }
+        for i in 23..32 {
+            assert!(
+                (a.inv_freq[i] / b.inv_freq[i] - 40.0).abs() < 1e-3,
+                "dim {i}"
+            );
+        }
+        // Dim 13 sits 3/13 of the way into the ramp: 0.01838 (analytic).
+        assert!(
+            (b.inv_freq[13] - 0.01838).abs() < 2e-5,
+            "{}",
+            b.inv_freq[13]
+        );
+        // Without the mscale pair the factor is 0.1 ln(40) + 1.
+        let s = scaling(
+            r#"{"rope_type": "yarn", "factor": 40, "original_max_position_embeddings": 4096}"#,
+        );
+        let c = rope_spec(64, 1e4, Some(&s), 16);
+        assert!((c.attention_factor - 1.368_888_5).abs() < 1e-5);
+        assert_eq!(c.inv_freq, b.inv_freq);
+    }
+
+    #[test]
+    fn longrope_picks_the_factors_by_length_and_scales_the_tables() {
+        // Phi-3.5-mini shape: rotary dim 96, base 1e4, 4096 pretrained,
+        // 131072 max, so factor 32 and attention factor sqrt(1 + 5/12).
+        let short: Vec<f32> = (0..48).map(|i| 1.0 + i as f32 / 48.0).collect();
+        let long: Vec<f32> = vec![2.0; 48];
+        let mut s = scaling(&format!(
+            r#"{{"type": "longrope", "short_factor": {}, "long_factor": {}}}"#,
+            serde_json::to_string(&short).unwrap(),
+            serde_json::to_string(&long).unwrap()
+        ));
+        assert_eq!(s.rope_type.as_deref(), Some("longrope"));
+        s.original_max_position_embeddings = Some(4096);
+        s.max_position_embeddings = Some(131_072);
+        let base = rope_spec(96, 1e4, None, 4096);
+        let at = |n: usize| rope_spec(96, 1e4, Some(&s), n);
+        let af = (17.0f32 / 12.0).sqrt();
+        for n in [1, 300, 4096] {
+            let r = at(n);
+            assert!((r.attention_factor - af).abs() < 1e-6);
+            for (i, (x, y)) in base.inv_freq.iter().zip(&r.inv_freq).enumerate() {
+                assert!((x / short[i] - y).abs() < 1e-7, "short dim {i} at {n}");
+            }
+        }
+        for n in [4097, 4500] {
+            let r = at(n);
+            assert!((r.attention_factor - af).abs() < 1e-6);
+            for (x, y) in base.inv_freq.iter().zip(&r.inv_freq) {
+                assert!((x / 2.0 - y).abs() < 1e-7, "long at {n}");
+            }
+        }
+        // The tables carry the attention factor: position 0 reads cos = af.
+        let (sin, cos) = rope_caches_len(2, 96, 1e4, Some(&s), 4097);
+        assert!((cos[0] - af).abs() < 1e-6 && sin[0] == 0.0);
+        assert!((sin[96] - (0.5f32).sin() * af).abs() < 1e-6, "{}", sin[96]);
+        // An explicit attention_factor wins.
+        let mut explicit = s.clone();
+        explicit.attention_factor = Some(1.0);
+        assert_eq!(rope_spec(96, 1e4, Some(&explicit), 8).attention_factor, 1.0);
+    }
+
+    /// A `[1.0, ...]` list of `n` entries, one per rotary pair.
+    fn ones(n: usize) -> String {
+        serde_json::to_string(&vec![1.0f32; n]).unwrap()
+    }
+
+    #[test]
+    fn phi3_config_lengths_and_legacy_type_names() {
+        // Phi-3.5-mini shape: 96 head dims, all rotated, 48 factors.
+        let phi35 = format!(
+            r#"{{"model_type": "phi3", "hidden_size": 3072, "intermediate_size": 8192,
+            "num_hidden_layers": 32, "num_attention_heads": 32, "rms_norm_eps": 1e-5,
+            "vocab_size": 32064, "max_position_embeddings": 131072,
+            "original_max_position_embeddings": 4096, "partial_rotary_factor": 1.0,
+            "rope_scaling": {{"type": "su", "short_factor": {f}, "long_factor": {f}}}}}"#,
+            f = ones(48)
+        );
+        let cfg = LlamaConfig::from_json(&phi35).unwrap();
+        let s = cfg.rope_scaling.as_ref().unwrap();
+        assert_eq!(s.rope_type.as_deref(), Some("longrope"));
+        assert_eq!(s.original_max_position_embeddings, Some(4096));
+        assert_eq!(s.max_position_embeddings, Some(131_072));
+        assert!(cfg.weight_prefix.is_none());
+        assert_eq!(cfg.rotary_dim(), 96);
+        // Phi-4-mini rotates 96 of its 128 dims, and its lists are 48 long too.
+        let partial = format!(
+            r#"{{"model_type": "phi3", "hidden_size": 3072, "intermediate_size": 8192,
+            "num_hidden_layers": 32, "num_attention_heads": 24, "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-5, "vocab_size": 200064, "partial_rotary_factor": 0.75,
+            "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
+            "rope_scaling": {{"type": "longrope", "short_factor": {f}, "long_factor": {f}}}}}"#,
+            f = ones(48)
+        );
+        let cfg = LlamaConfig::from_json(&partial).unwrap();
+        assert_eq!((cfg.head_dim(), cfg.rotary_dim()), (128, 96));
+        // 0.2 of 128 rotates 25 dims: no whole rotary pair count.
+        assert!(
+            LlamaConfig::from_json(&partial.replace("0.75", "0.2")).is_err(),
+            "odd rotary width"
+        );
+        // The factor lists must match the rotary pair count (64 here).
+        assert!(
+            LlamaConfig::from_json(&partial.replace("0.75", "1.0")).is_err(),
+            "48 factors for 64 rotary pairs"
+        );
+    }
+
+    /// The `llama3` recipe as first committed (322641a), kept verbatim so
+    /// the tables can be checked bit for bit.
+    fn legacy_llama3_tables(
+        tokens: usize,
+        head_dim: usize,
+        theta: f32,
+        s: Option<&RopeScaling>,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let half = head_dim / 2;
+        let mut inv: Vec<f32> = (0..half)
+            .map(|i| theta.powf(-2.0 * (i as f32) / head_dim as f32))
+            .collect();
+        if let Some(s) = s {
+            let factor = s.factor.unwrap();
+            let low = s.low_freq_factor.unwrap();
+            let high = s.high_freq_factor.unwrap();
+            let orig = s.original_max_position_embeddings.unwrap() as f32;
+            let (low_wavelen, high_wavelen) = (orig / low, orig / high);
+            for f in &mut inv {
+                let wavelen = 2.0 * std::f32::consts::PI / *f;
+                if wavelen > low_wavelen {
+                    *f /= factor;
+                } else if wavelen >= high_wavelen {
+                    let smooth = (orig / wavelen - low) / (high - low);
+                    *f = (1.0 - smooth) * *f / factor + smooth * *f;
+                }
+            }
+        }
+        let mut sin = vec![0.0f32; tokens * head_dim];
+        let mut cos = vec![0.0f32; tokens * head_dim];
+        for p in 0..tokens {
+            for d in 0..head_dim {
+                let ang = p as f32 * inv[d % half];
+                sin[p * head_dim + d] = ang.sin();
+                cos[p * head_dim + d] = ang.cos();
+            }
+        }
+        (sin, cos)
+    }
+
+    #[test]
+    fn llama3_and_default_tables_are_bit_identical_to_the_first_recipe() {
+        // Llama-3.1: head_dim 128, theta 500000, factor 8, low 1, high 4,
+        // 8192 pretrained; 1000 positions.
+        let s = scaling(
+            r#"{"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}"#,
+        );
+        for sc in [None, Some(&s)] {
+            let (sin_a, cos_a) = legacy_llama3_tables(1000, 128, 500_000.0, sc);
+            let (sin_b, cos_b) = rope_caches_scaled(1000, 128, 500_000.0, sc);
+            assert!(
+                sin_a
+                    .iter()
+                    .zip(&sin_b)
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            );
+            assert!(
+                cos_a
+                    .iter()
+                    .zip(&cos_b)
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn partial_rotation_permutes_heads_and_matches_hf() {
+        // Phi-4-mini: 128 dims, 96 rotated; theta 1e4, no scaling here.
+        let (hd, rd) = (128, 96);
+        let perm = rope_head_perm(hd, rd);
+        assert_eq!(rope_head_perm(hd, hd), (0..hd).collect::<Vec<_>>());
+        // Rotary pair j < 48 holds HF dims j and j + 48; the pairs after
+        // hold the pass-through dims 96..128 in order.
+        for j in 0..48 {
+            assert_eq!((perm[j], perm[j + 64]), (j, j + 48));
+        }
+        assert_eq!(perm[48..64], (96..112).collect::<Vec<_>>()[..]);
+        assert_eq!(perm[112..128], (112..128).collect::<Vec<_>>()[..]);
+        let mut sorted = perm.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..hd).collect::<Vec<_>>());
+        // Pass-through pairs read the identity at every position, rotary
+        // pairs the 96-wide spec's angles.
+        let (sin, cos) = rope_caches_partial(20, hd, rd, 1e4, None, 20);
+        let spec = rope_spec(rd, 1e4, None, 20);
+        for p in 0..20 {
+            for d in 0..hd {
+                let j = d % 64;
+                let (s, c) = (sin[p * hd + d], cos[p * hd + d]);
+                if j < 48 {
+                    let ang = p as f32 * spec.inv_freq[j];
+                    assert_eq!((s, c), (ang.sin(), ang.cos()));
+                } else {
+                    assert_eq!((s, c), (0.0, 1.0));
+                }
+            }
+        }
+        // HF's partial rotation of a head at position p (rotate-half over
+        // the first 96 dims, the rest kept), scaled by `af`.
+        let hf = |x: &[f32], p: usize, af: f32| -> Vec<f32> {
+            let mut out = x.to_vec();
+            for i in 0..48 {
+                let ang = p as f32 * spec.inv_freq[i];
+                let (s, c) = (ang.sin() * af, ang.cos() * af);
+                out[i] = x[i] * c - x[i + 48] * s;
+                out[i + 48] = x[i + 48] * c + x[i] * s;
+            }
+            out
+        };
+        // The engine: the permuted head through a whole-head rotate-half
+        // with the partial tables.
+        let engine = |x: &[f32], p: usize, sin: &[f32], cos: &[f32]| -> Vec<f32> {
+            let xp: Vec<f32> = perm.iter().map(|&src| x[src]).collect();
+            (0..hd)
+                .map(|d| {
+                    let rot = if d < 64 { -xp[d + 64] } else { xp[d - 64] };
+                    xp[d] * cos[p * hd + d] + rot * sin[p * hd + d]
+                })
+                .collect()
+        };
+        let vec = |seed: u32| -> Vec<f32> {
+            (0..hd)
+                .map(|i| {
+                    ((i as u32).wrapping_mul(2_654_435_761).wrapping_add(seed) % 1000) as f32
+                        / 500.0
+                        - 1.0
+                })
+                .collect()
+        };
+        let (q, k) = (vec(1), vec(7));
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        // Without a factor and with Phi-4-mini's sqrt(17/12) on the tables.
+        for af in [1.0f32, (17.0f32 / 12.0).sqrt()] {
+            let s = scaling(
+                r#"{"rope_type": "longrope", "short_factor": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], "long_factor": [1.0], "original_max_position_embeddings": 4096, "max_position_embeddings": 131072}"#,
+            );
+            let sc = (af != 1.0).then_some(&s);
+            let (sin, cos) = rope_caches_partial(20, hd, rd, 1e4, sc, 20);
+            let want = dot(&hf(&q, 17, af), &hf(&k, 5, af));
+            let got = dot(&engine(&q, 17, &sin, &cos), &engine(&k, 5, &sin, &cos));
+            assert!(
+                (want - got).abs() < 1e-3 * want.abs().max(1.0),
+                "{want} {got} af {af}"
+            );
+            // Only the pass-through dims escape the factor: their part of
+            // the score is unscaled in both.
+            let pass_hf: f32 = (96..128).map(|i| q[i] * k[i]).sum();
+            let eq = engine(&q, 17, &sin, &cos);
+            let ek = engine(&k, 5, &sin, &cos);
+            let pass_engine: f32 = (48..64).chain(112..128).map(|d| eq[d] * ek[d]).sum();
+            assert!(
+                (pass_hf - pass_engine).abs() < 1e-5,
+                "{pass_hf} {pass_engine}"
+            );
+        }
+        // The loader's row permutation: head blocks of a [rows, cols]
+        // matrix and a per-row vector follow `perm`.
+        let m = Bf16Slice::from((0..2 * hd * 3).map(|i| i as u16).collect::<Vec<u16>>());
+        let pm = permute_head_rows(&m, 3, hd, &perm);
+        for head in 0..2 {
+            for e in 0..hd {
+                let src = head * hd + perm[e];
+                assert_eq!(
+                    &pm[(head * hd + e) * 3..(head * hd + e + 1) * 3],
+                    &m[src * 3..(src + 1) * 3]
+                );
+            }
+        }
+        let v: Vec<f32> = (0..hd).map(|i| i as f32).collect();
+        let pv = permute_head_vec(&v, hd, &perm);
+        assert_eq!(pv[48], 96.0);
+        assert_eq!(pv[64], 48.0);
+        assert!(permute_head_vec(&[], hd, &perm).is_empty());
+    }
+
+    /// One case of `testdata/rope_reference.json`
+    /// (`tools/oracle/rope_reference.py`): a checkpoint's `config.json`,
+    /// the inverse frequencies and attention factor transformers derives
+    /// from it, and the `cos` / `sin` rows its rotary module returns at a
+    /// few positions on both sides of the pretraining length.
+    #[derive(Deserialize)]
+    struct RopeCase {
+        name: String,
+        config: serde_json::Value,
+        /// Which of the engine's tables the case is: `global`, or `local`
+        /// for the table Gemma-3's sliding layers read.
+        table: String,
+        head_dim: usize,
+        rotary_dim: usize,
+        /// The length of the sequence the tables serve (longrope reads its
+        /// long factors past the pretraining length) and the number of
+        /// positions the reference covers, which need not be the same.
+        seq_len: usize,
+        table_len: usize,
+        attention_factor: f32,
+        inv_freq: Vec<f32>,
+        positions: Vec<usize>,
+        /// `[positions, rotary_dim]`, in HF's dim order.
+        cos: Vec<Vec<f32>>,
+        sin: Vec<Vec<f32>>,
+    }
+
+    #[derive(Deserialize)]
+    struct RopeFixture {
+        transformers: String,
+        cases: Vec<RopeCase>,
+    }
+
+    /// Every table the engine builds for Phi-3.5-mini-instruct (longrope),
+    /// Phi-4-mini-instruct (longrope over a partial rotation),
+    /// google/gemma-3-4b-pt (a multimodal config whose text half scales
+    /// `linear`, plus its unscaled local table) and three yarn
+    /// configurations, against transformers 5.16's own tables.
+    #[test]
+    fn rope_tables_match_the_transformers_reference() {
+        let fx: RopeFixture =
+            serde_json::from_str(include_str!("../testdata/rope_reference.json")).unwrap();
+        assert!(fx.transformers.starts_with('5'), "{}", fx.transformers);
+        assert_eq!(fx.cases.len(), 10);
+        // A relative gap, against the reference value.
+        let rel = |a: f32, b: f32| {
+            let (a, b) = (f64::from(a), f64::from(b));
+            (a - b).abs() / b.abs().max(f64::MIN_POSITIVE)
+        };
+        for c in &fx.cases {
+            let cfg = LlamaConfig::from_json(&c.config.to_string())
+                .unwrap_or_else(|e| panic!("{}: {e}", c.name));
+            let (hd, rd, local) = (cfg.head_dim(), cfg.rotary_dim(), c.table == "local");
+            assert_eq!((hd, rd), (c.head_dim, c.rotary_dim), "{}", c.name);
+            // A multimodal config parses through its text half.
+            if c.config
+                .get("model_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("gemma3")
+            {
+                assert_eq!(cfg.model_type.as_deref(), Some("gemma3_text"), "{}", c.name);
+                assert_eq!(
+                    cfg.weight_prefix.as_deref(),
+                    Some("language_model.model."),
+                    "{}",
+                    c.name
+                );
+            }
+            let spec = if local {
+                rope_spec(
+                    rd,
+                    cfg.rope_local_base_freq.unwrap_or(1e4),
+                    None,
+                    c.table_len,
+                )
+            } else {
+                rope_spec(rd, cfg.rope_theta, cfg.rope_scaling.as_ref(), c.seq_len)
+            };
+            assert!(
+                rel(spec.attention_factor, c.attention_factor) < 1e-6,
+                "{}: attention factor {} against {}",
+                c.name,
+                spec.attention_factor,
+                c.attention_factor
+            );
+            assert_eq!(spec.inv_freq.len(), c.inv_freq.len(), "{}", c.name);
+            for (i, (&e, &r)) in spec.inv_freq.iter().zip(&c.inv_freq).enumerate() {
+                assert!(
+                    rel(e, r) < 1e-6,
+                    "{}: inv_freq[{i}] {e} against {r}",
+                    c.name
+                );
+            }
+            let caches = cfg.rope_caches_for(c.table_len, c.seq_len);
+            let (sin, cos) = if local {
+                (&caches.sin_local, &caches.cos_local)
+            } else {
+                (&caches.sin, &caches.cos)
+            };
+            assert_eq!(cos.len(), c.table_len * hd, "{}", c.name);
+            // Engine dim `d` of a head holds HF dim `perm[d]` (the identity
+            // without a partial rotation); the dims HF does not rotate read
+            // cos 1 / sin 0 here and are compared as such.
+            let perm = rope_head_perm(hd, rd);
+            for (row, &p) in c.positions.iter().enumerate() {
+                for d in 0..hd {
+                    let src = perm[d];
+                    let (rc, rs, slack) = if src < rd {
+                        let j = src % (rd / 2);
+                        // The two angles are the same f32 product of the
+                        // same position and inverse frequency, up to the
+                        // last ulp of `inv_freq`; no table can be closer
+                        // than that (`|cos a - cos b| <= |a - b|`).
+                        let (ae, ar) = (p as f32 * spec.inv_freq[j], p as f32 * c.inv_freq[j]);
+                        let da = (f64::from(ae) - f64::from(ar)).abs();
+                        (
+                            c.cos[row][src],
+                            c.sin[row][src],
+                            da * f64::from(c.attention_factor),
+                        )
+                    } else {
+                        (1.0, 0.0, 0.0)
+                    };
+                    // Plus the factor's own gap, which multiplies both tables.
+                    let daf =
+                        (f64::from(spec.attention_factor) - f64::from(c.attention_factor)).abs();
+                    let tol = 1e-6 + slack + daf;
+                    let (gc, gs) = (cos[p * hd + d], sin[p * hd + d]);
+                    assert!(
+                        (f64::from(gc) - f64::from(rc)).abs() < tol,
+                        "{}: cos at position {p} dim {d} (HF dim {src}): {gc} against {rc}",
+                        c.name
+                    );
+                    assert!(
+                        (f64::from(gs) - f64::from(rs)).abs() < tol,
+                        "{}: sin at position {p} dim {d} (HF dim {src}): {gs} against {rs}",
+                        c.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multimodal_gemma3_config_flattens_to_its_text_config() {
+        // google/gemma-3-4b-pt: six keys under text_config, the rest are
+        // Gemma3TextConfig defaults; weights under language_model.model.
+        let cfg = LlamaConfig::from_json(
+            r#"{"architectures": ["Gemma3ForConditionalGeneration"], "model_type": "gemma3",
+            "text_config": {"hidden_size": 2560, "intermediate_size": 10240,
+            "model_type": "gemma3_text", "num_hidden_layers": 34,
+            "rope_scaling": {"factor": 8.0, "rope_type": "linear"}, "sliding_window": 1024},
+            "vision_config": {"hidden_size": 1152, "model_type": "siglip_vision_model"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.weight_prefix.as_deref(), Some("language_model.model."));
+        assert_eq!(cfg.model_type.as_deref(), Some("gemma3_text"));
+        assert!(cfg.is_gemma() && cfg.tied());
+        assert_eq!((cfg.hidden_size, cfg.num_hidden_layers), (2560, 34));
+        assert_eq!(
+            (cfg.num_attention_heads, cfg.n_kv_heads(), cfg.head_dim()),
+            (8, 4, 256)
+        );
+        assert_eq!((cfg.vocab_size, cfg.rope_theta), (262_208, 1e6));
+        assert_eq!(cfg.rope_local_base_freq, Some(1e4));
+        assert_eq!(cfg.rms_norm_eps, 1e-6);
+        assert_eq!(cfg.activation().unwrap(), Activation::GeluTanh);
+        assert_eq!(cfg.attention_scale(), 0.0625);
+        assert_eq!(cfg.max_position_embeddings, Some(131_072));
+        let full: Vec<usize> = (0..34).filter(|&li| !cfg.sliding(li)).collect();
+        assert_eq!(full, vec![5, 11, 17, 23, 29]);
+        assert_eq!(cfg.layer_window(0), Some(1024));
+        assert_eq!(cfg.layer_window(5), None);
+        // The linear factor lands on the global table only.
+        // Position 1, dim 0: angle 1/8 on the global table, 1 on the local.
+        let r = cfg.rope_caches(4);
+        assert!(
+            (r.cos[256] - (0.125f32).cos()).abs() < 1e-6,
+            "{}",
+            r.cos[256]
+        );
+        assert!((r.cos_local[256] - (1.0f32).cos()).abs() < 1e-6);
+        assert!(LlamaConfig::from_json(r#"{"model_type": "gemma3"}"#).is_err());
     }
 
     #[test]

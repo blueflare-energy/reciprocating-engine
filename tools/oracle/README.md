@@ -33,6 +33,25 @@ mismatch fails unless the engine's token is within `--margin` logits
 logits. Such candidates are within bf16 rounding of each other, and the
 mismatch is reported as a near-tie.
 
+## RoPE tables
+
+`rope_reference.py` writes the fixture the engine's RoPE unit test reads.
+It loads no weights and runs nothing on a device: for every case it takes
+the checkpoint's `config.json`, instantiates that model's rotary module
+and records the inverse frequencies, the attention factor and the `cos` /
+`sin` rows at positions on both sides of the pretraining length.
+
+```console
+python rope_reference.py ../../crates/reng-model/testdata/rope_reference.json
+```
+
+The cases are Phi-3.5-mini-instruct and Phi-4-mini-instruct (longrope, the
+second over a partial rotation), google/gemma-3-4b-pt (a multimodal config
+whose text half scales `linear`, and its unscaled local table) and three
+yarn configurations. A model directory without a `config.json` is filled
+from the Hub (`hf download <repo> --include config.json`); `--offline`
+skips the download and the case with it.
+
 ## Runner checks
 
 The `bench` workflow runs `reng-generate --ref` on the self-hosted runner
