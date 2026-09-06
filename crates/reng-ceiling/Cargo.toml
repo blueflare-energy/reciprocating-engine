@@ -7,7 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "First-principles performance ceilings (roofline) for LLM inference on Gaudi2."
 
+[[bin]]
+name = "reng-ceiling"
+path = "src/bin/ceiling.rs"
+
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
+clap.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

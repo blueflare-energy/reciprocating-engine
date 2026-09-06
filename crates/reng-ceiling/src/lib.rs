@@ -6,6 +6,8 @@
 //! from the Intel whitepaper and HL-225B datasheet; the project wiki carries
 //! the citations. These are hard ceilings (100% utilization), not predictions.
 
+pub mod strategy;
+
 use reng_core::{Error, Result};
 
 /// Peak throughput and bandwidth figures for one accelerator.
