@@ -1127,7 +1127,7 @@ impl<'a> Runtime<'a> {
 
     /// Replace a raw (non-bf16) input's bytes (index tensors).
     pub fn upload_raw(&mut self, idx: usize, bytes: &[u8]) -> Result<()> {
-        let expect = self.gb.raw[idx].as_ref().map_or(0, Vec::len);
+        let expect = self.gb.raw[idx].as_ref().map_or(0, |b| b.len());
         assert_eq!(bytes.len(), expect, "raw input {idx} size");
         let hb = self.host_buf(idx, expect)?;
         // SAFETY: hb holds `expect` bytes.
@@ -1284,7 +1284,7 @@ impl<'a> Runtime<'a> {
 
     /// Launch the recipe and read back a row range of the output as raw bytes.
     #[allow(clippy::too_many_lines)]
-    fn launch_and_read_bytes(&mut self, first: usize, rows: usize) -> Result<Vec<u8>> {
+    pub(crate) fn launch_and_read_bytes(&mut self, first: usize, rows: usize) -> Result<Vec<u8>> {
         let row_elems = self.out.row_elems();
         let eb = self.out.kind.bytes();
         let n_out = rows * row_elems;

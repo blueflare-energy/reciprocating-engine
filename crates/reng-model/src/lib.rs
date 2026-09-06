@@ -68,6 +68,7 @@
 
 use memmap2::{Advice, Mmap};
 use reng_core::{Error, Result};
+use reng_fp8::{Fp8Format, Quantized, Scaling};
 use reng_synapse::{Activation, bf16_to_f32, f32_to_bf16, scale_bf16};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -1007,6 +1008,14 @@ pub struct LlamaWeights {
     /// checkpoint has no head), divided by the config's `logits_scaling`
     /// when it has one.
     pub lm_head: Bf16Slice,
+    /// The layers' seven projections quantized to fp8, one entry per
+    /// layer, when the fp8 switch is on ([`load_weights_fp8`]); `None`
+    /// otherwise, and the bf16 views above are then the only weights.
+    /// The norm gains, the embedding table and the LM head stay bf16 in
+    /// either case: they are a small share of the bytes (the head is read
+    /// once per step, the embedding is a host gather) and the head's
+    /// logits feed an argmax whose ties fp8 rounding would move.
+    pub fp8: Option<Vec<LayerFp8>>,
 }
 
 impl LlamaWeights {
@@ -1154,6 +1163,10 @@ impl LlamaWeights {
             layers,
             final_gamma: self.final_gamma.clone(),
             lm_head: self.lm_head.clone(),
+            // A shard's `o` and `down` weights are strided column windows,
+            // which the quantizer does not take; quantize before sharding
+            // or gather the windows first.
+            fp8: None,
         }
     }
 }
@@ -1598,7 +1611,282 @@ pub fn load_weights(dir: &Path, cfg: &LlamaConfig) -> Result<LlamaWeights> {
         layers,
         final_gamma,
         lm_head,
+        fp8: None,
     })
+}
+
+/// What the fp8 switch asks the loader for: the format, the scale scheme
+/// and the backoff the per-channel scales leave below full scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fp8Config {
+    pub format: Fp8Format,
+    pub scaling: Scaling,
+    pub backoff: f32,
+}
+
+impl Default for Fp8Config {
+    /// E4M3 with per-output-channel absmax scales and no backoff: the
+    /// format every inference source uses, and the scheme that gives each
+    /// output channel the whole range.
+    fn default() -> Self {
+        Self {
+            format: Fp8Format::E4M3,
+            scaling: Scaling::PerChannel,
+            backoff: reng_fp8::DEFAULT_BACKOFF,
+        }
+    }
+}
+
+impl std::fmt::Display for Fp8Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}/{} backoff {}",
+            self.format.name(),
+            self.scaling.name(),
+            self.backoff
+        )
+    }
+}
+
+/// Read the fp8 switch: the value of `RENG_FP8` (`None` when the variable
+/// is unset) and whether `--fp8` was given. Off by default, and off for
+/// an empty value, `0`, `off`, `false` or `no` even when the flag is
+/// given, so a wrapper script's flag can be turned off from the
+/// environment.
+///
+/// Any other value is a colon- or comma-separated list of settings, each
+/// of them a format (`e4m3`, `e5m2`), a scale scheme (`pcs`, `hw`,
+/// `unit`) or `backoff=<f32>`; `1`, `on`, `true` and `yes` mean the
+/// defaults ([`Fp8Config::default`]). So `RENG_FP8=e5m2:hw` and
+/// `RENG_FP8=pcs,backoff=0.5` are both valid.
+///
+/// # Errors
+///
+/// Returns an error naming the offending word if the value does not parse.
+pub fn fp8_switch(value: Option<&str>, flag: bool) -> Result<Option<Fp8Config>> {
+    let Some(v) = value else {
+        return Ok(if flag {
+            Some(Fp8Config::default())
+        } else {
+            None
+        });
+    };
+    let v = v.trim();
+    if matches!(
+        v.to_ascii_lowercase().as_str(),
+        "" | "0" | "off" | "false" | "no"
+    ) {
+        return Ok(None);
+    }
+    let mut cfg = Fp8Config::default();
+    if matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes") {
+        return Ok(Some(cfg));
+    }
+    for word in v.split([':', ',']).filter(|w| !w.trim().is_empty()) {
+        let word = word.trim();
+        if let Some(f) = Fp8Format::from_name(word) {
+            cfg.format = f;
+        } else if let Some(sc) = Scaling::from_name(word) {
+            cfg.scaling = sc;
+        } else if let Some(rest) = word.strip_prefix("backoff=") {
+            cfg.backoff = rest
+                .parse::<f32>()
+                .map_err(|e| Error::Other(format!("RENG_FP8 backoff: {e}")))?;
+            if !(cfg.backoff > 0.0 && cfg.backoff <= 1.0) {
+                return Err(Error::Other(format!(
+                    "RENG_FP8 backoff {} is not in (0, 1]",
+                    cfg.backoff
+                )));
+            }
+        } else {
+            return Err(Error::Other(format!(
+                "RENG_FP8: unknown setting {word:?} \
+                 (expected a format, a scale scheme or backoff=<f32>)"
+            )));
+        }
+    }
+    Ok(Some(cfg))
+}
+
+/// Take `--fp8` out of a command line, reporting whether it was there.
+/// The binaries call it before their own parsing so the flag can sit
+/// anywhere; [`fp8_switch`] then combines it with `RENG_FP8`.
+pub fn take_fp8_flag(args: &mut Vec<String>) -> bool {
+    let had = args.iter().any(|a| a == "--fp8");
+    args.retain(|a| a != "--fp8");
+    had
+}
+
+/// One layer's seven projections quantized to fp8, in the checkpoint's
+/// `[out, in]` layout: one byte per weight plus one scale per output
+/// channel. Nothing else of the layer is quantized.
+pub struct LayerFp8 {
+    pub wq: Quantized,
+    pub wk: Quantized,
+    pub wv: Quantized,
+    pub wo: Quantized,
+    pub wg: Quantized,
+    pub wu: Quantized,
+    pub wd: Quantized,
+}
+
+impl LayerFp8 {
+    /// The seven matrices with the names the graph gives their tensors.
+    #[must_use]
+    pub fn matrices(&self) -> [(&'static str, &Quantized); 7] {
+        [
+            ("wq", &self.wq),
+            ("wk", &self.wk),
+            ("wv", &self.wv),
+            ("wo", &self.wo),
+            ("wg", &self.wg),
+            ("wu", &self.wu),
+            ("wd", &self.wd),
+        ]
+    }
+
+    /// Bytes of codes the layer's seven matrices hold.
+    #[must_use]
+    pub fn code_bytes(&self) -> usize {
+        self.matrices().iter().map(|(_, q)| q.code_bytes()).sum()
+    }
+}
+
+/// What one quantization pass produced, for the line the loader reports.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Fp8Report {
+    /// Matrices quantized (seven per layer).
+    pub matrices: usize,
+    /// Bytes those matrices took as bf16, and take as fp8 codes plus
+    /// their f32 scale vectors.
+    pub bf16_bytes: usize,
+    pub fp8_bytes: usize,
+    pub scale_bytes: usize,
+    /// Mean and maximum relative error of the round trip over the sampled
+    /// rows (up to [`FP8_ERROR_ROWS`] rows per matrix).
+    pub mean_rel: f32,
+    pub max_rel: f32,
+    /// Seconds the pass took.
+    pub secs: f64,
+}
+
+/// Rows per matrix the loader measures the quantization error on. A full
+/// pass over every row costs as much again as the quantization itself; an
+/// evenly spaced sample is enough for the report line.
+pub const FP8_ERROR_ROWS: usize = 8;
+
+impl std::fmt::Display for Fp8Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gib = |b: usize| b as f64 / (1024.0 * 1024.0 * 1024.0);
+        write!(
+            f,
+            "{} matrices, {:.2} GiB bf16 -> {:.2} GiB fp8 + {} KiB scales, mean rel {:.4}, max rel {:.4}, {:.2} s",
+            self.matrices,
+            gib(self.bf16_bytes),
+            gib(self.fp8_bytes),
+            self.scale_bytes / 1024,
+            self.mean_rel,
+            self.max_rel,
+            self.secs
+        )
+    }
+}
+
+impl LlamaWeights {
+    /// Quantize the layers' seven projections to fp8 in place, leaving the
+    /// norm gains, the embedding table and the LM head bf16. The bf16
+    /// views stay where they are (they are the checkpoint's own pages, and
+    /// the CPU reference and the bf16 recipes still read them); the codes
+    /// are new owned buffers, one byte per weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a matrix does not have the shape the config
+    /// implies, or if it is the strided column window of a
+    /// tensor-parallel shard, which the quantizer does not take.
+    pub fn quantize_fp8(&mut self, cfg: &LlamaConfig, q: Fp8Config) -> Result<Fp8Report> {
+        let t0 = std::time::Instant::now();
+        let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
+        let hd = cfg.head_dim();
+        let (qd, kvd) = (cfg.q_dim(), cfg.n_kv_heads() * hd);
+        let mut report = Fp8Report::default();
+        let mut errors: Vec<reng_fp8::RowError> = Vec::new();
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for (li, l) in self.layers.iter().enumerate() {
+            let mut one = |name: &str,
+                           w: &Bf16Slice,
+                           pitch: usize,
+                           rows: usize,
+                           cols: usize|
+             -> Result<Quantized> {
+                if pitch != 0 {
+                    return Err(Error::Other(format!(
+                        "layer {li} {name}: fp8 does not take the strided column window of a \
+                         tensor-parallel shard; quantize before sharding"
+                    )));
+                }
+                if w.len() != rows * cols {
+                    return Err(Error::Other(format!(
+                        "layer {li} {name}: {} elements, expected {rows} x {cols}",
+                        w.len()
+                    )));
+                }
+                let out = reng_fp8::quantize_with(w, rows, cols, q.format, q.scaling, q.backoff);
+                report.matrices += 1;
+                report.bf16_bytes += w.len() * 2;
+                report.fp8_bytes += out.code_bytes();
+                report.scale_bytes += out.scales.len() * 4;
+                errors.extend(reng_fp8::sample_row_errors(w, &out, FP8_ERROR_ROWS));
+                Ok(out)
+            };
+            layers.push(LayerFp8 {
+                wq: one("wq", &l.wq, 0, qd, h)?,
+                wk: one("wk", &l.wk, 0, kvd, h)?,
+                wv: one("wv", &l.wv, 0, kvd, h)?,
+                wo: one("wo", &l.wo, l.wo_pitch, h, qd)?,
+                wg: one("wg", &l.wg, 0, i, h)?,
+                wu: one("wu", &l.wu, 0, i, h)?,
+                wd: one("wd", &l.wd, l.wd_pitch, h, i)?,
+            });
+        }
+        if !errors.is_empty() {
+            report.mean_rel = (errors.iter().map(|e| f64::from(e.mean_rel)).sum::<f64>()
+                / errors.len() as f64) as f32;
+            report.max_rel = errors.iter().fold(0.0f32, |m, e| m.max(e.max_rel));
+        }
+        report.secs = t0.elapsed().as_secs_f64();
+        self.fp8 = Some(layers);
+        Ok(report)
+    }
+
+    /// Bytes of fp8 codes the model holds, 0 when the switch is off.
+    #[must_use]
+    pub fn fp8_bytes(&self) -> usize {
+        self.fp8
+            .as_ref()
+            .map_or(0, |ls| ls.iter().map(LayerFp8::code_bytes).sum())
+    }
+}
+
+/// [`load_weights`] plus, when the fp8 switch is on, a quantization pass
+/// over the layers' projections ([`LlamaWeights::quantize_fp8`]). The
+/// report is returned rather than printed, so the caller decides.
+///
+/// # Errors
+///
+/// As [`load_weights`], plus the quantizer's own errors.
+pub fn load_weights_fp8(
+    dir: &Path,
+    cfg: &LlamaConfig,
+    fp8: Option<Fp8Config>,
+) -> Result<(LlamaWeights, Option<Fp8Report>)> {
+    let mut w = load_weights(dir, cfg)?;
+    let Some(q) = fp8 else {
+        return Ok((w, None));
+    };
+    let report = w.quantize_fp8(cfg, q)?;
+    Ok((w, Some(report)))
 }
 
 /// Rotate-half RoPE caches `[tokens, head_dim]` for positions `0..tokens`.
@@ -1989,8 +2277,22 @@ fn layer_views<'a>(
     w: &'a LlamaWeights,
     cfg: &LlamaConfig,
     rope: &reng_synapse::RopeTables<'a>,
-) -> reng_synapse::ModelWeights<'a> {
+) -> Result<reng_synapse::ModelWeights<'a>> {
     use reng_synapse::{LayerWeights, ModelWeights};
+    if w.fp8.is_some() {
+        // The host side of fp8 is done (quantized codes and per-channel
+        // scales are in `LlamaWeights::fp8`); the node that consumes them
+        // is not. Failing here beats running the bf16 weights and calling
+        // the answer fp8.
+        return Err(Error::Other(
+            "fp8 weights are quantized on the host but no device gemm form is wired yet: \
+             run reng-fp8-probe to choose between the plain `gemm` over two fp8 operands \
+             (with an in-recipe cast_bf16_to_hf8 of the activation and the exponent bias \
+             as the scale) and the `fp8_gemm_bf16` complex guid (with the per-channel \
+             scaleB), then wire the winner into reng_synapse::model::build_layer"
+                .into(),
+        ));
+    }
     let hd = cfg.head_dim();
     let act = cfg.activation().expect("checked by LlamaConfig::load");
     let layers: Vec<LayerWeights<'a>> = w
@@ -2042,12 +2344,12 @@ fn layer_views<'a>(
             eps: cfg.rms_norm_eps,
         })
         .collect();
-    ModelWeights {
+    Ok(ModelWeights {
         layers,
         final_gamma: &w.final_gamma,
         lm_head: &w.lm_head,
         final_softcap: cfg.final_softcap(),
-    }
+    })
 }
 
 /// Run causal prefill on `ids` through the fused engine and return logits
@@ -2066,7 +2368,7 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     padded.resize(tokens, 0);
     let rope = cfg.rope_caches_for(tokens, table_seq_len(real, tokens));
     let x = embed_tokens(w, cfg, &padded);
-    let m = layer_views(w, cfg, &rope.tables());
+    let m = layer_views(w, cfg, &rope.tables())?;
     let mut logits = reng_synapse::model_forward_bf16(
         &x,
         &m,
@@ -2119,7 +2421,7 @@ impl<'a> Generator<'a> {
         let rope = cfg.rope_caches(capacity);
         // The cached recipes take RoPE rows as per-step inputs, so the layer
         // views carry no tables (they would have to outlive `rope`).
-        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]))?;
         let embed = reng_synapse::EmbedTable {
             rows: &w.embed,
             scale: cfg.embed_scale(),
@@ -2272,7 +2574,7 @@ impl<'a> BatchedGenerator<'a> {
         let rope = cfg.rope_caches(capacity);
         // The batched recipes take RoPE rows as per-step inputs, so the
         // layer views carry no tables (they would have to outlive `rope`).
-        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]))?;
         let embed = reng_synapse::EmbedTable {
             rows: &w.embed,
             scale: cfg.embed_scale(),
@@ -2438,7 +2740,7 @@ impl<'a> TpGenerator<'a> {
             eprintln!("{msg}");
         }
         let rope = cfg.rope_caches(capacity);
-        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]));
+        let m = layer_views(w, cfg, &reng_synapse::RopeTables::single(&[], &[]))?;
         let embed = reng_synapse::EmbedTable {
             rows: &w.embed,
             scale: cfg.embed_scale(),
@@ -3483,6 +3785,7 @@ mod tests {
             final_gamma: vec![1.0; 4],
             // Tied: the same view, counted once by `footprint`.
             lm_head: embed,
+            fp8: None,
         };
         let l0 = &full.layers[0];
         assert!(!l0.wq.is_mapped() && !l0.wo.is_mapped());
@@ -3596,6 +3899,207 @@ mod tests {
         let l = [0.1, 0.9, 0.3, 2.0, -1.0, 0.0];
         assert_eq!(argmax_rows(&l, 3), vec![1, 0]);
     }
+
+    /// A minimal Llama checkpoint (one layer, everything bf16) so the fp8
+    /// switch can be exercised through the real loader.
+    fn write_tiny_llama(path: &Path) -> LlamaConfig {
+        let cfg: LlamaConfig = serde_json::from_str(
+            r#"{"model_type": "llama", "hidden_size": 8, "intermediate_size": 16,
+                "num_hidden_layers": 1, "num_attention_heads": 2,
+                "num_key_value_heads": 2, "rms_norm_eps": 1e-5, "vocab_size": 8,
+                "tie_word_embeddings": true}"#,
+        )
+        .unwrap();
+        // Name, element count; every tensor is bf16 and 2-aligned, so the
+        // loader views all of them in place.
+        let tensors: [(&str, usize); 11] = [
+            ("model.embed_tokens.weight", 8 * 8),
+            ("model.layers.0.input_layernorm.weight", 8),
+            ("model.layers.0.post_attention_layernorm.weight", 8),
+            ("model.layers.0.self_attn.q_proj.weight", 8 * 8),
+            ("model.layers.0.self_attn.k_proj.weight", 8 * 8),
+            ("model.layers.0.self_attn.v_proj.weight", 8 * 8),
+            ("model.layers.0.self_attn.o_proj.weight", 8 * 8),
+            ("model.layers.0.mlp.gate_proj.weight", 16 * 8),
+            ("model.layers.0.mlp.up_proj.weight", 16 * 8),
+            ("model.layers.0.mlp.down_proj.weight", 8 * 16),
+            ("model.norm.weight", 8),
+        ];
+        let shape = |name: &str, n: usize| -> String {
+            match name {
+                "model.embed_tokens.weight" => "[8, 8]".into(),
+                "model.layers.0.self_attn.q_proj.weight" => "[8, 8]".into(),
+                "model.layers.0.self_attn.k_proj.weight" => "[8, 8]".into(),
+                "model.layers.0.self_attn.v_proj.weight" => "[8, 8]".into(),
+                "model.layers.0.self_attn.o_proj.weight" => "[8, 8]".into(),
+                "model.layers.0.mlp.gate_proj.weight" => "[16, 8]".into(),
+                "model.layers.0.mlp.up_proj.weight" => "[16, 8]".into(),
+                "model.layers.0.mlp.down_proj.weight" => "[8, 16]".into(),
+                _ => format!("[{n}]"),
+            }
+        };
+        let mut data: Vec<u8> = Vec::new();
+        let mut entries: Vec<String> = Vec::new();
+        let mut seed = 1u32;
+        for (name, n) in tensors {
+            let start = data.len();
+            for k in 0..n {
+                // A spread wide enough that the per-channel scales differ
+                // between rows, with one large weight per matrix.
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let x = (seed >> 8) as f32 / f32::from(u16::MAX) / 256.0 - 0.5;
+                let x = if k == 0 { x * 30.0 } else { x };
+                data.extend_from_slice(&f32_to_bf16(x).to_le_bytes());
+            }
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"BF16\",\"shape\":{},\"data_offsets\":[{start},{}]}}",
+                shape(name, n),
+                data.len()
+            ));
+        }
+        let mut header = format!("{{{}}}", entries.join(","));
+        while header.len() % 8 != 0 {
+            header.push(' ');
+        }
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path.join("model.safetensors"), bytes).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn the_fp8_switch_reads_the_variable_and_the_flag() {
+        // Off by default and off for every falsy value, flag or not.
+        assert_eq!(fp8_switch(None, false).unwrap(), None);
+        for off in ["", "0", "off", "false", "no", " OFF "] {
+            assert_eq!(fp8_switch(Some(off), false).unwrap(), None, "{off:?}");
+            assert_eq!(fp8_switch(Some(off), true).unwrap(), None, "{off:?}");
+        }
+        // The flag alone, and the truthy values, mean the defaults.
+        let default = Fp8Config::default();
+        assert_eq!(fp8_switch(None, true).unwrap(), Some(default));
+        for on in ["1", "on", "true", "YES"] {
+            assert_eq!(
+                fp8_switch(Some(on), false).unwrap(),
+                Some(default),
+                "{on:?}"
+            );
+        }
+        assert_eq!(default.format, Fp8Format::E4M3);
+        assert_eq!(default.scaling, Scaling::PerChannel);
+        assert_eq!(format!("{default}"), "e4m3/pcs backoff 1");
+        // Settings, in either order and with either separator.
+        let c = fp8_switch(Some("e5m2:hw"), false).unwrap().unwrap();
+        assert_eq!((c.format, c.scaling), (Fp8Format::E5M2, Scaling::HwExpBias));
+        let c = fp8_switch(Some("unit,backoff=0.5"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!((c.scaling, c.backoff), (Scaling::Unit, 0.5));
+        // Nonsense is an error, not a silent default.
+        assert!(fp8_switch(Some("e4m3:banana"), false).is_err());
+        assert!(fp8_switch(Some("backoff=0"), false).is_err());
+        assert!(fp8_switch(Some("backoff=2"), false).is_err());
+        assert!(fp8_switch(Some("backoff=x"), false).is_err());
+    }
+
+    #[test]
+    fn the_fp8_switch_off_leaves_the_weights_bf16() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_tiny_llama(dir.path());
+        let plain = load_weights(dir.path(), &cfg).unwrap();
+        let (off, report) = load_weights_fp8(dir.path(), &cfg, None).unwrap();
+        assert!(report.is_none());
+        assert!(off.fp8.is_none());
+        assert_eq!(off.fp8_bytes(), 0);
+        // Every matrix is still the checkpoint's own mapped bf16 bytes.
+        for (a, b) in [
+            (&plain.embed, &off.embed),
+            (&plain.lm_head, &off.lm_head),
+            (&plain.layers[0].wq, &off.layers[0].wq),
+            (&plain.layers[0].wd, &off.layers[0].wd),
+        ] {
+            assert!(a.is_mapped() && b.is_mapped());
+            assert_eq!(&a[..], &b[..]);
+        }
+        assert_eq!(plain.final_gamma, off.final_gamma);
+    }
+
+    #[test]
+    fn the_fp8_switch_on_quantizes_the_projections_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_tiny_llama(dir.path());
+        let plain = load_weights(dir.path(), &cfg).unwrap();
+        let (on, report) = load_weights_fp8(dir.path(), &cfg, Some(Fp8Config::default())).unwrap();
+        let report = report.expect("a report when the switch is on");
+        let fp8 = on.fp8.as_ref().expect("quantized layers");
+        assert_eq!(fp8.len(), 1);
+        assert_eq!(report.matrices, 7);
+        // 8x8 x 4 + 16x8 x 2 + 8x16 = 640 weights.
+        assert_eq!(report.fp8_bytes, 640);
+        assert_eq!(report.bf16_bytes, 1280);
+        assert_eq!(on.fp8_bytes(), 640);
+        // One scale per output channel of each matrix.
+        assert_eq!(report.scale_bytes, 4 * (8 + 8 + 8 + 8 + 16 + 16 + 8));
+        let l = &fp8[0];
+        assert_eq!((l.wq.rows, l.wq.cols), (8, 8));
+        assert_eq!((l.wk.rows, l.wk.cols), (8, 8));
+        assert_eq!((l.wd.rows, l.wd.cols), (8, 16));
+        assert_eq!(l.wq.exp_bias, 7);
+        assert_eq!(l.wq.format, Fp8Format::E4M3);
+        assert!(report.mean_rel > 0.0 && report.mean_rel < 0.05);
+        // The bf16 views are untouched by the quantization: the norms, the
+        // embedding table and the head are the same bytes, and so are the
+        // projections themselves (the codes are a second copy).
+        assert!(on.embed.is_mapped() && on.lm_head.is_mapped());
+        assert_eq!(&on.embed[..], &plain.embed[..]);
+        assert_eq!(&on.lm_head[..], &plain.lm_head[..]);
+        assert_eq!(on.final_gamma, plain.final_gamma);
+        assert_eq!(on.layers[0].g1, plain.layers[0].g1);
+        assert_eq!(&on.layers[0].wq[..], &plain.layers[0].wq[..]);
+        // The codes really are the weights: the round trip of the largest
+        // element of a row is exact, and the whole row is close.
+        let back = l.wq.dequantize();
+        for r in 0..l.wq.rows {
+            for c in 0..l.wq.cols {
+                let want = reng_fp8::bf16_to_f32(on.layers[0].wq[r * l.wq.cols + c]);
+                let got = back[r * l.wq.cols + c];
+                assert!(
+                    (got - want).abs() <= want.abs() * 0.07,
+                    "row {r} col {c}: {want} came back as {got}"
+                );
+            }
+        }
+    }
+
+    /// The device side is not wired, and the switch says so instead of
+    /// quietly running the bf16 weights. `layer_views` refuses before any
+    /// SynapseAI call, so this test never touches a card.
+    #[cfg(feature = "link-synapse")]
+    #[test]
+    fn fp8_weights_are_refused_until_the_gemm_form_is_wired() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_tiny_llama(dir.path());
+        let (w, _) = load_weights_fp8(dir.path(), &cfg, Some(Fp8Config::default())).unwrap();
+        let err = prefill_logits(&w, &cfg, &[0, 1]).unwrap_err().to_string();
+        assert!(err.contains("no device gemm form is wired yet"), "{err}");
+        assert!(err.contains("reng-fp8-probe"), "{err}");
+    }
+
+    #[test]
+    fn fp8_refuses_a_tensor_parallel_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_tiny_llama(dir.path());
+        let w = load_weights(dir.path(), &cfg).unwrap();
+        let mut shard = w.shard(&cfg, 0, 2);
+        assert!(shard.fp8.is_none());
+        let err = shard
+            .quantize_fp8(&cfg.shard(0, 2), Fp8Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("strided column window"), "{err}");
+    }
+
     #[test]
     fn tensor_parallel_shard_takes_rows_and_columns() {
         // hidden 4, 2 heads of head_dim 2, 2 kv heads, intermediate 4; two shards.
@@ -3633,6 +4137,7 @@ mod tests {
             layers: vec![layer],
             final_gamma: vec![1.0; 4],
             lm_head: mat(8, 4),
+            fp8: None,
         };
         let s1 = w.shard(&cfg, 1, 2);
         let c1 = cfg.shard(1, 2);

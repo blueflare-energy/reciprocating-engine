@@ -12,7 +12,7 @@
     dead_code
 )]
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 
 pub type synStatus = c_int;
 pub type synDeviceId = u32;
@@ -29,6 +29,12 @@ pub const SYN_DEVICE_GAUDI2: c_int = 4;
 pub const SYN_TYPE_BF16: c_int = 1 << 1;
 pub const SYN_TYPE_F32: c_int = 1 << 2; // syn_type_single
 pub const SYN_TYPE_INT32: c_int = 1 << 4; // syn_type_int32
+/// `syn_type_fp8_143` (8192): 1 sign, 4 exponent, 3 mantissa bits, the
+/// vendor's `hf8`.
+pub const SYN_TYPE_FP8_143: c_int = 1 << 13;
+/// `syn_type_fp8_152` (16384): 1 sign, 5 exponent, 2 mantissa bits, the
+/// vendor's `f8`.
+pub const SYN_TYPE_FP8_152: c_int = 1 << 14;
 pub const SYN_TENSOR_DATA: c_int = 0; // DATA_TENSOR
 pub const SYN_GEOMETRY_SIZES: c_int = 1; // synGeometryMaxSizes
 pub const SYN_HOST_TO_DRAM: c_int = 0;
@@ -37,6 +43,36 @@ pub const SYN_DRAM_TO_DRAM: c_int = 2;
 /// synStatus for a second synInitialize in one process.
 pub const SYN_OBJECT_ALREADY_INITIALIZED: synStatus = 5;
 pub const HABANA_DIM_MAX: usize = 25;
+
+/// `synQuantizationProperty`: which quantization record
+/// `synTensorSetQuantizationData` is given. Only the floating-point one is
+/// used here; the MME reads the exponent bias out of it and ignores the
+/// integer records for an fp8 tensor.
+pub const SYN_QUANT_DYNAMIC_RANGE: c_int = 0;
+pub const SYN_QUANT_METADATA: c_int = 1;
+pub const SYN_FP_QUANT_METADATA: c_int = 2;
+pub const SYN_QUANT_FLAGS: c_int = 3;
+pub const SYN_QUANT_PC_DYNAMIC_RANGE: c_int = 4;
+
+/// `synFpQuantParam { double scale; unsigned expBias; }`, 16 bytes with its
+/// trailing padding. On Gaudi2 the plain `gemm` path honours `expBias`
+/// (one of 3, 7, 11, 15 for E4M3) and ignores `scale`.
+#[repr(C)]
+pub struct synFpQuantParam {
+    pub scale: f64,
+    pub expBias: c_uint,
+}
+
+/// `synFpQuantMetadata { synDataType dataType; synFpQuantParam*
+/// fpQuantParams; unsigned numFpQuantParams; }`, 24 bytes with its
+/// padding. `numFpQuantParams` above 1 asks for per-channel quantization,
+/// which the plain `gemm` path ignores.
+#[repr(C)]
+pub struct synFpQuantMetadata {
+    pub dataType: c_int,
+    pub fpQuantParams: *const synFpQuantParam,
+    pub numFpQuantParams: c_uint,
+}
 
 #[repr(C)]
 pub struct synTensorGeometry {
@@ -195,6 +231,12 @@ unsafe extern "C" {
         geometryType: c_int,
     ) -> synStatus;
     pub fn synTensorSetDeviceDataType(tensor: synTensor, deviceDataType: c_int) -> synStatus;
+    pub fn synTensorSetQuantizationData(
+        tensor: synTensor,
+        prop: c_int,
+        propVal: *mut c_void,
+        propSize: u64,
+    ) -> synStatus;
     pub fn synNodeCreate(
         graphHandle: synGraphHandle,
         pInputsTensorList: *const synTensor,

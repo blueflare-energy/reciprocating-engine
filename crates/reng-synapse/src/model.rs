@@ -505,9 +505,42 @@ fn post_norm_node(
 }
 
 /// Bytes per element of a device dtype the engine's persistent tensors
-/// take: 2 for bf16, 4 for f32 and int32.
+/// take: 1 for the two fp8 formats, 2 for bf16, 4 for f32 and int32.
 fn elem_bytes(dtype: core::ffi::c_int) -> usize {
-    if dtype == SYN_TYPE_BF16 { 2 } else { 4 }
+    match dtype {
+        SYN_TYPE_FP8_143 | SYN_TYPE_FP8_152 => 1,
+        SYN_TYPE_BF16 => 2,
+        _ => 4,
+    }
+}
+
+/// Attach the floating-point quantization record the MME reads for an fp8
+/// operand: the format and one `synFpQuantParam { scale: 1.0, expBias }`.
+/// The exponent bias is what the descriptor patcher folds into the
+/// multiply, so a power-of-16 per-tensor scale costs no node; `scale` and
+/// per-channel arrays are accepted by the API but ignored by the plain
+/// `gemm` path, where an arbitrary scale needs the `fp8_gemm_<out>` complex
+/// guid and its scale operands instead.
+///
+/// Gaudi2 accepts only 3, 7, 11 and 15 as the E4M3 bias (15 for E5M2); any
+/// other value is rejected by `synTensorSetQuantizationData`.
+fn set_fp8_quant_metadata(t: synTensor, dtype: core::ffi::c_int, exp_bias: u32) -> Result<()> {
+    let param = synFpQuantParam {
+        scale: 1.0,
+        expBias: exp_bias,
+    };
+    let meta = synFpQuantMetadata {
+        dataType: dtype,
+        fpQuantParams: &raw const param,
+        numFpQuantParams: 1,
+    };
+    syn!(synTensorSetQuantizationData(
+        t,
+        SYN_FP_QUANT_METADATA,
+        (&raw const meta).cast::<c_void>().cast_mut(),
+        core::mem::size_of::<synFpQuantMetadata>() as u64,
+    ));
+    Ok(())
 }
 
 pub(crate) fn make_tensor(
@@ -568,8 +601,9 @@ pub(crate) struct Gb<'a> {
     /// Host data per bf16 input: a checkpoint slice borrowed as is, or an
     /// owned conversion (per-step inputs, scaled copies).
     pub data: Vec<std::borrow::Cow<'a, [u16]>>,
-    /// Raw device bytes for non-bf16 inputs (else `data` is converted).
-    pub raw: Vec<Option<Vec<u8>>>,
+    /// Raw device bytes for non-bf16 inputs (else `data` is converted);
+    /// borrowed where the caller keeps them alive, as fp8 weights are.
+    pub raw: Vec<Option<std::borrow::Cow<'a, [u8]>>>,
     /// Per input: a factor applied to the bf16 data while it is staged for
     /// the upload (the attention scale on `wq`), so the host keeps a view of
     /// the checkpoint instead of a scaled copy. `None` for the others.
@@ -800,7 +834,53 @@ impl<'a> Gb<'a> {
         self.names.push(cname);
         self.sizes.push(sizes.to_vec());
         self.data.push(std::borrow::Cow::Owned(Vec::new()));
-        self.raw.push(Some(bytes.to_vec()));
+        self.raw.push(Some(std::borrow::Cow::Owned(bytes.to_vec())));
+        self.scales.push(None);
+        self.strides.push(None);
+        Ok(t)
+    }
+
+    /// A persistent input tensor of fp8 codes (one byte per element) with
+    /// the quantization metadata the MME reads: a quantized weight matrix
+    /// as [`reng_fp8::Quantized::codes`] holds it, borrowed so that
+    /// nothing is copied before the upload.
+    ///
+    /// `exp_bias` is the per-tensor exponent bias
+    /// ([`reng_fp8::Quantized::exp_bias`]); it goes into the recipe-cache
+    /// digest alongside the dtype, so an fp8 recipe and its bf16 twin, and
+    /// two fp8 recipes at different biases, never share a cached recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any SynapseAI call fails; in particular
+    /// `synTensorSetQuantizationData` rejects an exponent bias outside
+    /// `{3, 7, 11, 15}` on Gaudi2.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sizes` and the code count disagree.
+    pub fn input_fp8(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        codes: std::borrow::Cow<'a, [u8]>,
+        format: reng_fp8::Fp8Format,
+        exp_bias: u32,
+    ) -> Result<synTensor> {
+        assert_eq!(
+            sizes.iter().product::<u64>() as usize,
+            codes.len(),
+            "input {name}: sizes {sizes:?} against {} codes",
+            codes.len()
+        );
+        let dtype = format.syn_data_type();
+        self.note_tensor("in", name, sizes, dtype, &format!("expbias={exp_bias}"));
+        let (t, cname) = make_tensor(self.graph, name, sizes, dtype, true)?;
+        set_fp8_quant_metadata(t, dtype, exp_bias)?;
+        self.names.push(cname);
+        self.sizes.push(sizes.to_vec());
+        self.data.push(std::borrow::Cow::Owned(Vec::new()));
+        self.raw.push(Some(codes));
         self.scales.push(None);
         self.strides.push(None);
         Ok(t)
@@ -1070,6 +1150,18 @@ pub(crate) fn build_layer<'a>(
     // Weights are the checkpoint's bf16 `[out, in]` matrices, borrowed:
     // as the gemms' transposed B operand (`[K = in, N = out]`) they need
     // no copy; the per-head form is a free reshape of the same matrix.
+    //
+    // TODO(fp8): the seven projections below are what an fp8 weight
+    // replaces. The host side is ready (`reng_fp8` quantizes a `[out, in]`
+    // matrix and `Gb::input_fp8` creates the operand with its exponent
+    // bias as `SYN_FP_QUANT_METADATA`), but the node that consumes it is
+    // not chosen: the MME rejects a bf16 activation against an fp8 weight,
+    // so the two candidates are the plain `gemm` over two fp8 operands
+    // with an in-recipe `cast_bf16_to_hf8` of the activation, and the
+    // `fp8_gemm_bf16` complex guid with a per-output-channel `scaleB`.
+    // `reng-fp8-probe` (crate `reng-model`, module `reng_synapse::fp8`)
+    // runs both at the decode shapes and times them; wire the winner here
+    // and drop the guard in `reng_model::layer_views`.
     // Every MME node runs at the same rate whatever its N, except that a
     // batch_gemm over per-head blocks runs each head as an N = hd gemm at
     // a fraction of the rate (12% of a 1.7B prefill), so the plain form is

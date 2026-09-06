@@ -2,12 +2,17 @@
 //! report per-position argmax tokens, optionally comparing against a reference
 //! JSON produced by an HF transformers run of the same token ids.
 //!
-//! `reng-prefill <model_dir> <out.json> [--ref <ref.json>] <id> [<id> ...]`
+//! `reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] <id> [<id> ...]`
+//!
+//! `--fp8` (or `RENG_FP8=1`) quantizes the projections at load; see
+//! [`reng_model::fp8_switch`] for the values the variable takes.
 //!
 //! The reference JSON has `argmax` (per position), `last_logits` (full row),
 //! and `last_top5` (ids). The engine's output JSON has the same fields.
 
-use reng_model::{LlamaConfig, argmax_rows, load_weights, prefill_logits};
+use reng_model::{
+    LlamaConfig, argmax_rows, fp8_switch, load_weights_fp8, prefill_logits, take_fp8_flag,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -41,10 +46,15 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() -> reng_core::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let fp8 = fp8_switch(
+        std::env::var("RENG_FP8").ok().as_deref(),
+        take_fp8_flag(&mut args),
+    )?;
     if args.len() < 3 {
         return Err(reng_core::Error::Other(
-            "usage: reng-prefill <model_dir> <out.json> [--ref <ref.json>] <id> [<id> ...]".into(),
+            "usage: reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] <id> [<id> ...]"
+                .into(),
         ));
     }
     let dir = Path::new(&args[0]);
@@ -65,7 +75,13 @@ fn main() -> reng_core::Result<()> {
 
     let t0 = Instant::now();
     let cfg = LlamaConfig::load(dir)?;
-    let w = load_weights(dir, &cfg)?;
+    let (w, fp8_report) = load_weights_fp8(dir, &cfg, fp8)?;
+    if let Some(r) = fp8_report {
+        println!(
+            "fp8 {}: {r}",
+            fp8.expect("a report means the switch was on")
+        );
+    }
     let (mapped, owned) = w.footprint();
     println!(
         "loaded {} layers, hidden {}, inter {}, heads {}/{} kv, head_dim {}, vocab {} in {:.2}s (mapped {:.2} GB, owned {:.2} GB)",

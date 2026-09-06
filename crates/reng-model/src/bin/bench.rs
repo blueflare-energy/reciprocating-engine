@@ -22,7 +22,10 @@
 use reng_ceiling::{
     HardwareSpec, Precision, decode_ceiling, model_from_hf_config, prefill_ceiling,
 };
-use reng_model::{BatchedGenerator, Generator, LlamaConfig, load_weights};
+use reng_model::{
+    BatchedGenerator, Fp8Config, Generator, LlamaConfig, fp8_switch, load_weights_fp8,
+    take_fp8_flag,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -37,11 +40,16 @@ struct Args {
     warmup: usize,
     batch: usize,
     stagger: usize,
+    fp8: Option<Fp8Config>,
 }
 
 fn parse_args() -> reng_core::Result<Args> {
-    let usage = "usage: reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--warmup <steps>] [--batch <n>] [--stagger <k>]";
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage: reng-bench <model_dir> <out.json> [--prompt <tokens>] [--new <tokens>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--warmup <steps>] [--batch <n>] [--stagger <k>] [--fp8]";
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let fp8 = fp8_switch(
+        std::env::var("RENG_FP8").ok().as_deref(),
+        take_fp8_flag(&mut args),
+    )?;
     if args.len() < 2 {
         return Err(reng_core::Error::Other(usage.into()));
     }
@@ -56,6 +64,7 @@ fn parse_args() -> reng_core::Result<Args> {
         warmup: 4,
         batch: 1,
         stagger: 0,
+        fp8,
     };
     let mut i = 2;
     while i + 1 < args.len() {
@@ -117,8 +126,14 @@ fn main() -> reng_core::Result<()> {
         .map_or_else(|| shape.name.clone(), |n| n.to_string_lossy().into_owned());
     let hw = HardwareSpec::gaudi2();
     let t_load = Instant::now();
-    let w = load_weights(dir, &cfg)?;
+    let (w, fp8_report) = load_weights_fp8(dir, &cfg, a.fp8)?;
     let load_s = t_load.elapsed().as_secs_f64();
+    if let Some(r) = fp8_report {
+        println!(
+            "fp8 {}: {r}",
+            a.fp8.expect("a report means the switch was on")
+        );
+    }
     let (mapped, owned) = w.footprint();
     println!(
         "loaded weights in {load_s:.2}s (mapped {:.2} GB, owned {:.2} GB)",

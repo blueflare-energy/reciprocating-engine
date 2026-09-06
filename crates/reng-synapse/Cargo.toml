@@ -16,6 +16,7 @@ link-synapse = []
 
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
+reng-fp8 = { path = "../reng-fp8", version = "0.0.1" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

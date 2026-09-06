@@ -196,6 +196,11 @@ mod batched;
 #[cfg(feature = "link-synapse")]
 pub use batched::BatchedModel;
 
+/// FP8 operands on the MME: fp8 tensor creation with the vendor's
+/// quantization metadata, and the probes that decide the gemm form.
+#[cfg(feature = "link-synapse")]
+pub mod fp8;
+
 #[cfg(feature = "link-synapse")]
 mod probe;
 

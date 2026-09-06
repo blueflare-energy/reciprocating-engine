@@ -14,6 +14,7 @@ link-synapse = ["reng-synapse/link-synapse"]
 [dependencies]
 reng-core = { path = "../reng-core", version = "0.0.1" }
 reng-synapse = { path = "../reng-synapse", version = "0.0.1" }
+reng-fp8 = { path = "../reng-fp8", version = "0.0.1" }
 reng-ceiling = { path = "../reng-ceiling", version = "0.0.1" }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
@@ -41,4 +42,15 @@ required-features = ["link-synapse"]
 [[bin]]
 name = "reng-tp"
 path = "src/bin/tp.rs"
+required-features = ["link-synapse"]
+
+# Host-only: loads a checkpoint, quantizes its projections and reports the
+# sizes and the error, with no device contact at all.
+[[bin]]
+name = "reng-fp8-quantize"
+path = "src/bin/fp8_quantize.rs"
+
+[[bin]]
+name = "reng-fp8-probe"
+path = "src/bin/fp8_probe.rs"
 required-features = ["link-synapse"]

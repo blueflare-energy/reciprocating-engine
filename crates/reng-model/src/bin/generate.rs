@@ -15,9 +15,15 @@
 //! the reference's best candidate in the reference's own f32 logits; such a
 //! near-tie is within bf16 rounding and is reported as one instead.
 //!
-//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]`
+//! `--fp8` (or `RENG_FP8=1`) quantizes the projections at load; see
+//! [`reng_model::fp8_switch`] for the values the variable takes.
+//!
+//! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] [--fp8] <id> [<id> ...]`
 
-use reng_model::{Generator, LlamaConfig, argmax_rows, load_weights, prefill_logits};
+use reng_model::{
+    Fp8Config, Generator, LlamaConfig, argmax_rows, fp8_switch, load_weights_fp8, prefill_logits,
+    take_fp8_flag,
+};
 use std::path::Path;
 use std::time::Instant;
 
@@ -69,12 +75,17 @@ struct Args {
     decode_rows: usize,
     capacity: usize,
     recompute: bool,
+    fp8: Option<Fp8Config>,
     ids: Vec<u32>,
 }
 
 fn parse_args() -> reng_core::Result<Args> {
-    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] <id> [<id> ...]";
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage: reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] [--fp8] <id> [<id> ...]";
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let fp8 = fp8_switch(
+        std::env::var("RENG_FP8").ok().as_deref(),
+        take_fp8_flag(&mut args),
+    )?;
     if args.len() < 4 {
         return Err(reng_core::Error::Other(usage.into()));
     }
@@ -135,6 +146,7 @@ fn parse_args() -> reng_core::Result<Args> {
         decode_rows,
         capacity,
         recompute,
+        fp8,
         ids,
     })
 }
@@ -192,7 +204,13 @@ fn main() -> reng_core::Result<()> {
 
     let t_start = Instant::now();
     let cfg = LlamaConfig::load(Path::new(&a.dir))?;
-    let w = load_weights(Path::new(&a.dir), &cfg)?;
+    let (w, fp8_report) = load_weights_fp8(Path::new(&a.dir), &cfg, a.fp8)?;
+    if let Some(r) = fp8_report {
+        println!(
+            "fp8 {}: {r}",
+            a.fp8.expect("a report means the switch was on")
+        );
+    }
     let (mapped, owned) = w.footprint();
     println!(
         "loaded weights in {:.2}s (mapped {:.2} GB, owned {:.2} GB)",

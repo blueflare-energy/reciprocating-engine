@@ -119,6 +119,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   its type needs. The permuted rows are owned rather than mapped: about
   0.8 GB for Phi-4-mini, and a tensor-parallel shard of them is copied
   again per rank.
+- Host side of FP8 weight quantization (`reng-fp8`): a bf16 `[out, in]`
+  matrix becomes one byte per weight in E4M3 (`syn_type_fp8_143`) or E5M2
+  (`syn_type_fp8_152`) plus one f32 scale per output channel, rounded to
+  nearest even and saturated to the format's largest finite magnitude, as
+  the device cast kernel's `CAST_CLIP` form does. Three scale schemes:
+  per-output-channel absmax (an arbitrary f32, which the `fp8_gemm_bf16`
+  complex guid takes as its `scaleB` operand), one hardware-aligned
+  exponent bias out of `{3, 7, 11, 15}` for the whole matrix (which the MME
+  descriptor applies for free), and unit. The encoder is bit-exact against
+  PyTorch's `float8_e4m3fn` / `float8_e5m2` casts over 25216 values of
+  random, Llama-shaped and real SmolLM2-135M rows
+  (`tools/fp8_fixtures.py` writes the fixtures, the checkpoint rows read
+  with numpy straight out of the safetensors file); the only divergence is
+  the saturation, where torch keeps going to 448 and Gaudi's range stops at
+  240. Rows are quantized over up to eight threads.
+  `RENG_FP8=1` or `--fp8` quantizes a model's q/k/v/o/gate/up/down at load
+  (`load_weights_fp8`), leaving the norms, the embedding table and the LM
+  head bf16; `RENG_FP8=e5m2:hw` and `RENG_FP8=pcs,backoff=0.5` select the
+  format, the scheme and the backoff. `reng-fp8-quantize` runs that pass on
+  its own and reports the bytes and the error: SmolLM2-135M 0.198 GiB ->
+  0.099 GiB and Llama-3.2-3B 5.25 GiB -> 2.63 GiB of projection weights,
+  mean relative error 0.0225 per weight in either case.
+  On the graph side, `Gb::input_fp8` creates a persistent fp8 tensor and
+  attaches the exponent bias as `SYN_FP_QUANT_METADATA`, and
+  `reng_synapse::fp8` builds the probe graphs. The node that consumes such
+  an operand is not chosen yet: the MME refuses a bf16 activation against
+  an fp8 weight, so the candidates are the plain `gemm` over two fp8
+  operands with an in-recipe `cast_bf16_to_hf8` of the activation and the
+  `fp8_gemm_bf16` complex guid with the per-channel `scaleB`.
+  `reng-fp8-probe` runs both at the decode shapes and times them against
+  bf16; until it has, the switch fails with that message instead of
+  quietly running the bf16 weights.
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds
