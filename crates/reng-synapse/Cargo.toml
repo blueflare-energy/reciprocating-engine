@@ -156,3 +156,8 @@ required-features = ["link-synapse"]
 name = "reng-gather-test"
 path = "src/bin/gather_test.rs"
 required-features = ["link-synapse"]
+
+[[bin]]
+name = "reng-hccl-test"
+path = "src/bin/hccl_test.rs"
+required-features = ["link-synapse"]

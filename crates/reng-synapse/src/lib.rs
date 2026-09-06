@@ -168,6 +168,10 @@ pub use batched::BatchedModel;
 #[cfg(feature = "link-synapse")]
 mod probe;
 
+/// HCCL collectives (one card per process) and the `reng-hccl-test` worker.
+#[cfg(feature = "link-synapse")]
+pub mod hccl;
+
 #[cfg(feature = "link-synapse")]
 pub use probe::{
     NodeInput, SYN_TYPE_INT32, bench_node, run_node, run_node_extra, run_node_extra_typed,

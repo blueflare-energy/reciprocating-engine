@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `reng-synapse`: HCCL bindings (`ffi.rs`: the `hccl.h` collectives, the
+  1032-byte `hcclUniqueId` passed by value, `synEventElapsedTime`) and a
+  `hccl` module with one card per process (`Card`), a communicator
+  (`Comm`, unique id carried by file) and the `reng-hccl-test` probe: the
+  coordinator spawns one worker per module id, verifies a summed
+  all-reduce, times 16 KB / 1 MB / 16 MB all-reduces and checks that a
+  recipe launch, a collective and another launch on one stream stay
+  ordered. `Runtime::new_on` compiles a recipe onto a caller-owned device
+  and stream; `Gb::scratch_alias_typed` aliases an f32 scratch tensor.
+  On the Gaudi2 box the first collective fails inside HCL
+  (`credit_manager.cpp: No available intermediate buffer`) because the
+  stack's completion-queue counters never advance; see the multi-card
+  report.
+
 - `reng-synapse`: a Llama-style decoder (RMSNorm, RoPE, grouped-query
   attention, SwiGLU) as one fused SynapseAI recipe; attention batched over
   heads in 4-D tensors; a KV cache updated inside the recipe (placement

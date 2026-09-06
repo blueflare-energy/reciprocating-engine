@@ -48,12 +48,12 @@ macro_rules! syn {
 /// produces this exact NaN, so "none left" means the recipe has written the
 /// whole output.
 const SENTINEL_BF16: u16 = 0x7FC1;
-const SENTINEL_D32: u32 = 0x7FC1_7FC1;
+pub(crate) const SENTINEL_D32: u32 = 0x7FC1_7FC1;
 /// A second quiet-NaN pattern the HOST buffer is filled with before every
 /// device-to-host copy; "none left" means the copy has landed. Distinct from
 /// the device sentinel so the two conditions stay separable.
 const HOST_SENTINEL_BF16: u16 = 0x7FC2;
-const HOST_SENTINEL_D32: u32 = 0x7FC2_7FC2;
+pub(crate) const HOST_SENTINEL_D32: u32 = 0x7FC2_7FC2;
 /// Upper bound on waiting for a recipe's output to complete.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -465,8 +465,28 @@ impl<'a> Runtime<'a> {
     /// second recipe over the same weights and KV cache costs only its own
     /// per-step inputs and output. The child must be dropped before the
     /// parent.
+    pub fn new_with(gb: Gb<'a>, out: Out, parent: Option<&Runtime<'_>>) -> Result<Self> {
+        let borrowed = parent.map(|p| (p.dev, p.stream));
+        Self::build(gb, out, parent, borrowed)
+    }
+
+    /// Like [`Runtime::new`], but on a device and stream the caller has
+    /// already acquired and owns (the multi-card probe, whose process holds
+    /// exactly one device for its HCCL rank). Nothing is shared with another
+    /// runtime, and drop leaves the device and stream alone.
+    pub fn new_on(gb: Gb<'a>, out: Out, dev: synDeviceId, stream: synStreamHandle) -> Result<Self> {
+        Self::build(gb, out, None, Some((dev, stream)))
+    }
+
+    /// Persistent tensors named like `parent`'s bind to its buffers; a
+    /// `borrowed` device and stream are used instead of acquiring one.
     #[allow(clippy::too_many_lines)]
-    pub fn new_with(mut gb: Gb<'a>, out: Out, parent: Option<&Runtime<'_>>) -> Result<Self> {
+    fn build(
+        mut gb: Gb<'a>,
+        out: Out,
+        parent: Option<&Runtime<'_>>,
+        borrowed: Option<(synDeviceId, synStreamHandle)>,
+    ) -> Result<Self> {
         gb.serialize_if_requested()?;
         let trace = env_on("RENG_RECIPE_TRACE");
         let t0 = Instant::now();
@@ -486,8 +506,8 @@ impl<'a> Runtime<'a> {
             name_ptrs.len() as u32
         ));
 
-        let (dev, stream) = match parent {
-            Some(p) => (p.dev, p.stream),
+        let (dev, stream) = match borrowed {
+            Some(ds) => ds,
             None => {
                 let dev = crate::device::acquire_device()?;
                 let mut stream: synStreamHandle = core::ptr::null_mut();
@@ -661,7 +681,7 @@ impl<'a> Runtime<'a> {
             gb,
             dev,
             stream,
-            owns_device: parent.is_none(),
+            owns_device: borrowed.is_none(),
             recipe,
             infos,
             info_index,

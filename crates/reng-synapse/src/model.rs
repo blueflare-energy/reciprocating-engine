@@ -615,7 +615,8 @@ impl<'a> Gb<'a> {
         self.scratch_typed(name, sizes, SYN_TYPE_BF16)
     }
 
-    fn scratch_typed(
+    /// [`Gb::scratch`] with an explicit dtype (bf16 or f32).
+    pub fn scratch_typed(
         &mut self,
         name: &str,
         sizes: &[u64],
@@ -641,15 +642,31 @@ impl<'a> Gb<'a> {
     ///
     /// Panics if `of` is not a scratch tensor of this graph.
     pub fn scratch_alias(&mut self, name: &str, sizes: &[u64], of: &str) -> Result<synTensor> {
+        self.scratch_alias_typed(name, sizes, of, SYN_TYPE_BF16)
+    }
+
+    /// [`Gb::scratch_alias`] with an explicit dtype (bf16 or f32), which
+    /// must be the aliased tensor's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `of` is not a scratch tensor of this graph.
+    pub fn scratch_alias_typed(
+        &mut self,
+        name: &str,
+        sizes: &[u64],
+        of: &str,
+        dtype: core::ffi::c_int,
+    ) -> Result<synTensor> {
         let sec = *self
             .scratch_sections
             .get(of)
             .unwrap_or_else(|| panic!("no scratch tensor named {of}"));
-        self.note_tensor("alias", name, sizes, SYN_TYPE_BF16, of);
-        let (t, cname) = make_tensor_in(self.graph, name, sizes, SYN_TYPE_BF16, sec)?;
+        self.note_tensor("alias", name, sizes, dtype, of);
+        let (t, cname) = make_tensor_in(self.graph, name, sizes, dtype, sec)?;
         self.scratch_names.push(cname);
         self.scratch_sizes.push(sizes.to_vec());
-        self.scratch_f32.push(false);
+        self.scratch_f32.push(dtype == SYN_TYPE_F32);
         self.scratch_alias.push(Some(of.to_owned()));
         Ok(t)
     }

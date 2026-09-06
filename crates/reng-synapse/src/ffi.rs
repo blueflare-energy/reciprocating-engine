@@ -3,8 +3,14 @@
 //! Types and signatures mirror `synapse_api.h` / `synapse_common_types.h` from
 //! the Intel Gaudi 1.19.0 stack; only the entry points needed for a matmul are
 //! declared. `synGEMMParams` is C++-only upstream, so it is redeclared here as
-//! a `repr(C)` struct with the same two-byte layout.
-#![allow(non_camel_case_types, non_snake_case, dead_code)]
+//! a `repr(C)` struct with the same two-byte layout. The HCCL collectives
+//! (`hccl.h`, checked against the 1.24.1 headers) follow at the end.
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
 
 use core::ffi::{c_char, c_int, c_void};
 
@@ -241,4 +247,134 @@ unsafe extern "C" {
         pRecipeHandle: synRecipeHandle,
         flags: u32,
     ) -> synStatus;
+    pub fn synDeviceGetCount(pCount: *mut u32) -> synStatus;
+    pub fn synDeviceGetModuleIDs(pDeviceModuleIds: *mut u32, size: *mut u32) -> synStatus;
+    pub fn synEventElapsedTime(
+        pNanoSeconds: *mut u64,
+        eventHandleStart: synEventHandle,
+        eventHandleEnd: synEventHandle,
+    ) -> synStatus;
+}
+
+unsafe extern "C" {
+    /// libc `_exit`: terminate without atexit handlers or destructors.
+    pub fn _exit(status: c_int) -> !;
+}
+
+/// `synEventCreate` flag: the event carries a device timestamp, so a pair
+/// of them gives `synEventElapsedTime` (`synapse_api_types.h`:
+/// `enum eventCreateFlags {EVENT_COLLECT_TIME = 1}`).
+pub const EVENT_COLLECT_TIME: u32 = 1;
+
+// HCCL (`hccl.h` / `hccl_types.h`, HCCL 2.6.4 in SynapseAI 1.24.1). The
+// symbols are exported by libSynapse.so (no libhccl.so on the stack) and
+// forwarded to libhcl.so; `stream_handle` is a `synStreamHandle`; sendbuff and
+// recvbuff are device addresses from `synDeviceMalloc`.
+pub type hcclComm_t = *mut c_void;
+pub type hcclResult_t = c_int;
+pub type hcclDataType_t = c_int;
+pub type hcclRedOp_t = c_int;
+pub const HCCL_UNIQUE_ID_MAX_BYTES: usize = 1024;
+
+/// `hcclUniqueId`: 1032 bytes, passed BY VALUE to `hcclCommInitRank` (a
+/// memory-class aggregate under the SysV ABI: copied onto the stack).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct hcclUniqueId {
+    pub internal: [u8; HCCL_UNIQUE_ID_MAX_BYTES],
+    pub length: usize,
+}
+
+pub const hcclSuccess: hcclResult_t = 0;
+pub const hcclPortDown: hcclResult_t = 16;
+pub const hcclSum: hcclRedOp_t = 0;
+pub const hcclMin: hcclRedOp_t = 2;
+pub const hcclMax: hcclRedOp_t = 3;
+pub const hcclInt32: hcclDataType_t = 2;
+pub const hcclFloat32: hcclDataType_t = 7;
+pub const hcclBfloat16: hcclDataType_t = 9;
+
+unsafe extern "C" {
+    pub fn hcclGetVersion(version: *mut c_int) -> hcclResult_t;
+    pub fn hcclGetUniqueId(uniqueId: *mut hcclUniqueId) -> hcclResult_t;
+    pub fn hcclCommInitRank(
+        comm: *mut hcclComm_t,
+        nranks: c_int,
+        commId: hcclUniqueId,
+        rank: c_int,
+    ) -> hcclResult_t;
+    pub fn hcclCommFinalize(comm: hcclComm_t) -> hcclResult_t;
+    pub fn hcclCommDestroy(comm: hcclComm_t) -> hcclResult_t;
+    pub fn hcclCommAbort(comm: hcclComm_t) -> hcclResult_t;
+    pub fn hcclGetErrorString(result: hcclResult_t) -> *const c_char;
+    pub fn hcclGetLastErrorMessage() -> *const c_char;
+    pub fn hcclCommGetAsyncError(comm: hcclComm_t, asyncError: *mut hcclResult_t) -> hcclResult_t;
+    pub fn hcclCommGetAsyncErrorMessage(comm: hcclComm_t) -> *const c_char;
+    pub fn hcclCommCount(comm: hcclComm_t, count: *mut c_int) -> hcclResult_t;
+    pub fn hcclCommSynDevice(comm: hcclComm_t, device: *mut c_int) -> hcclResult_t;
+    pub fn hcclCommUserRank(comm: hcclComm_t, rank: *mut c_int) -> hcclResult_t;
+    pub fn hcclAllReduce(
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: hcclDataType_t,
+        reduceOp: hcclRedOp_t,
+        comm: hcclComm_t,
+        stream_handle: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclAllGather(
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        sendcount: usize,
+        datatype: hcclDataType_t,
+        comm: hcclComm_t,
+        stream_handle: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclReduceScatter(
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        recvcount: usize,
+        datatype: hcclDataType_t,
+        reduceOp: hcclRedOp_t,
+        comm: hcclComm_t,
+        stream_handle: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclBroadcast(
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: hcclDataType_t,
+        root: c_int,
+        comm: hcclComm_t,
+        stream_handle: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclReduce(
+        sendbuff: *const c_void,
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: hcclDataType_t,
+        reduceOp: hcclRedOp_t,
+        root: c_int,
+        comm: hcclComm_t,
+        stream_handle: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclSend(
+        sendbuff: *const c_void,
+        count: usize,
+        datatype: hcclDataType_t,
+        peer: c_int,
+        comm: hcclComm_t,
+        stream: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclRecv(
+        recvbuff: *mut c_void,
+        count: usize,
+        datatype: hcclDataType_t,
+        peer: c_int,
+        comm: hcclComm_t,
+        stream: synStreamHandle,
+    ) -> hcclResult_t;
+    pub fn hcclBarrier(comm: hcclComm_t, stream_handle: synStreamHandle) -> hcclResult_t;
+    pub fn hcclGroupStart() -> hcclResult_t;
+    pub fn hcclGroupEnd() -> hcclResult_t;
 }
