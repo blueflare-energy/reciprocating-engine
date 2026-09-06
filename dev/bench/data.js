@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788705484559,
+  "lastUpdate": 1788709377879,
   "repoUrl": "https://github.com/blueflare-energy/reciprocating-engine",
   "entries": {
     "Gaudi2 inference": [
@@ -13040,6 +13040,1372 @@ window.BENCHMARK_DATA = {
           {
             "name": "TinyLlama-1.1B decode % of ceiling (b8)",
             "value": 51.32414584796334,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "noah@it.bluefla.re",
+            "name": "bfe-noah"
+          },
+          "committer": {
+            "email": "noah@it.bluefla.re",
+            "name": "Noah"
+          },
+          "distinct": true,
+          "id": "5fd7fad062d328e65b1806c85d9accbd19ae169a",
+          "message": "Tensor-parallel follow-up: teardown order, lifecycle, asserts\n\nReview follow-up on the reng-tp commit, from scratchpad/tp-review.md.\n\nTeardown order (review 1). Rust drops fields in declaration order, so\nRank::card released the device before Rank::comm destroyed the\ncommunicator, and every world-2 process printed\n\"hccl_device.cpp:45(operator->): The condition [ false ] failed. device\nnot initialized\" at exit. Comm now goes before Card in Rank and in the\nprobe's Worker, and Comm::drop calls hcclCommFinalize (exported by\nlibSynapse.so, already in the bindings) before hcclCommDestroy. The line\nis gone from a world-2 run.\n\nActivation (review 2). Recipe B open-codes SiLU as sigmoid + mult + mult,\nand nothing checked LayerWeights::act, so a gelu_pytorch_tanh model that\npassed the other asserts would have produced silently wrong logits with a\nVERDICT: PASS. TpModel::new now asserts the activation, and the # Panics\ndoc says so.\n\nLifecycle (review 3). A rank must never outlive its coordinator holding a\ncard. Each worker starts a watchdog thread that polls the hand-shake\ndirectory's abort file and its own parent id; on either it calls\nhcclCommAbort and leaves through _exit (abort_and_die, with a 10 s hard\ndeadline in case hcclCommAbort blocks, which on the peer of an aborted\nrank it does). Group::wait_all writes abort and waits out that grace\nbefore it kills anything, so a kill is never the first move at a rank\nstuck in a collective (Multi-Card risk 10), and Group has a Drop that\ndoes the same for a coordinator that returns early or panics. The\nworker's error path in bin/tp.rs leaves the same way instead of running\nthe destructor chain, which after an HCL failure can hang in libSynapse\nfor minutes while still holding the card.\n\nUniformity (review 5). The recipes and their per-layer bind lists come\nfrom layer 0, so every layer must agree with it on the presence of the\nattention biases and the q/k norms and on the norm epsilon; asserted.\n\nSecond prefill (review 6). The wide recipe's ScatterND is out of place,\nso its blocks alternate between the sequence's slot and a shared scratch\nbuffer and the parity is chosen to land the last block in the slot. A\nsecond prefill onto a non-empty sequence with an odd block count would\ntherefore read the scratch and write it over the keys already there.\nDocumented on TpModel::prefill and TpGenerator::prefill and rejected with\nan assert rather than fixed: seeding block 0 from the slot needs a\ndevice-side copy of the whole cache per layer.\n\nCoverage (review 4). reng-tp gains --prompt-file <json>, which takes the\nprompt from the \"prompt\" array of a generate.py reference file. With the\n1000-token prompt of ~/oracle/gen8_dsl8_1000.json the 8B distill prefills\nfour 256-row blocks, and world 2, world 1 and single-card reng-generate\nall give the oracle's eight ids exactly.\n\nCHANGELOG and README: the review's documentation notes (the id ring binds\nthe embedding and head recipes, not the layers; 18 GB rather than 24 GB\nis the measured strided-shard saving; the stale forward reference to the\ncoming multi-card path; the read-back tensor joining Bindings) plus the\nnew limitation, the lifecycle and the multi-block prefill result. The\ntwo-card 70B attainment is now 79% of 28.8 ms, the ceiling under\nreng-ceiling's convention of counting the embedding table as a lookup,\nrather than 81% of a ceiling that streamed it every token.\n\nChecks on this build, modules 5 and 6 only: reng-tp world 1 SmolLM2-135M\nand Llama-3.2-1B equal single-card reng-generate id for id; world 2 8B\n8/8 exact against gen8_dsl8c.json; world 2 8B over the 1000-token prompt\n8/8 exact against gen8_dsl8_1000.json and equal to both the single-card\nand world-1 ids; world 2 70B 8/8 exact against gen8_dsl70b.json and 27.4\ntok/s at batch 1 (36.48 ms/step; per layer A 90.4 us, all-reduces\n38.1 us, B 315.1 us); reng-generate --ref SmolLM2-135M 7/8 exact plus the\ndocumented near-tie; reng-cache-test and reng-batch-test PASS. SIGINT to\nthe coordinator mid-decode of a world-2 8B run: both workers gone in 11 s\nand both cards back to 768 MiB. cargo fmt --check, clippy with and\nwithout link-synapse, and cargo test all clean.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_015f8r6hegh3UGeA9M8fCfUu",
+          "timestamp": "2026-09-06T09:19:09-06:00",
+          "tree_id": "05d9a9994d2119354e38a2bfbc77f3517c71cfe0",
+          "url": "https://github.com/blueflare-energy/reciprocating-engine/commit/5fd7fad062d328e65b1806c85d9accbd19ae169a"
+        },
+        "date": 1788709377100,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B prefill tok/s (b1)",
+            "value": 6643.458850415881,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20870 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B prefill % of ceiling (b1)",
+            "value": 31.83202732874926,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B decode tok/s (b1)",
+            "value": 132.41446960440746,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 7.55 ms; ceiling 163 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B decode % of ceiling (b1)",
+            "value": 81.23378221912843,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B prefill tok/s (b1)",
+            "value": 7268.863778703077,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20870 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B prefill % of ceiling (b1)",
+            "value": 34.82864508721197,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B decode tok/s (b8)",
+            "value": 1039.712564638392,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 7.69 ms; ceiling 1293 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Llama-8B decode % of ceiling (b8)",
+            "value": 80.42023811537437,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B prefill tok/s (b1)",
+            "value": 20674.749524601903,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 101462 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B prefill % of ceiling (b1)",
+            "value": 20.376817101411785,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B decode tok/s (b1)",
+            "value": 427.2184905502941,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 2.34 ms; ceiling 792 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B decode % of ceiling (b1)",
+            "value": 53.91194524328618,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B prefill tok/s (b1)",
+            "value": 22318.282376270243,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 101462 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B prefill % of ceiling (b1)",
+            "value": 21.996665906774876,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B decode tok/s (b8)",
+            "value": 3293.815481872017,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 2.43 ms; ceiling 6282 tok/s"
+          },
+          {
+            "name": "DeepSeek-R1-Distill-Qwen-1.5B decode % of ceiling (b8)",
+            "value": 52.43500421685974,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Falcon3-1B-Base prefill tok/s (b1)",
+            "value": 23632.822741274504,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 111553 tok/s"
+          },
+          {
+            "name": "Falcon3-1B-Base prefill % of ceiling (b1)",
+            "value": 21.18538060924784,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Falcon3-1B-Base decode tok/s (b1)",
+            "value": 542.5502033147545,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.84 ms; ceiling 871 tok/s"
+          },
+          {
+            "name": "Falcon3-1B-Base decode % of ceiling (b1)",
+            "value": 62.3067211666235,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Falcon3-1B-Base prefill tok/s (b1)",
+            "value": 25012.960206407726,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 111553 tok/s"
+          },
+          {
+            "name": "Falcon3-1B-Base prefill % of ceiling (b1)",
+            "value": 22.422589461191908,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Falcon3-1B-Base decode tok/s (b8)",
+            "value": 4159.35131276845,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.92 ms; ceiling 6790 tok/s"
+          },
+          {
+            "name": "Falcon3-1B-Base decode % of ceiling (b8)",
+            "value": 61.25981165185974,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-2-2B prefill tok/s (b1)",
+            "value": 13499.328672057329,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 59826 tok/s"
+          },
+          {
+            "name": "Gemma-2-2B prefill % of ceiling (b1)",
+            "value": 22.564159832938234,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-2-2B decode tok/s (b1)",
+            "value": 291.0349476493157,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 3.44 ms; ceiling 467 tok/s"
+          },
+          {
+            "name": "Gemma-2-2B decode % of ceiling (b1)",
+            "value": 62.30807934365281,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-2-2B prefill tok/s (b1)",
+            "value": 13531.144750834872,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 59826 tok/s"
+          },
+          {
+            "name": "Gemma-2-2B prefill % of ceiling (b1)",
+            "value": 22.61734048393459,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-2-2B decode tok/s (b8)",
+            "value": 2269.0781744053547,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 3.53 ms; ceiling 3663 tok/s"
+          },
+          {
+            "name": "Gemma-2-2B decode % of ceiling (b8)",
+            "value": 61.94679884364432,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-1B prefill tok/s (b1)",
+            "value": 24561.189406298487,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 156572 tok/s"
+          },
+          {
+            "name": "Gemma-3-1B prefill % of ceiling (b1)",
+            "value": 15.686824659806968,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-1B decode tok/s (b1)",
+            "value": 502.83471499218354,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.99 ms; ceiling 1223 tok/s"
+          },
+          {
+            "name": "Gemma-3-1B decode % of ceiling (b1)",
+            "value": 41.124967248319415,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-1B prefill tok/s (b1)",
+            "value": 25535.09616931165,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 156572 tok/s"
+          },
+          {
+            "name": "Gemma-3-1B prefill % of ceiling (b1)",
+            "value": 16.308842770317117,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-1B decode tok/s (b8)",
+            "value": 3965.1821690652373,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 2.02 ms; ceiling 9654 tok/s"
+          },
+          {
+            "name": "Gemma-3-1B decode % of ceiling (b8)",
+            "value": 41.07148249825378,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-270m prefill tok/s (b1)",
+            "value": 39610.713336339206,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 582419 tok/s"
+          },
+          {
+            "name": "Gemma-3-270m prefill % of ceiling (b1)",
+            "value": 6.801065707548482,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-270m decode tok/s (b1)",
+            "value": 1048.375261600342,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 0.95 ms; ceiling 4545 tok/s"
+          },
+          {
+            "name": "Gemma-3-270m decode % of ceiling (b1)",
+            "value": 23.06569352699486,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-270m prefill tok/s (b1)",
+            "value": 52832.46232862276,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 582419 tok/s"
+          },
+          {
+            "name": "Gemma-3-270m prefill % of ceiling (b1)",
+            "value": 9.071208709056567,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Gemma-3-270m decode tok/s (b8)",
+            "value": 8178.214278606267,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 0.98 ms; ceiling 35168 tok/s"
+          },
+          {
+            "name": "Gemma-3-270m decode % of ceiling (b8)",
+            "value": 23.254424505036447,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "granite-3.1-2b-instruct prefill tok/s (b1)",
+            "value": 11615.722497485605,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 61766 tok/s"
+          },
+          {
+            "name": "granite-3.1-2b-instruct prefill % of ceiling (b1)",
+            "value": 18.805977992321008,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "granite-3.1-2b-instruct decode tok/s (b1)",
+            "value": 280.7035100140582,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 3.56 ms; ceiling 482 tok/s"
+          },
+          {
+            "name": "granite-3.1-2b-instruct decode % of ceiling (b1)",
+            "value": 58.20116567384983,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "granite-3.1-2b-instruct prefill tok/s (b1)",
+            "value": 12937.276633781263,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 61766 tok/s"
+          },
+          {
+            "name": "granite-3.1-2b-instruct prefill % of ceiling (b1)",
+            "value": 20.945588163639815,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "granite-3.1-2b-instruct decode tok/s (b8)",
+            "value": 2178.7081625692795,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 3.67 ms; ceiling 3798 tok/s"
+          },
+          {
+            "name": "granite-3.1-2b-instruct decode % of ceiling (b8)",
+            "value": 57.37009193008028,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.1-8B prefill tok/s (b1)",
+            "value": 6465.586587059805,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20870 tok/s"
+          },
+          {
+            "name": "Llama-3.1-8B prefill % of ceiling (b1)",
+            "value": 30.97975521031465,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.1-8B decode tok/s (b1)",
+            "value": 132.31839664969158,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 7.56 ms; ceiling 163 tok/s"
+          },
+          {
+            "name": "Llama-3.1-8B decode % of ceiling (b1)",
+            "value": 81.17484327156588,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.1-8B prefill tok/s (b1)",
+            "value": 7195.060377447528,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20870 tok/s"
+          },
+          {
+            "name": "Llama-3.1-8B prefill % of ceiling (b1)",
+            "value": 34.475017264925654,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.1-8B decode tok/s (b8)",
+            "value": 1039.7417018428005,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 7.69 ms; ceiling 1293 tok/s"
+          },
+          {
+            "name": "Llama-3.1-8B decode % of ceiling (b8)",
+            "value": 80.42249183529297,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-1B prefill tok/s (b1)",
+            "value": 23782.856573767363,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 126672 tok/s"
+          },
+          {
+            "name": "Llama-3.2-1B prefill % of ceiling (b1)",
+            "value": 18.77516935691778,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-1B decode tok/s (b1)",
+            "value": 606.1479636918506,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.65 ms; ceiling 989 tok/s"
+          },
+          {
+            "name": "Llama-3.2-1B decode % of ceiling (b1)",
+            "value": 61.276277279594154,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-1B prefill tok/s (b1)",
+            "value": 29943.40199914901,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 126672 tok/s"
+          },
+          {
+            "name": "Llama-3.2-1B prefill % of ceiling (b1)",
+            "value": 23.638558383957744,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-1B decode tok/s (b8)",
+            "value": 4734.813193031694,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.69 ms; ceiling 7811 tok/s"
+          },
+          {
+            "name": "Llama-3.2-1B decode % of ceiling (b8)",
+            "value": 60.61629524755351,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-3B prefill tok/s (b1)",
+            "value": 12722.160731778684,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 48697 tok/s"
+          },
+          {
+            "name": "Llama-3.2-3B prefill % of ceiling (b1)",
+            "value": 26.12517411834777,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-3B decode tok/s (b1)",
+            "value": 273.2333287965216,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 3.66 ms; ceiling 380 tok/s"
+          },
+          {
+            "name": "Llama-3.2-3B decode % of ceiling (b1)",
+            "value": 71.8603601203424,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-3B prefill tok/s (b1)",
+            "value": 13354.601753842635,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 48697 tok/s"
+          },
+          {
+            "name": "Llama-3.2-3B prefill % of ceiling (b1)",
+            "value": 27.423902547374347,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Llama-3.2-3B decode tok/s (b8)",
+            "value": 2104.8642549608917,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 3.80 ms; ceiling 2989 tok/s"
+          },
+          {
+            "name": "Llama-3.2-3B decode % of ceiling (b8)",
+            "value": 70.41920034084302,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Mistral-7B-v0.3 prefill tok/s (b1)",
+            "value": 7052.821111914716,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 22017 tok/s"
+          },
+          {
+            "name": "Mistral-7B-v0.3 prefill % of ceiling (b1)",
+            "value": 32.03423820795803,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Mistral-7B-v0.3 decode tok/s (b1)",
+            "value": 138.4402730039588,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 7.22 ms; ceiling 172 tok/s"
+          },
+          {
+            "name": "Mistral-7B-v0.3 decode % of ceiling (b1)",
+            "value": 80.51036844983521,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Mistral-7B-v0.3 prefill tok/s (b1)",
+            "value": 7553.294560098817,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 22017 tok/s"
+          },
+          {
+            "name": "Mistral-7B-v0.3 prefill % of ceiling (b1)",
+            "value": 34.307411651816324,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Mistral-7B-v0.3 decode tok/s (b8)",
+            "value": 1092.9966788570096,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 7.32 ms; ceiling 1363 tok/s"
+          },
+          {
+            "name": "Mistral-7B-v0.3 decode % of ceiling (b8)",
+            "value": 80.17952679987728,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "OLMo-2-0425-1B prefill tok/s (b1)",
+            "value": 25709.956341280387,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 121772 tok/s"
+          },
+          {
+            "name": "OLMo-2-0425-1B prefill % of ceiling (b1)",
+            "value": 21.11317565412737,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "OLMo-2-0425-1B decode tok/s (b1)",
+            "value": 528.8381036843953,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.89 ms; ceiling 950 tok/s"
+          },
+          {
+            "name": "OLMo-2-0425-1B decode % of ceiling (b1)",
+            "value": 55.67903186881887,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "OLMo-2-0425-1B prefill tok/s (b1)",
+            "value": 27273.43162653233,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 121772 tok/s"
+          },
+          {
+            "name": "OLMo-2-0425-1B prefill % of ceiling (b1)",
+            "value": 22.397111258304566,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "OLMo-2-0425-1B decode tok/s (b8)",
+            "value": 4352.516352072395,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.84 ms; ceiling 7234 tok/s"
+          },
+          {
+            "name": "OLMo-2-0425-1B decode % of ceiling (b8)",
+            "value": 60.16954988588508,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct prefill tok/s (b1)",
+            "value": 8568.776076191414,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 41841 tok/s"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct prefill % of ceiling (b1)",
+            "value": 20.4795119225147,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct decode tok/s (b1)",
+            "value": 209.79612314334855,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 4.77 ms; ceiling 326 tok/s"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct decode % of ceiling (b1)",
+            "value": 64.28900847714498,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct prefill tok/s (b1)",
+            "value": 9404.542743141641,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 41841 tok/s"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct prefill % of ceiling (b1)",
+            "value": 22.477007628792414,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct decode tok/s (b8)",
+            "value": 1617.3922127025423,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 4.95 ms; ceiling 2482 tok/s"
+          },
+          {
+            "name": "Phi-3-mini-4k-instruct decode % of ceiling (b8)",
+            "value": 65.17218677748578,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "phi-4 prefill tok/s (b1)",
+            "value": 4161.507859950435,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 11075 tok/s"
+          },
+          {
+            "name": "phi-4 prefill % of ceiling (b1)",
+            "value": 37.576710606417166,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "phi-4 decode tok/s (b1)",
+            "value": 72.96509990003541,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 13.71 ms; ceiling 87 tok/s"
+          },
+          {
+            "name": "phi-4 decode % of ceiling (b1)",
+            "value": 84.35167148353943,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "phi-4 prefill tok/s (b1)",
+            "value": 4623.76548904432,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 11075 tok/s"
+          },
+          {
+            "name": "phi-4 prefill % of ceiling (b1)",
+            "value": 41.75070756584531,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "phi-4 decode tok/s (b8)",
+            "value": 583.0915729758658,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 13.72 ms; ceiling 687 tok/s"
+          },
+          {
+            "name": "phi-4 decode % of ceiling (b8)",
+            "value": 84.8651409900974,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-0.5B prefill tok/s (b1)",
+            "value": 31235.350803492795,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 316929 tok/s"
+          },
+          {
+            "name": "Qwen2.5-0.5B prefill % of ceiling (b1)",
+            "value": 9.855622668675364,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-0.5B decode tok/s (b1)",
+            "value": 804.3214684396509,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.24 ms; ceiling 2475 tok/s"
+          },
+          {
+            "name": "Qwen2.5-0.5B decode % of ceiling (b1)",
+            "value": 32.49749312503596,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-0.5B prefill tok/s (b1)",
+            "value": 36192.75668422605,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 316929 tok/s"
+          },
+          {
+            "name": "Qwen2.5-0.5B prefill % of ceiling (b1)",
+            "value": 11.419822222038977,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-0.5B decode tok/s (b8)",
+            "value": 6207.06848350794,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.29 ms; ceiling 19559 tok/s"
+          },
+          {
+            "name": "Qwen2.5-0.5B decode % of ceiling (b8)",
+            "value": 31.734530933096504,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-1.5B prefill tok/s (b1)",
+            "value": 22580.105128030078,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 101462 tok/s"
+          },
+          {
+            "name": "Qwen2.5-1.5B prefill % of ceiling (b1)",
+            "value": 22.254715675128782,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-1.5B decode tok/s (b1)",
+            "value": 428.5198550590512,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 2.33 ms; ceiling 792 tok/s"
+          },
+          {
+            "name": "Qwen2.5-1.5B decode % of ceiling (b1)",
+            "value": 54.07616821979475,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-1.5B prefill tok/s (b1)",
+            "value": 23337.962713000787,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 101462 tok/s"
+          },
+          {
+            "name": "Qwen2.5-1.5B prefill % of ceiling (b1)",
+            "value": 23.001652192037472,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-1.5B decode tok/s (b8)",
+            "value": 3301.027790476133,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 2.42 ms; ceiling 6282 tok/s"
+          },
+          {
+            "name": "Qwen2.5-1.5B decode % of ceiling (b8)",
+            "value": 52.54981861194394,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-32B prefill tok/s (b1)",
+            "value": 2193.9277906375846,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 4900 tok/s"
+          },
+          {
+            "name": "Qwen2.5-32B prefill % of ceiling (b1)",
+            "value": 44.775389077720085,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-32B decode tok/s (b1)",
+            "value": 33.736218956183016,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 29.64 ms; ceiling 38 tok/s"
+          },
+          {
+            "name": "Qwen2.5-32B decode % of ceiling (b1)",
+            "value": 88.1414790101584,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-32B prefill tok/s (b1)",
+            "value": 2351.801352599964,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 4900 tok/s"
+          },
+          {
+            "name": "Qwen2.5-32B prefill % of ceiling (b1)",
+            "value": 47.99739583296374,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-32B decode tok/s (b8)",
+            "value": 264.1431377796113,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 30.29 ms; ceiling 305 tok/s"
+          },
+          {
+            "name": "Qwen2.5-32B decode % of ceiling (b8)",
+            "value": 86.61518812567475,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-3B prefill tok/s (b1)",
+            "value": 13125.333709046012,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 50776 tok/s"
+          },
+          {
+            "name": "Qwen2.5-3B prefill % of ceiling (b1)",
+            "value": 25.84934292878098,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-3B decode tok/s (b1)",
+            "value": 257.4495149144285,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 3.88 ms; ceiling 397 tok/s"
+          },
+          {
+            "name": "Qwen2.5-3B decode % of ceiling (b1)",
+            "value": 64.91187359307102,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-3B prefill tok/s (b1)",
+            "value": 14077.258911337933,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 50776 tok/s"
+          },
+          {
+            "name": "Qwen2.5-3B prefill % of ceiling (b1)",
+            "value": 27.724086957546824,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-3B decode tok/s (b8)",
+            "value": 2003.3070530227953,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 3.99 ms; ceiling 3154 tok/s"
+          },
+          {
+            "name": "Qwen2.5-3B decode % of ceiling (b8)",
+            "value": 63.511593474728215,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-7B prefill tok/s (b1)",
+            "value": 7642.829557019211,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 22166 tok/s"
+          },
+          {
+            "name": "Qwen2.5-7B prefill % of ceiling (b1)",
+            "value": 34.48025432334226,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-7B decode tok/s (b1)",
+            "value": 139.56995787449372,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 7.16 ms; ceiling 173 tok/s"
+          },
+          {
+            "name": "Qwen2.5-7B decode % of ceiling (b1)",
+            "value": 80.60732853791498,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-7B prefill tok/s (b1)",
+            "value": 8203.249936963552,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 22166 tok/s"
+          },
+          {
+            "name": "Qwen2.5-7B prefill % of ceiling (b1)",
+            "value": 37.0085636470427,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen2.5-7B decode tok/s (b8)",
+            "value": 1081.5220982066087,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 7.40 ms; ceiling 1380 tok/s"
+          },
+          {
+            "name": "Qwen2.5-7B decode % of ceiling (b8)",
+            "value": 78.39176724424354,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-0.6B prefill tok/s (b1)",
+            "value": 23312.867792362485,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 259893 tok/s"
+          },
+          {
+            "name": "Qwen3-0.6B prefill % of ceiling (b1)",
+            "value": 8.970167312571624,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-0.6B decode tok/s (b1)",
+            "value": 638.1937966805108,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.57 ms; ceiling 2024 tok/s"
+          },
+          {
+            "name": "Qwen3-0.6B decode % of ceiling (b1)",
+            "value": 31.527264522412327,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-0.6B prefill tok/s (b1)",
+            "value": 23722.765934580722,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 259893 tok/s"
+          },
+          {
+            "name": "Qwen3-0.6B prefill % of ceiling (b1)",
+            "value": 9.127885142465312,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-0.6B decode tok/s (b8)",
+            "value": 4716.590747979807,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.70 ms; ceiling 14803 tok/s"
+          },
+          {
+            "name": "Qwen3-0.6B decode % of ceiling (b8)",
+            "value": 31.863201782699242,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-1.7B prefill tok/s (b1)",
+            "value": 16126.84773672921,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90752 tok/s"
+          },
+          {
+            "name": "Qwen3-1.7B prefill % of ceiling (b1)",
+            "value": 17.77029595349698,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-1.7B decode tok/s (b1)",
+            "value": 393.1091817817505,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 2.54 ms; ceiling 708 tok/s"
+          },
+          {
+            "name": "Qwen3-1.7B decode % of ceiling (b1)",
+            "value": 55.50464536136085,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-1.7B prefill tok/s (b1)",
+            "value": 16870.706382572098,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90752 tok/s"
+          },
+          {
+            "name": "Qwen3-1.7B prefill % of ceiling (b1)",
+            "value": 18.58995944260465,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-1.7B decode tok/s (b8)",
+            "value": 2980.466893165851,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 2.68 ms; ceiling 5486 tok/s"
+          },
+          {
+            "name": "Qwen3-1.7B decode % of ceiling (b8)",
+            "value": 54.33304043617041,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-4B prefill tok/s (b1)",
+            "value": 8371.014890073533,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 38892 tok/s"
+          },
+          {
+            "name": "Qwen3-4B prefill % of ceiling (b1)",
+            "value": 21.523914293182536,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-4B decode tok/s (b1)",
+            "value": 201.87569521731118,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 4.95 ms; ceiling 304 tok/s"
+          },
+          {
+            "name": "Qwen3-4B decode % of ceiling (b1)",
+            "value": 66.48003093504015,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-4B prefill tok/s (b1)",
+            "value": 9177.97494310664,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 38892 tok/s"
+          },
+          {
+            "name": "Qwen3-4B prefill % of ceiling (b1)",
+            "value": 23.5988047631664,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-4B decode tok/s (b8)",
+            "value": 1552.6046565464135,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 5.15 ms; ceiling 2386 tok/s"
+          },
+          {
+            "name": "Qwen3-4B decode % of ceiling (b8)",
+            "value": 65.07008346432679,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-8B prefill tok/s (b1)",
+            "value": 5820.732357269276,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20693 tok/s"
+          },
+          {
+            "name": "Qwen3-8B prefill % of ceiling (b1)",
+            "value": 28.12933676207136,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-8B decode tok/s (b1)",
+            "value": 126.88322863510855,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 7.88 ms; ceiling 162 tok/s"
+          },
+          {
+            "name": "Qwen3-8B decode % of ceiling (b1)",
+            "value": 78.5111341208092,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-8B prefill tok/s (b1)",
+            "value": 6402.895869729481,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 20693 tok/s"
+          },
+          {
+            "name": "Qwen3-8B prefill % of ceiling (b1)",
+            "value": 30.942706710636738,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "Qwen3-8B decode tok/s (b8)",
+            "value": 988.0630710917709,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 8.10 ms; ceiling 1281 tok/s"
+          },
+          {
+            "name": "Qwen3-8B decode % of ceiling (b8)",
+            "value": 77.15998201885266,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 12844.798804791471,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 1.1137164066707292,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b1)",
+            "value": 856.6824820961393,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.17 ms; ceiling 8986 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b1)",
+            "value": 9.533517362280058,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M prefill tok/s (b1)",
+            "value": 42546.93781087778,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 1153328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M prefill % of ceiling (b1)",
+            "value": 3.68905916034261,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-135M decode tok/s (b8)",
+            "value": 7329.8381649040075,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.09 ms; ceiling 66328 tok/s"
+          },
+          {
+            "name": "SmolLM2-135M decode % of ceiling (b8)",
+            "value": 11.050921159969116,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill tok/s (b1)",
+            "value": 13698.833918869297,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90959 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill % of ceiling (b1)",
+            "value": 15.060495773860593,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B decode tok/s (b1)",
+            "value": 398.60955768433683,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 2.51 ms; ceiling 709 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B decode % of ceiling (b1)",
+            "value": 56.19596476936353,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill tok/s (b1)",
+            "value": 14721.858588641007,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 90959 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B prefill % of ceiling (b1)",
+            "value": 16.185208928783172,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-1.7B decode tok/s (b8)",
+            "value": 3170.5876866338267,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 2.52 ms; ceiling 5371 tok/s"
+          },
+          {
+            "name": "SmolLM2-1.7B decode % of ceiling (b8)",
+            "value": 59.02865049115886,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M prefill tok/s (b1)",
+            "value": 27908.57499688209,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 430320 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M prefill % of ceiling (b1)",
+            "value": 6.48554274409177,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M decode tok/s (b1)",
+            "value": 644.631016328685,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.55 ms; ceiling 3356 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M decode % of ceiling (b1)",
+            "value": 19.20924230642204,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M prefill tok/s (b1)",
+            "value": 30820.4586686212,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 430320 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M prefill % of ceiling (b1)",
+            "value": 7.162221722541824,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM2-360M decode tok/s (b8)",
+            "value": 5732.186513884788,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.40 ms; ceiling 25431 tok/s"
+          },
+          {
+            "name": "SmolLM2-360M decode % of ceiling (b8)",
+            "value": 22.53987452243721,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM3-3B prefill tok/s (b1)",
+            "value": 12685.47552694276,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 50915 tok/s"
+          },
+          {
+            "name": "SmolLM3-3B prefill % of ceiling (b1)",
+            "value": 24.91521007123202,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM3-3B decode tok/s (b1)",
+            "value": 253.0302607507675,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 3.95 ms; ceiling 398 tok/s"
+          },
+          {
+            "name": "SmolLM3-3B decode % of ceiling (b1)",
+            "value": 63.63653965992764,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM3-3B prefill tok/s (b1)",
+            "value": 13372.026371150803,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 50915 tok/s"
+          },
+          {
+            "name": "SmolLM3-3B prefill % of ceiling (b1)",
+            "value": 26.26364659390667,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "SmolLM3-3B decode tok/s (b8)",
+            "value": 2072.2555523031756,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 3.86 ms; ceiling 3144 tok/s"
+          },
+          {
+            "name": "SmolLM3-3B decode % of ceiling (b8)",
+            "value": 65.91921982866575,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "TinyLlama-1.1B prefill tok/s (b1)",
+            "value": 21942.279120532883,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 151372 tok/s"
+          },
+          {
+            "name": "TinyLlama-1.1B prefill % of ceiling (b1)",
+            "value": 14.495646355503764,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "TinyLlama-1.1B decode tok/s (b1)",
+            "value": 585.2007378430353,
+            "unit": "tok/s",
+            "extra": "ctx ~160; mean step 1.71 ms; ceiling 1182 tok/s"
+          },
+          {
+            "name": "TinyLlama-1.1B decode % of ceiling (b1)",
+            "value": 49.50188983692474,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "TinyLlama-1.1B prefill tok/s (b1)",
+            "value": 24422.296421377534,
+            "unit": "tok/s",
+            "extra": "128 tokens; ceiling 151372 tok/s"
+          },
+          {
+            "name": "TinyLlama-1.1B prefill % of ceiling (b1)",
+            "value": 16.134010973467934,
+            "unit": "%",
+            "extra": "HbmBandwidth bound"
+          },
+          {
+            "name": "TinyLlama-1.1B decode tok/s (b8)",
+            "value": 4783.034814664127,
+            "unit": "tok/s",
+            "extra": "ctx ~144; mean step 1.67 ms; ceiling 9357 tok/s"
+          },
+          {
+            "name": "TinyLlama-1.1B decode % of ceiling (b8)",
+            "value": 51.119726697634725,
             "unit": "%",
             "extra": "HbmBandwidth bound"
           }
