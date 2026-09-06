@@ -100,6 +100,19 @@ SmolLM2-135M matches the f32 transformers reference on per-position argmax
 token for token except at f32 near-ties, which bf16 cannot resolve.
 `tools/oracle/` holds the reference scripts.
 
+The roofline is a physical limit, not a target: at batch 1 every token
+streams the whole model from HBM, so the ceiling is the weight bytes per
+token over the 2.45 TB/s of the card, one formula for every row. For
+Qwen2.5-32B that is 65 GB per token, 26.5 ms, 37.7 tok/s; the compute
+for the same token takes under a millisecond. Real HBM sustains 85 to
+92% of its spec on a streaming pattern, so 88% is the end of the road on
+one card in bf16. Higher single-stream numbers come only from fewer
+bytes per token (FP8 halves them, INT4 quarters them), more cards
+(tensor parallelism adds a card's bandwidth per card, see
+[Multi-card](#multi-card)), or more accepted tokens per pass
+(speculative decoding). Batching raises throughput, not latency: batch 8
+rides eight tokens on one pass over the weights.
+
 After every merge, the `bench` workflow regenerates two tables:
 
 - decode versus batch (the plan's Chart 2):
