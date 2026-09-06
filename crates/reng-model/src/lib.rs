@@ -606,8 +606,15 @@ impl Bf16Slice {
 }
 
 /// Copy `src` (little-endian bf16 bytes, any alignment) into `dst`.
+///
+/// # Panics
+///
+/// Panics unless `src` is exactly `dst` twice over: the copy below writes
+/// `src.len()` bytes through a raw pointer, so a wrong length is a write
+/// past the end of `dst` rather than a panic, and the check costs nothing
+/// next to the memcpy it guards.
 fn copy_bf16_bytes(src: &[u8], dst: &mut [u16]) {
-    debug_assert_eq!(src.len(), dst.len() * 2);
+    assert_eq!(src.len(), dst.len() * 2, "copy_bf16_bytes: length mismatch");
     // SAFETY: `dst` holds `src.len()` bytes and the ranges do not overlap
     // (`dst` is a fresh buffer); a u16 accepts every bit pattern.
     unsafe {
