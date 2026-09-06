@@ -94,15 +94,39 @@ pub struct Fp8Operand<'a> {
     pub exp_bias: u32,
 }
 
-impl Fp8Operand<'_> {
-    fn add(&self, gb: &mut Gb<'_>) -> Result<synTensor> {
+impl<'a> Fp8Operand<'a> {
+    /// Add the operand to a graph, borrowing the codes: the caller keeps
+    /// them alive until the upload, so a 59 MB weight is not copied.
+    fn add(&self, gb: &mut Gb<'a>) -> Result<synTensor> {
         gb.input_fp8(
             self.name,
             self.sizes,
-            std::borrow::Cow::Owned(self.codes.to_vec()),
+            std::borrow::Cow::Borrowed(self.codes),
             self.format,
             self.exp_bias,
         )
+    }
+}
+
+/// A unit scale, the stand-in for a scale operand the caller did not give.
+const UNIT_SCALE: &[f32] = &[1.0];
+
+/// The scale operands the `fp8_gemm_<out>` complex guid takes: `None` for
+/// the two-input form `[A, B]`, or the pair for the four-input form
+/// `[A, B, scaleA, scaleB]`. Those are the only two forms the research
+/// probed (`fp8-research.md` 7.1b, probes `cguid-2in`, `cguid-scales`,
+/// `cguid-pcs-1d`); with one scale given and the other left out the node
+/// would be created with three inputs and the vector would land in the
+/// `scaleA` slot, which is a different operand with a different shape
+/// contract. So a missing side becomes a unit scale rather than a missing
+/// operand.
+fn scale_operands<'s>(
+    scale_a: Option<&'s [f32]>,
+    scale_b: Option<&'s [f32]>,
+) -> Option<(&'s [f32], &'s [f32])> {
+    match (scale_a, scale_b) {
+        (None, None) => None,
+        (a, b) => Some((a.unwrap_or(UNIT_SCALE), b.unwrap_or(UNIT_SCALE))),
     }
 }
 
@@ -256,6 +280,11 @@ pub fn gemm_mixed(
 /// applies one scale per output channel, which is what a
 /// [`reng_fp8::Scaling::PerChannel`] weight needs.
 ///
+/// The node is created with two inputs (`[A, B]`) or with four
+/// (`[A, B, scaleA, scaleB]`), never three: giving only one of the two
+/// scales would put that vector in the `scaleA` slot. A side left out
+/// becomes a unit scale (see [`scale_operands`]).
+///
 /// # Errors
 ///
 /// Returns an error if any SynapseAI call fails.
@@ -275,14 +304,15 @@ pub fn gemm_fp8_scaled(
     let t_a = a.add(&mut gb)?;
     let t_b = b.add(&mut gb)?;
     let mut ins = vec![t_a, t_b];
-    for (name, s) in [("SA", scale_a), ("SB", scale_b)] {
-        let Some(s) = s else { continue };
-        assert!(!s.is_empty(), "{name}: an empty scale vector");
-        // SAFETY: an f32 slice is readable as four times as many bytes.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s))
-        };
-        ins.push(gb.input_raw(name, &[s.len() as u64], SYN_TYPE_F32, bytes)?);
+    if let Some((sa, sb)) = scale_operands(scale_a, scale_b) {
+        for (name, s) in [("SA", sa), ("SB", sb)] {
+            assert!(!s.is_empty(), "{name}: an empty scale vector");
+            // SAFETY: an f32 slice is readable as four times as many bytes.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s))
+            };
+            ins.push(gb.input_raw(name, &[s.len() as u64], SYN_TYPE_F32, bytes)?);
+        }
     }
     let (t_out, n_out) = gb.output("OUT", out_sizes, SYN_TYPE_BF16)?;
     let params = Fp8GemmParams {
@@ -378,6 +408,14 @@ pub fn bench_gemm_bf16(
     time_launches(Runtime::new(gb, out)?, iters)
 }
 
+/// Seconds per launch over `iters` launches plus the final
+/// `launch_and_read(1)`, which is counted as one launch: it carries the
+/// device memset of the output, a stream sync, a D2H of one row and the
+/// sentinel spin, so the figure is a launch time with a fixed overhead
+/// added, not a clean kernel time. The overhead is the same for the fp8
+/// and the bf16 form, so it compresses their ratio toward 1.0. The
+/// division is `iters + 1` as `fp8-research.md` 4.3 measured it, so the
+/// numbers stay comparable with that table.
 fn time_launches(mut rt: Runtime<'_>, iters: usize) -> Result<f64> {
     for _ in 0..3 {
         rt.launch_and_read(1)?;
@@ -409,6 +447,41 @@ mod tests {
         assert_eq!(SYN_TYPE_FP8_152, 16384);
         assert_eq!(Fp8Format::E4M3.syn_data_type(), SYN_TYPE_FP8_143);
         assert_eq!(Fp8Format::E5M2.syn_data_type(), SYN_TYPE_FP8_152);
+    }
+
+    /// The complex guid takes `[A, B]` or `[A, B, scaleA, scaleB]` and
+    /// nothing else, so a caller that gives only `scale_b` (the
+    /// per-output-channel weight scales, which is the interesting case)
+    /// must still get four inputs with a unit `scaleA`, not three with
+    /// the weight scales in the `scaleA` slot.
+    #[test]
+    fn the_complex_guid_takes_two_operands_or_four() {
+        assert_eq!(scale_operands(None, None), None);
+        let sb = [2.0f32, 3.0, 4.0];
+        assert_eq!(
+            scale_operands(None, Some(&sb)),
+            Some((&[1.0f32][..], &sb[..])),
+            "a missing scaleA becomes a unit scale, so scaleB stays in slot 3"
+        );
+        let sa = [0.5f32];
+        assert_eq!(
+            scale_operands(Some(&sa), None),
+            Some((&sa[..], &[1.0f32][..]))
+        );
+        assert_eq!(
+            scale_operands(Some(&sa), Some(&sb)),
+            Some((&sa[..], &sb[..]))
+        );
+        // The input count the node is created with, in the same order.
+        for (a, b, want) in [
+            (None, None, 2),
+            (None, Some(&sb[..]), 4),
+            (Some(&sa[..]), None, 4),
+            (Some(&sa[..]), Some(&sb[..]), 4),
+        ] {
+            let n = 2 + scale_operands(a, b).map_or(0, |_| 2);
+            assert_eq!(n, want, "inputs for scale_a {a:?} scale_b {b:?}");
+        }
     }
 
     #[test]
