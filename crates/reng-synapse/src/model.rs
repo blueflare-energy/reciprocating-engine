@@ -34,6 +34,7 @@
 //! of a workspace tensor), `RENG_READBACK_TRACE` (print readback poll counts).
 
 use crate::ffi::*;
+use crate::heads::AxisParams;
 use crate::runtime::{Out, OutKind, Runtime};
 use crate::{Activation, LayerWeights};
 use crate::{bf16_to_f32, scale_bf16};
@@ -160,6 +161,47 @@ fn scaled_wq<'a>(w: &LayerWeights<'a>) -> std::borrow::Cow<'a, [u16]> {
 /// of the gemm as `scores / cap`, ready for the `tanh`).
 fn score_scale(w: &LayerWeights<'_>) -> f32 {
     w.scale / w.attn_softcap.unwrap_or(1.0)
+}
+
+/// How a layer's q/k/v projections are built: from the checkpoint's three
+/// matrices, or (a model with attention biases, Qwen2) from their row-block
+/// concatenation as one gemm. Three small decode gemms run concurrently
+/// on the MME at a fraction of the rate of one over the concatenated
+/// weight (5.8 us against 3.9 us for the 6.3 MB of Qwen2.5-1.5B), which
+/// is worth about 2 us of a 74 us layer. The biases stay the three
+/// broadcast `add` nodes on the per-head tensors: the TPC fuser merges
+/// them into the RoPE kernels, whereas a bias given to the gemm as its
+/// third input (which `reng-gemm-bias-test` shows to be numerically the
+/// same add) is split out by the graph compiler into an add stage of its
+/// own that costs a handoff. Bias-free models keep the three gemms, so
+/// their graphs are unchanged.
+enum QkvProj {
+    /// The three weights as separate gemm operands: the flat `[in, out]`
+    /// matrices, or the per-head blocks of `RENG_HEAD_BLOCKS`.
+    Separate(synTensor, synTensor, synTensor),
+    /// The concatenated weight `[hidden, (n_heads + 2 n_kv_heads) *
+    /// head_dim]`, the q rows carrying the attention scale.
+    Fused(synTensor),
+}
+
+/// Whether a layer's projections take the fused form of [`QkvProj`]: it
+/// has attention biases and neither the per-head blocks nor the
+/// full-width q/k norm (which wants the flat q and k alone) is in use.
+fn fused_qkv(w: &LayerWeights<'_>, head_blocks: bool) -> bool {
+    !w.bq.is_empty() && !head_blocks && !wide_qk_norm(w)
+}
+
+/// The q, k and v projections as one `[(n_heads + 2 n_kv_heads) *
+/// head_dim, hidden]` row-block matrix (the q rows scaled as `scaled_wq`),
+/// the B operand of the fused projection gemm. An owned copy, as the
+/// scaled `wq` is anyway; the runtime frees it after the upload.
+fn qkv_weight(w: &LayerWeights<'_>) -> Vec<u16> {
+    let wq = scaled_wq(w);
+    let mut m = Vec::with_capacity(wq.len() + w.wk.len() + w.wv.len());
+    m.extend_from_slice(&wq);
+    m.extend_from_slice(w.wk);
+    m.extend_from_slice(w.wv);
+    m
 }
 
 /// Gemma-2's attention softcap on scores that already carry `1 / cap`:
@@ -903,10 +945,18 @@ pub(crate) fn build_layer<'a>(
     // it out again); it goes on the norm gain instead.
     let scale = score_scale(w);
     let q_scale = if w.qn.is_empty() { scale } else { 1.0 };
-    let wq_scaled = scaled_wq(w);
-    let (t_wq, t_wk, t_wv) = if head_blocks {
-        (
-            gb.input_bf16(&p("wq"), &[h, hd, hpg, groups], wq_scaled)?,
+    // Query, key and value heads of the fused projection (see `QkvProj`).
+    let heads_all = hpg * groups + 2 * groups;
+    let fused = fused_qkv(w, head_blocks);
+    let proj = if fused {
+        QkvProj::Fused(gb.input_bf16(
+            &p("wqkv"),
+            &[h, hd * heads_all],
+            std::borrow::Cow::Owned(qkv_weight(w)),
+        )?)
+    } else if head_blocks {
+        QkvProj::Separate(
+            gb.input_bf16(&p("wq"), &[h, hd, hpg, groups], scaled_wq(w))?,
             gb.input_bf16(
                 &p("wk"),
                 &[h, hd, 1, groups],
@@ -919,8 +969,8 @@ pub(crate) fn build_layer<'a>(
             )?,
         )
     } else {
-        (
-            gb.input_bf16(&p("wq2"), &[h, qw], wq_scaled)?,
+        QkvProj::Separate(
+            gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?,
             gb.input_bf16(
                 &p("wk2"),
                 &[h, hd * groups],
@@ -1034,112 +1084,159 @@ pub(crate) fn build_layer<'a>(
         }
         _ => x,
     };
-    if head_blocks {
-        gb.node("reshape", &p("n1_4d"), &[t_ain], &[t_n1_4], none.0, none.1)?;
-        gb.node(
-            "batch_gemm",
-            &p("q_proj"),
-            &[t_n1_4, t_wq],
-            &[t_q],
-            pgt.0,
-            pgt.1,
-        )?;
-        gb.node(
-            "batch_gemm",
-            &p("k_proj"),
-            &[t_n1_4, t_wk],
-            &[t_k],
-            pgt.0,
-            pgt.1,
-        )?;
-        gb.node(
-            "batch_gemm",
-            &p("v_proj"),
-            &[t_n1_4, t_wv],
-            &[t_v],
-            pgt.0,
-            pgt.1,
-        )?;
-    } else {
-        // `[features, t]` is `[hd, heads, t]`; the head layout wants the
-        // token dim inside the heads, so each projection ends in a
-        // transpose of its two outer dims (the inverse of `heads_last`).
-        let tr_in = TransposeParams {
-            permutation: [0, 2, 1, 0, 0],
-            tensor_dim: 3,
-        };
-        let ptr_in = (
-            (&raw const tr_in).cast::<c_void>(),
-            core::mem::size_of::<TransposeParams>() as u32,
-        );
-        // Full-width q/k norm gains (OLMo-2), applied to the flat
-        // projections before the head reshape; the scale rides on the q
-        // gain, as in the per-head form.
-        let (t_qn_w, t_kn_w) = if wide_qk {
-            let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
-            (
-                Some(gb.input(&p("qn"), &[qw], &qn_scaled)?),
-                Some(gb.input(&p("kn"), &[hd * groups], w.kn)?),
-            )
-        } else {
-            (None, None)
-        };
-        for (name, wt, n_out, heads, out, gain) in [
-            ("q", t_wq, qw, hpg * groups, t_q, t_qn_w),
-            ("k", t_wk, hd * groups, groups, t_k, t_kn_w),
-            ("v", t_wv, hd * groups, groups, t_v, None),
-        ] {
-            let flat = gb.mid(&p(&format!("{name}2")), &[n_out, t], bf)?;
-            let by_head = gb.mid(&p(&format!("{name}_heads")), &[hd, heads, t], bf)?;
-            let tokens_in = gb.mid(&p(&format!("{name}_tokens")), &[hd, t, heads], bf)?;
+    // `[features, t]` is `[hd, heads, t]`; the head layout wants the token
+    // dim inside the heads, so the flat projections end in a transpose of
+    // their two outer dims (the inverse of `heads_last`).
+    let tr_in = TransposeParams {
+        permutation: [0, 2, 1, 0, 0],
+        tensor_dim: 3,
+    };
+    let ptr_in = (
+        (&raw const tr_in).cast::<c_void>(),
+        core::mem::size_of::<TransposeParams>() as u32,
+    );
+    let split_heads = AxisParams { axis: 2 };
+    let psplit = (
+        (&raw const split_heads).cast::<c_void>(),
+        core::mem::size_of::<AxisParams>() as u32,
+    );
+    match proj {
+        QkvProj::Fused(t_wqkv) => {
+            // One gemm; its `[hd, heads_all, t]` view is transposed once
+            // and split along its outermost dim (a contiguous split, so
+            // no copy) into the q, k and v heads.
+            let flat = gb.mid(&p("qkv2"), &[hd * heads_all, t], bf)?;
+            let by_head = gb.mid(&p("qkv_heads"), &[hd, heads_all, t], bf)?;
+            let tokens_in = gb.mid(&p("qkv_tokens"), &[hd, t, heads_all], bf)?;
+            let q_tokens = gb.mid(&p("q_tokens"), &[hd, t, hpg * groups], bf)?;
+            let k_tokens = gb.mid(&p("k_tokens"), &[hd, t, groups], bf)?;
+            let v_tokens = gb.mid(&p("v_tokens"), &[hd, t, groups], bf)?;
             gb.node(
                 "gemm",
-                &p(&format!("{name}_proj")),
-                &[t_ain, wt],
+                &p("qkv_proj"),
+                &[t_ain, t_wqkv],
                 &[flat],
                 pgt.0,
                 pgt.1,
             )?;
-            let flat = match gain {
-                Some(g) => {
-                    let normed = gb.mid(&p(&format!("{name}2n")), &[n_out, t], bf)?;
-                    let inv = gb.mid(&p(&format!("{name}2inv")), &[1, t], SYN_TYPE_F32)?;
-                    gb.node(
-                        "rms_norm_fwd_bf16",
-                        &p(&format!("{name}_norm")),
-                        &[flat, g],
-                        &[normed, inv],
-                        prm.0,
-                        prm.1,
-                    )?;
-                    normed
-                }
-                None => flat,
-            };
-            gb.node(
-                "reshape",
-                &p(&format!("{name}_3d")),
-                &[flat],
-                &[by_head],
-                none.0,
-                none.1,
-            )?;
+            gb.node("reshape", &p("qkv_3d"), &[flat], &[by_head], none.0, none.1)?;
             gb.node(
                 "transpose",
-                &p(&format!("{name}_tokens_in")),
+                &p("qkv_tokens_in"),
                 &[by_head],
                 &[tokens_in],
                 ptr_in.0,
                 ptr_in.1,
             )?;
             gb.node(
-                "reshape",
-                &p(&format!("{name}_4d")),
+                "split",
+                &p("qkv_split"),
                 &[tokens_in],
-                &[out],
-                none.0,
-                none.1,
+                &[q_tokens, k_tokens, v_tokens],
+                psplit.0,
+                psplit.1,
             )?;
+            gb.node("reshape", &p("q_4d"), &[q_tokens], &[t_q], none.0, none.1)?;
+            gb.node("reshape", &p("k_4d"), &[k_tokens], &[t_k], none.0, none.1)?;
+            gb.node("reshape", &p("v_4d"), &[v_tokens], &[t_v], none.0, none.1)?;
+        }
+        QkvProj::Separate(t_wq, t_wk, t_wv) if head_blocks => {
+            gb.node("reshape", &p("n1_4d"), &[t_ain], &[t_n1_4], none.0, none.1)?;
+            gb.node(
+                "batch_gemm",
+                &p("q_proj"),
+                &[t_n1_4, t_wq],
+                &[t_q],
+                pgt.0,
+                pgt.1,
+            )?;
+            gb.node(
+                "batch_gemm",
+                &p("k_proj"),
+                &[t_n1_4, t_wk],
+                &[t_k],
+                pgt.0,
+                pgt.1,
+            )?;
+            gb.node(
+                "batch_gemm",
+                &p("v_proj"),
+                &[t_n1_4, t_wv],
+                &[t_v],
+                pgt.0,
+                pgt.1,
+            )?;
+        }
+        QkvProj::Separate(t_wq, t_wk, t_wv) => {
+            // Full-width q/k norm gains (OLMo-2), applied to the flat
+            // projections before the head reshape; the scale rides on the q
+            // gain, as in the per-head form.
+            let (t_qn_w, t_kn_w) = if wide_qk {
+                let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
+                (
+                    Some(gb.input(&p("qn"), &[qw], &qn_scaled)?),
+                    Some(gb.input(&p("kn"), &[hd * groups], w.kn)?),
+                )
+            } else {
+                (None, None)
+            };
+            for (name, wt, n_out, heads, out, gain) in [
+                ("q", t_wq, qw, hpg * groups, t_q, t_qn_w),
+                ("k", t_wk, hd * groups, groups, t_k, t_kn_w),
+                ("v", t_wv, hd * groups, groups, t_v, None),
+            ] {
+                let flat = gb.mid(&p(&format!("{name}2")), &[n_out, t], bf)?;
+                let by_head = gb.mid(&p(&format!("{name}_heads")), &[hd, heads, t], bf)?;
+                let tokens_in = gb.mid(&p(&format!("{name}_tokens")), &[hd, t, heads], bf)?;
+                gb.node(
+                    "gemm",
+                    &p(&format!("{name}_proj")),
+                    &[t_ain, wt],
+                    &[flat],
+                    pgt.0,
+                    pgt.1,
+                )?;
+                let flat = match gain {
+                    Some(g) => {
+                        let normed = gb.mid(&p(&format!("{name}2n")), &[n_out, t], bf)?;
+                        let inv = gb.mid(&p(&format!("{name}2inv")), &[1, t], SYN_TYPE_F32)?;
+                        gb.node(
+                            "rms_norm_fwd_bf16",
+                            &p(&format!("{name}_norm")),
+                            &[flat, g],
+                            &[normed, inv],
+                            prm.0,
+                            prm.1,
+                        )?;
+                        normed
+                    }
+                    None => flat,
+                };
+                gb.node(
+                    "reshape",
+                    &p(&format!("{name}_3d")),
+                    &[flat],
+                    &[by_head],
+                    none.0,
+                    none.1,
+                )?;
+                gb.node(
+                    "transpose",
+                    &p(&format!("{name}_tokens_in")),
+                    &[by_head],
+                    &[tokens_in],
+                    ptr_in.0,
+                    ptr_in.1,
+                )?;
+                gb.node(
+                    "reshape",
+                    &p(&format!("{name}_4d")),
+                    &[tokens_in],
+                    &[out],
+                    none.0,
+                    none.1,
+                )?;
+            }
         }
     }
     // Attention biases (when present) broadcast over the token dim.
@@ -1556,17 +1653,31 @@ pub(crate) fn build_layer_batched<'a>(
     // outermost), so the head layout is a free reshape. These weights are
     // laid out differently from the wide recipe's per-head blocks, so they
     // get their own names and buffers.
-    let t_wq = gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?;
-    let t_wk = gb.input_bf16(
-        &p("wk2"),
-        &[h, hd * groups],
-        std::borrow::Cow::Borrowed(w.wk),
-    )?;
-    let t_wv = gb.input_bf16(
-        &p("wv2"),
-        &[h, hd * groups],
-        std::borrow::Cow::Borrowed(w.wv),
-    )?;
+    // With attention biases the projections are the fused gemm of
+    // `build_layer` (see `QkvProj`), over the same concatenated weight.
+    let heads_all = hpg * groups + 2 * groups;
+    let fused = fused_qkv(w, false);
+    let proj = if fused {
+        QkvProj::Fused(gb.input_bf16(
+            &p("wqkv"),
+            &[h, hd * heads_all],
+            std::borrow::Cow::Owned(qkv_weight(w)),
+        )?)
+    } else {
+        QkvProj::Separate(
+            gb.input_bf16(&p("wq2"), &[h, qw], scaled_wq(w))?,
+            gb.input_bf16(
+                &p("wk2"),
+                &[h, hd * groups],
+                std::borrow::Cow::Borrowed(w.wk),
+            )?,
+            gb.input_bf16(
+                &p("wv2"),
+                &[h, hd * groups],
+                std::borrow::Cow::Borrowed(w.wv),
+            )?,
+        )
+    };
     let t_wo = gb.input_bf16(&p("wo"), &[qw, h], std::borrow::Cow::Borrowed(w.wo))?;
     let t_wg = gb.input_bf16(&p("wg"), &[h, i], std::borrow::Cow::Borrowed(w.wg))?;
     let t_wu = gb.input_bf16(&p("wu"), &[h, i], std::borrow::Cow::Borrowed(w.wu))?;
@@ -1579,9 +1690,19 @@ pub(crate) fn build_layer_batched<'a>(
     let t_inv1 = (!post_norm)
         .then(|| gb.mid(&p("inv1"), &[1, b], SYN_TYPE_F32))
         .transpose()?;
-    let t_q2 = gb.mid(&p("q2"), &[qw, b], bf)?;
-    let t_k2 = gb.mid(&p("k2"), &[hd * groups, b], bf)?;
-    let t_v2 = gb.mid(&p("v2"), &[hd * groups, b], bf)?;
+    // The flat projections: the three, or the fused one.
+    let t_flat = if fused {
+        (None, Some(gb.mid(&p("qkv2"), &[hd * heads_all, b], bf)?))
+    } else {
+        (
+            Some((
+                gb.mid(&p("q2"), &[qw, b], bf)?,
+                gb.mid(&p("k2"), &[hd * groups, b], bf)?,
+                gb.mid(&p("v2"), &[hd * groups, b], bf)?,
+            )),
+            None,
+        )
+    };
     let t_q = gb.mid(&p("q"), &[hd, 1, hpg, groups, b], bf)?;
     let t_k = gb.mid(&p("k"), &[hd, 1, 1, groups, b], bf)?;
     let t_v = gb.mid(&p("v"), &[hd, 1, 1, groups, b], bf)?;
@@ -1661,42 +1782,84 @@ pub(crate) fn build_layer_batched<'a>(
         }
         _ => x,
     };
-    gb.node("gemm", &p("q_proj"), &[t_ain, t_wq], &[t_q2], pgt.0, pgt.1)?;
-    gb.node("gemm", &p("k_proj"), &[t_ain, t_wk], &[t_k2], pgt.0, pgt.1)?;
-    gb.node("gemm", &p("v_proj"), &[t_ain, t_wv], &[t_v2], pgt.0, pgt.1)?;
-    // Full-width q/k norms (OLMo-2) on the flat projections, as in
-    // `build_layer`; the inputs carry the same names and sizes.
-    let (t_q2, t_k2) = if wide_qk {
-        let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
-        let t_qn = gb.input(&p("qn"), &[qw], &qn_scaled)?;
-        let t_kn = gb.input(&p("kn"), &[hd * groups], w.kn)?;
-        let q2n = gb.mid(&p("q2n"), &[qw, b], bf)?;
-        let q2inv = gb.mid(&p("q2inv"), &[1, b], SYN_TYPE_F32)?;
-        let k2n = gb.mid(&p("k2n"), &[hd * groups, b], bf)?;
-        let k2inv = gb.mid(&p("k2inv"), &[1, b], SYN_TYPE_F32)?;
-        gb.node(
-            "rms_norm_fwd_bf16",
-            &p("q_norm"),
-            &[t_q2, t_qn],
-            &[q2n, q2inv],
-            prm.0,
-            prm.1,
-        )?;
-        gb.node(
-            "rms_norm_fwd_bf16",
-            &p("k_norm"),
-            &[t_k2, t_kn],
-            &[k2n, k2inv],
-            prm.0,
-            prm.1,
-        )?;
-        (q2n, k2n)
-    } else {
-        (t_q2, t_k2)
-    };
-    gb.node("reshape", &p("q_5d"), &[t_q2], &[t_q], none.0, none.1)?;
-    gb.node("reshape", &p("k_5d"), &[t_k2], &[t_k], none.0, none.1)?;
-    gb.node("reshape", &p("v_5d"), &[t_v2], &[t_v], none.0, none.1)?;
+    match (proj, t_flat) {
+        (QkvProj::Fused(t_wqkv), (_, Some(t_qkv2))) => {
+            // One gemm; `[hd * heads_all, B]` is `[hd, heads_all, B]`,
+            // split along the heads into the q, k and v heads of every
+            // sequence (sequences outermost, as the 5-D views want them).
+            let by_head = gb.mid(&p("qkv_heads"), &[hd, heads_all, b], bf)?;
+            let q_heads = gb.mid(&p("q_heads"), &[hd, hpg * groups, b], bf)?;
+            let k_heads = gb.mid(&p("k_heads"), &[hd, groups, b], bf)?;
+            let v_heads = gb.mid(&p("v_heads"), &[hd, groups, b], bf)?;
+            let split_heads = AxisParams { axis: 1 };
+            gb.node(
+                "gemm",
+                &p("qkv_proj"),
+                &[t_ain, t_wqkv],
+                &[t_qkv2],
+                pgt.0,
+                pgt.1,
+            )?;
+            gb.node(
+                "reshape",
+                &p("qkv_3d"),
+                &[t_qkv2],
+                &[by_head],
+                none.0,
+                none.1,
+            )?;
+            gb.node(
+                "split",
+                &p("qkv_split"),
+                &[by_head],
+                &[q_heads, k_heads, v_heads],
+                (&raw const split_heads).cast::<c_void>(),
+                core::mem::size_of::<AxisParams>() as u32,
+            )?;
+            gb.node("reshape", &p("q_5d"), &[q_heads], &[t_q], none.0, none.1)?;
+            gb.node("reshape", &p("k_5d"), &[k_heads], &[t_k], none.0, none.1)?;
+            gb.node("reshape", &p("v_5d"), &[v_heads], &[t_v], none.0, none.1)?;
+        }
+        (QkvProj::Separate(t_wq, t_wk, t_wv), (Some((t_q2, t_k2, t_v2)), _)) => {
+            gb.node("gemm", &p("q_proj"), &[t_ain, t_wq], &[t_q2], pgt.0, pgt.1)?;
+            gb.node("gemm", &p("k_proj"), &[t_ain, t_wk], &[t_k2], pgt.0, pgt.1)?;
+            gb.node("gemm", &p("v_proj"), &[t_ain, t_wv], &[t_v2], pgt.0, pgt.1)?;
+            // Full-width q/k norms (OLMo-2) on the flat projections, as in
+            // `build_layer`; the inputs carry the same names and sizes.
+            let (t_q2, t_k2) = if wide_qk {
+                let qn_scaled: Vec<f32> = w.qn.iter().map(|v| v * scale).collect();
+                let t_qn = gb.input(&p("qn"), &[qw], &qn_scaled)?;
+                let t_kn = gb.input(&p("kn"), &[hd * groups], w.kn)?;
+                let q2n = gb.mid(&p("q2n"), &[qw, b], bf)?;
+                let q2inv = gb.mid(&p("q2inv"), &[1, b], SYN_TYPE_F32)?;
+                let k2n = gb.mid(&p("k2n"), &[hd * groups, b], bf)?;
+                let k2inv = gb.mid(&p("k2inv"), &[1, b], SYN_TYPE_F32)?;
+                gb.node(
+                    "rms_norm_fwd_bf16",
+                    &p("q_norm"),
+                    &[t_q2, t_qn],
+                    &[q2n, q2inv],
+                    prm.0,
+                    prm.1,
+                )?;
+                gb.node(
+                    "rms_norm_fwd_bf16",
+                    &p("k_norm"),
+                    &[t_k2, t_kn],
+                    &[k2n, k2inv],
+                    prm.0,
+                    prm.1,
+                )?;
+                (q2n, k2n)
+            } else {
+                (t_q2, t_k2)
+            };
+            gb.node("reshape", &p("q_5d"), &[t_q2], &[t_q], none.0, none.1)?;
+            gb.node("reshape", &p("k_5d"), &[t_k2], &[t_k], none.0, none.1)?;
+            gb.node("reshape", &p("v_5d"), &[t_v2], &[t_v], none.0, none.1)?;
+        }
+        _ => unreachable!("projection form and its flat tensors agree"),
+    }
     // Attention biases (when present) broadcast over the sequence batch.
     let (t_q, t_k, t_v) = if w.bq.is_empty() {
         (t_q, t_k, t_v)

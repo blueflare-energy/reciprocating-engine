@@ -7,6 +7,8 @@
 //!
 //! `post_norm` 1 puts the layer norms on the branch outputs (OLMo-2);
 //! `qk_norm` 1 adds Qwen3 per-head q/k norms, 2 OLMo-2 full-width ones.
+//! With `RENG_TEST_BIAS` set the layer has Qwen2-style attention biases
+//! (the fused q/k/v projection).
 
 use reng_synapse::{Activation, LayerWeights, decoder_layer_bf16, decoder_layer_cpu, to_bf16};
 
@@ -68,6 +70,15 @@ fn main() -> reng_core::Result<()> {
     };
     let qn = gain(qn_len, 0.95, 0.01, 0);
     let kn = gain(kn_len, 1.05, -0.01, 1);
+    let bias = std::env::var_os("RENG_TEST_BIAS").is_some();
+    let bias_of = |n: usize, mul: usize| {
+        if bias {
+            seq(n, mul, 9, 43, 0.5)
+        } else {
+            Vec::new()
+        }
+    };
+    let (bq, bk, bv) = (bias_of(hidden, 29), bias_of(kvd, 31), bias_of(kvd, 37));
     let wq = to_bf16(&seq(hidden * hidden, 5, 1, 17, fan));
     let wk = to_bf16(&seq(hidden * kvd, 11, 4, 19, fan));
     let wv = to_bf16(&seq(hidden * kvd, 13, 2, 21, fan));
@@ -98,9 +109,9 @@ fn main() -> reng_core::Result<()> {
         wk: &wk,
         wv: &wv,
         wo: &wo,
-        bq: &[],
-        bk: &[],
-        bv: &[],
+        bq: &bq,
+        bk: &bk,
+        bv: &bv,
         qn: &qn,
         kn: &kn,
         wg: &wg,
@@ -118,7 +129,7 @@ fn main() -> reng_core::Result<()> {
     };
 
     println!(
-        "fused decoder layer: tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads} (head_dim {hd}), post_norm={post_norm}, qk_norm={qk_norm}"
+        "fused decoder layer: tokens={tokens}, hidden={hidden}, inter={inter}, n_heads={n_heads}, n_kv_heads={n_kv_heads} (head_dim {hd}), post_norm={post_norm}, qk_norm={qk_norm}, bias={bias}"
     );
     let hpu = decoder_layer_bf16(&x, &w, tokens, hidden, inter)?;
     let cpu = decoder_layer_cpu(&x, &w, tokens, hidden, inter);

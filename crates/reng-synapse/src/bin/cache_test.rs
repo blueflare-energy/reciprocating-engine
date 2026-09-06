@@ -9,7 +9,9 @@
 //! With `RENG_TEST_GEMMA` set the layers take Gemma's form (see
 //! `reng-model-test`): post norms on both branch outputs, GELU-tanh, a
 //! window of 100 positions on the even layers and a second RoPE table on
-//! the odd ones, and the embeddings are scaled by 2 on the device.
+//! the odd ones, and the embeddings are scaled by 2 on the device. With
+//! `RENG_TEST_BIAS` set the layers have Qwen2-style attention biases (the
+//! fused q/k/v projection).
 //!
 //! The model gets a synthetic embedding table whose row `t` is the input
 //! row of position `t`, so when the device decode loop is built
@@ -54,6 +56,9 @@ struct Owned {
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
+    bq: Vec<f32>,
+    bk: Vec<f32>,
+    bv: Vec<f32>,
     wo: Vec<u16>,
     wg: Vec<u16>,
     wu: Vec<u16>,
@@ -95,6 +100,8 @@ fn main() -> reng_core::Result<()> {
     let qk_norm = arg(13, 0usize);
     let loop_steps = arg(14, 4usize);
     let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
+    // Qwen2-style attention biases (the fused q/k/v projection).
+    let bias = std::env::var_os("RENG_TEST_BIAS").is_some();
     let tokens = rows + 8 + tail_rows * tail_size;
     assert!(
         tokens + loop_steps <= capacity,
@@ -151,6 +158,13 @@ fn main() -> reng_core::Result<()> {
             Vec::new()
         }
     };
+    let bias_of = |n: usize, mul: usize| {
+        if bias {
+            seq(n, mul, 9, 43, 0.5)
+        } else {
+            Vec::new()
+        }
+    };
     let owned: Vec<Owned> = (0..n_layers)
         .map(|l| Owned {
             g1: (0..hidden)
@@ -166,6 +180,9 @@ fn main() -> reng_core::Result<()> {
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
+            bq: bias_of(hidden, 29 + l),
+            bk: bias_of(kvd, 31 + l),
+            bv: bias_of(kvd, 37 + l),
             wo: to_bf16(&seq(hidden * hidden, 3 + l, 5, 29, fan)),
             wg: to_bf16(&seq(hidden * inter, 17 + l, 6, 31, fan)),
             wu: to_bf16(&seq(hidden * inter, 19 + l, 7, 37, fan)),
@@ -188,9 +205,9 @@ fn main() -> reng_core::Result<()> {
             wk: &o.wk,
             wv: &o.wv,
             wo: &o.wo,
-            bq: &[],
-            bk: &[],
-            bv: &[],
+            bq: &o.bq,
+            bk: &o.bk,
+            bv: &o.bv,
             qn: &o.qn,
             kn: &o.kn,
             wg: &o.wg,
@@ -262,7 +279,7 @@ fn main() -> reng_core::Result<()> {
             .0 as u32
     };
     println!(
-        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}"
+        "cached model: layers={n_layers}, rows={rows}, decode_rows={decode_rows}, capacity={capacity}, tokens={tokens}, hidden={hidden}, inter={inter}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}, bias={bias}"
     );
 
     let t0 = Instant::now();

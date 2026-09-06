@@ -10,7 +10,8 @@
 //! With `RENG_TEST_GEMMA` set the layers take Gemma's form (see
 //! `reng-model-test`): post norms on both branch outputs, GELU-tanh, a
 //! window of 100 positions on the even layers and a second RoPE table on
-//! the odd ones.
+//! the odd ones. With `RENG_TEST_BIAS` set the layers have Qwen2-style
+//! attention biases (the fused q/k/v projection).
 
 use reng_synapse::{
     Activation, BatchedModel, LayerWeights, ModelWeights, RopeTables, model_forward_cpu, to_bf16,
@@ -42,6 +43,9 @@ struct Owned {
     wq: Vec<u16>,
     wk: Vec<u16>,
     wv: Vec<u16>,
+    bq: Vec<f32>,
+    bk: Vec<f32>,
+    bv: Vec<f32>,
     wo: Vec<u16>,
     wg: Vec<u16>,
     wu: Vec<u16>,
@@ -80,6 +84,8 @@ fn main() -> reng_core::Result<()> {
     let post_norm = arg(11, 0usize) != 0;
     let qk_norm = arg(12, 0usize);
     let gemma = std::env::var_os("RENG_TEST_GEMMA").is_some();
+    // Qwen2-style attention biases (the fused q/k/v projection).
+    let bias = std::env::var_os("RENG_TEST_BIAS").is_some();
     let prompts: Vec<usize> = (0..batch)
         .map(|b| [40usize, rows + 44, rows][b % 3])
         .collect();
@@ -131,6 +137,13 @@ fn main() -> reng_core::Result<()> {
             Vec::new()
         }
     };
+    let bias_of = |n: usize, mul: usize| {
+        if bias {
+            seq(n, mul, 9, 43, 0.5)
+        } else {
+            Vec::new()
+        }
+    };
     let owned: Vec<Owned> = (0..n_layers)
         .map(|l| Owned {
             g1: (0..hidden)
@@ -146,6 +159,9 @@ fn main() -> reng_core::Result<()> {
             wq: to_bf16(&seq(hidden * hidden, 5 + l, 1, 17, fan)),
             wk: to_bf16(&seq(hidden * kvd, 11 + l, 4, 19, fan)),
             wv: to_bf16(&seq(hidden * kvd, 13 + l, 2, 21, fan)),
+            bq: bias_of(hidden, 29 + l),
+            bk: bias_of(kvd, 31 + l),
+            bv: bias_of(kvd, 37 + l),
             wo: to_bf16(&seq(hidden * hidden, 3 + l, 5, 29, fan)),
             wg: to_bf16(&seq(hidden * inter, 17 + l, 6, 31, fan)),
             wu: to_bf16(&seq(hidden * inter, 19 + l, 7, 37, fan)),
@@ -168,9 +184,9 @@ fn main() -> reng_core::Result<()> {
             wk: &o.wk,
             wv: &o.wv,
             wo: &o.wo,
-            bq: &[],
-            bk: &[],
-            bv: &[],
+            bq: &o.bq,
+            bk: &o.bk,
+            bv: &o.bv,
             qn: &o.qn,
             kn: &o.kn,
             wg: &o.wg,
@@ -217,7 +233,7 @@ fn main() -> reng_core::Result<()> {
         .map(|b| seq(longest * hidden, 7 + b, 3 + 2 * b, 23, 1.0))
         .collect();
     println!(
-        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}"
+        "batched model: layers={n_layers}, batch={batch}, rows={rows}, capacity={capacity}, prompts={prompts:?}, steps={steps}, hidden={hidden}, heads={n_heads}/{n_kv_heads} kv, vocab={vocab}, post_norm={post_norm}, qk_norm={qk_norm}, gemma={gemma}, bias={bias}"
     );
 
     let t0 = Instant::now();
