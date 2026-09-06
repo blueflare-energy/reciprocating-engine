@@ -17,6 +17,11 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/bench.yml'
   workflow_dispatch:
+    inputs:
+      multi_card:
+        description: 'Also run the multi-card sweep (holds all eight cards)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -147,3 +152,52 @@ jobs:
           alert-threshold: '150%'
           comment-on-alert: false
           fail-on-alert: false
+
+  # The multi-card sweep is never part of the automatic path: it holds every
+  # card named in RENG_MULTI_MODULES (all eight by default) for as long as it
+  # runs, which would stall every other job on the runner. Start it by hand
+  # from the Actions tab with `multi_card` ticked, or run the same command on
+  # the box:
+  #
+  #   python3 tools/sweep_tp.py ./target/release/reng-tp \
+  #     ./target/release/reng-bench sweep-mc \
+  #     --modules 0,1,2,3,4,5,6,7 --worlds 2,4,8 --replicas 1,8 --batches 1,8 \
+  #     --ceiling ./target/release/reng-ceiling --ctx 192 "${dirs[@]}"
+  #
+  # It runs after `bench` so the two never hold the cards at once.
+  multi-card:
+    name: multi-card sweep (manual)
+    needs: bench
+    if: github.event_name == 'workflow_dispatch' && inputs.multi_card
+    runs-on: [self-hosted, gaudi2]
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: clean up
+        run: |
+          for pid in $(pgrep -u "$(id -u)" -f "[t]arget/release/reng-"); do
+            echo "killing leftover engine process $pid"
+            kill -9 "$pid" || true
+          done
+          sleep 2
+      - name: build
+        run: |
+          cargo build --release --locked -p reng-model --features link-synapse --bin reng-bench --bin reng-tp
+          cargo build --release --locked -p reng-ceiling --bin reng-ceiling
+      - name: sweep
+        run: |
+          set -euo pipefail
+          : "${RENG_MODEL_DIRS:?the runner must export RENG_MODEL_DIRS}"
+          IFS=: read -ra dirs <<< "${RENG_SWEEP_DIRS:-$RENG_MODEL_DIRS}"
+          python3 tools/sweep_tp.py ./target/release/reng-tp \
+            ./target/release/reng-bench sweep-mc \
+            --modules "${RENG_MULTI_MODULES:-0,1,2,3,4,5,6,7}" \
+            --worlds 2,4,8 --replicas 1,8 --batches 1,8 \
+            --ceiling ./target/release/reng-ceiling --ctx 192 "${dirs[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multi-card-sweep
+          path: |
+            sweep-mc.json
+            sweep-mc.md
+            sweep-mc-cells.json

@@ -8,6 +8,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- N-card parallelism strategies and the ceiling each one admits
+  (`reng_ceiling::strategy`, and a `reng-ceiling <model_dir> --cards N
+  [--batch b]` binary that prints them). Two objectives, because they do
+  not have the same winner: single-stream tokens per second at batch 1,
+  and aggregate tokens per second over every card at a batch per replica.
+  Five strategies for N in {1, 2, 4, 8}. Data parallel: N replicas, a
+  stream unchanged, the aggregate N times the single-card ceiling, and
+  the model has to fit one card. Tensor parallel: each card streams 1/N
+  of the layer weights and 1/N of the KV cache per token at 2.45 TB/s
+  with the LM head replicated and the embedding still a lookup, plus the
+  collective floor of two all-reduces per layer at `hidden x batch x 4`
+  bytes, which gives a physical and a practical ceiling (the 70B at world
+  2 reproduces the 28.8 ms per token the README carries). Pipeline
+  parallel: consecutive layers in N stages, a single stream no faster
+  than one card because the token still reads every layer, one activation
+  hand-off per boundary, and up to N times the aggregate with N
+  micro-batches in flight; it is the split that runs a model larger than
+  one card for the least communication. The hybrids `dp2 x tp4` and
+  `dp4 x tp2` compose the two. Expert parallel, for a mixture of experts:
+  the E routed experts over N cards, a card streaming the shared weights
+  plus k/N of the expert bytes per token, projected for OLMoE-1B-7B and
+  Mixtral-8x7B from their configs and marked projected because the engine
+  has no MoE layer yet and no all-to-all is measured on this box. The
+  chooser returns the best strategy per model, card count and objective
+  with its reasons: does it fit one card, do the heads divide the world,
+  and how the collective floor compares with the per-layer weight time.
+  The all-reduce latency table is the 8 KB to 64 MB sweep measured on the
+  box on 2026-09-06, interpolated in the log of the message size and
+  overridable with `--collectives <file.json>`.
+- `tools/sweep_tp.py`: the multi-card sweep. `reng-tp` over a roster at
+  every admissible world (the Megatron gate is checked from config.json,
+  so an inadmissible world is skipped with its reason recorded rather
+  than run), and N data-parallel replicas of `reng-bench` started
+  together, one per module, summed. It writes the same JSON shape as the
+  single-card benches plus a world and a strategy per entry, and a
+  Markdown table. It holds every card it is given, so the `bench`
+  workflow only runs it from a manual dispatch with `multi_card` ticked.
+- README: an "Across cards" table beside the single-card one. Per model,
+  the measured tensor-parallel batch-1 throughput at worlds 2, 4 and 8
+  against that world's practical ceiling, the measured eight-replica
+  data-parallel aggregate at batch 8 against eight times the single-card
+  ceiling, and `reng-ceiling`'s best eight-card strategy for each
+  objective. Rows the split does not admit carry the reason (the head
+  counts, or the layer form `TpModel::new` rejects).
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds

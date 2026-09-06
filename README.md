@@ -113,6 +113,147 @@ bytes per token (FP8 halves them, INT4 quarters them), more cards
 (speculative decoding). Batching raises throughput, not latency: batch 8
 rides eight tokens on one pass over the weights.
 
+### Across cards
+
+Two objectives decide which split of N cards is the right one, and they do not
+have the same answer. Single-stream tokens per second is one sequence at batch
+1: the latency one user waits on. Aggregate tokens per second is every card
+summed at a batch per replica: what a server serves. Four strategies compete
+for them. Data parallelism runs N independent replicas; nothing crosses the
+interconnect, so a stream is exactly as fast as on one card and the machine
+does N times the work, as long as the model fits one card. Tensor
+parallelism splits every layer over N cards, so each streams `1/N` of the
+weight bytes and `1/N` of the KV cache per token, with the LM head replicated,
+and pays two all-reduces per layer for it. Pipeline parallelism cuts the
+layers into N consecutive stages: a token still reads every layer, one stage at
+a time, so a single stream is no faster than on one card, but N micro-batches
+in flight give up to N times the throughput, and the model no longer has to fit
+one card. Of the splits that buy capacity it is the one that communicates
+least: one activation per stage boundary against two all-reduces per layer.
+The hybrids (`dp2 x tp4`, `dp4 x tp2`) compose the arithmetic of the first
+two. Expert parallelism spreads a mixture of experts' routed experts over
+the cards so a card streams the shared weights plus `k/N` of the expert bytes
+per token; the engine has no MoE layer yet, so those rows are projections from
+the config and `reng-ceiling` marks them so.
+
+Small models gain nothing from tensor parallelism because the collective floor
+does not shrink with the model. Two all-reduces of `hidden x batch x 4` bytes
+cost 36 us per layer at world 2, 39 at world 4 and 49 at world 8, measured.
+Llama-3.2-1B's whole token is 1.74 ms on one card, and at world 8 its 16
+layers weigh 6.2 us of weight time each against 49.4 us of collective, so the
+split costs eight times what it saves. The measured rows agree: every model
+below 3B is slower on two cards than on one at batch 1 (Qwen2.5-0.5B 0.68x,
+Qwen3-0.6B 0.72x, Llama-3.2-1B 0.89x), and the line where the eightfold
+bandwidth starts to outrun both floors falls between Llama-3.2-3B and the 8B
+distill. Pipeline parallelism is the mirror image: it never makes a token
+faster, because the token reads the same bytes either way. What it buys is
+capacity and throughput -- a model larger than one card runs, and N stages with
+N micro-batches in flight retire N times the tokens without a collective on the
+token path. That is why it is the eight-card pick for the 70B's aggregate row
+below and for nothing else.
+
+Measured on the eight-card box on 2026-09-06: bf16, a 128-token prompt, 64
+timed decode steps, three repeats, medians. Every `reng-tp` run generated the
+same 64 ids as the single card, at every world and batch; the 70B, which does
+not fit one card, is identical across worlds instead. Tensor-parallel columns
+are batch 1, one figure per world, with the percentage of that world's
+practical ceiling; the data-parallel column is eight replicas at batch 8,
+aggregate, against eight times the single-card ceiling. The last two columns
+are `reng-ceiling`'s pick for eight cards, per objective, with the ceiling it
+picked.
+
+| Model | TP b1 w2 | TP b1 w4 | TP b1 w8 | DP x8 b8 | Best on 8 cards, 1 stream | Best on 8 cards, aggregate b8 |
+|---|---|---|---|---|---|---|
+| SmolLM2-135M | 9 heads | 9 heads | 9 heads | 59271 (12%) | data 8962 | data 515198 |
+| Gemma-3-270m | layer form | layer form | layer form | not measured | data 4540 | data 277819 |
+| SmolLM2-360M | 15 heads | 15 heads | 15 heads | not measured | data 3350 | data 199382 |
+| Qwen2.5-0.5B | 483 (54%) | 14 heads | 14 heads, 2 kv | not measured | data 2474 | data 155741 |
+| Qwen3-0.6B | 406 (54%) | 417 (55%) | 13 (2%)* | not measured | data 2018 | data 114609 |
+| Llama-3.2-1B | 513 (61%) | 585 (61%) | 575 (63%)* | 37976 (61%) | data 989 | data 62177 |
+| Gemma-3-1B | layer form | layer form | layer form | not measured | data 1222 | data 76848 |
+| OLMo-2-0425-1B | layer form | layer form | layer form | not measured | dp2 x tp4 981 (shape only) | data 56815 |
+| Qwen2.5-1.5B | 339 (59%) | 2 kv heads | 2 kv heads | not measured | data 792 | data 50077 |
+| Qwen3-1.7B | 329 (61%) | 356 (59%) | 159 (28%)* | not measured | data 707 | data 43350 |
+| Falcon3-1B-Base | 474 (63%) | 535 (62%) | 4 kv heads | not measured | data 870 | data 53790 |
+| TinyLlama-1.1B | 459 (57%) | 505 (56%) | 4 kv heads | not measured | data 1182 | data 74544 |
+| DeepSeek-R1-Distill-Qwen-1.5B | 339 (59%) | 2 kv heads | 2 kv heads | not measured | data 792 | data 50077 |
+| SmolLM2-1.7B | 360 (58%) | 435 (59%) | 295 (42%)* | not measured | dp2 x tp4 735 | data 42099 |
+| granite-3.1-2b-instruct | 233 (59%) | 275 (59%) | 141 (33%)* | not measured | data 482 | data 30197 |
+| Gemma-2-2B | layer form | layer form | layer form | not measured | dp2 x tp4 521 (shape only) | data 29081 |
+| Qwen2.5-3B | 235 (63%) | 2 kv heads | 2 kv heads | not measured | data 397 | data 25177 |
+| Llama-3.2-3B | 269 (67%) | 323 (65%) | 316 (63%)* | 16889 (71%) | tensor 500 | data 23753 |
+| SmolLM3-3B | layer form | layer form | layer form | not measured | dp2 x tp4 453 (shape only) | data 25035 |
+| Phi-3-mini-4k-instruct | layer form | layer form | layer form | not measured | tensor 490 (shape only) | data 19481 |
+| Qwen3-4B | 204 (64%) | 247 (61%) | 216 (53%)* | not measured | tensor 405 | data 18958 |
+| Qwen2.5-7B | 177 (74%) | 241 (69%) | 28 heads, 4 kv | 8675 (79%) | dp2 x tp4 347 | data 11020 |
+| Mistral-7B-v0.3 | 176 (73%) | 242 (68%) | 178 (43%)* | not measured | tensor 414 | data 10867 |
+| Llama-3.1-8B | 166 (74%) | 223 (70%) | 270 (74%) | not measured | tensor 366 | data 10309 |
+| Qwen3-8B | 154 (72%) | 202 (68%) | 220 (66%)* | not measured | tensor 333 | data 10207 |
+| DeepSeek-R1-Distill-Llama-8B | 166 (74%) | 223 (70%) | 216 (59%)* | 8337 (81%) | tensor 366 | data 10309 |
+| phi-4 | 104 (78%) | 10 kv heads | 10 kv heads | not measured | dp4 x tp2 133 | data 5482 |
+| Qwen2.5-32B | 52 (81%) | 79 (75%) | 106 (74%) | 2114 (87%) | tensor 143 | data 2436 |
+| DeepSeek-R1-Distill-Llama-70B | 27 (88%) | 45 (82%) | 67 (79%) | not measured | tensor 84 | pipeline 1014 |
+
+`*` the world-8 median carries a collective stall: 16 of 78 world-8 runs
+measured a per-layer all-reduce of hundreds of microseconds to milliseconds
+instead of tens, and none of the 342 runs at worlds 1, 2 and 4 did. The best of
+the three repeats is a clean run in every case (Qwen3-0.6B 425.5 tok/s against
+the 13.3 median, Llama-3.2-1B 628.9 against 574.7, Mistral-7B-v0.3 296.7
+against 177.9). World 8 is not a slower configuration so much as an unreliable
+one.
+
+`layer form` is `TpModel::new` rejecting the layer outright, not a divisibility
+failure: GeLU-tanh activations, post-attention or post-MLP norms, a sliding
+window, an attention softcap or per-layer RoPE (the three Gemmas,
+Phi-3-mini-4k-instruct, SmolLM3-3B, OLMo-2-0425-1B). The head counts are
+`LlamaConfig::shard`'s gate: `num_attention_heads`, `num_key_value_heads` and
+`intermediate_size` must all divide the world, and KV heads split as whole GQA
+groups, so 4 KV heads stop at world 4 and 2 at world 2. `reng-ceiling` models
+the divisibility gate but not the layer form, so a pick marked `(shape only)`
+is a shape projection the engine's tensor-parallel path would not run today.
+
+The ceilings the percentages are against, tokens per second at batch 1 and
+context 192, practical with the physical ceiling in brackets. The practical
+ceiling is the physical one plus the measured collective floor for that world
+and message size; the physical one is the per-card bytes over 2.45 TB/s alone.
+
+```
+Qwen2.5-0.5B                    w2 892 (3881)        w4 -                 w8 -                 dp8 b8 155741
+Qwen3-0.6B                      w2 758 (3213)        w4 756 (4563)        w8 643 (5778)        dp8 b8 114609
+Llama-3.2-1B                    w2 841 (1632)        w4 958 (2417)        w8 905 (3184)        dp8 b8 62177
+Qwen2.5-1.5B                    w2 577 (1377)        w4 -                 w8 -                 dp8 b8 50077
+Qwen3-1.7B                      w2 543 (1199)        w4 607 (1839)        w8 561 (2507)        dp8 b8 43350
+Falcon3-1B-Base                 w2 751 (1461)        w4 861 (2214)        w8 -                 dp8 b8 53790
+TinyLlama-1.1B                  w2 805 (2223)        w4 894 (3973)        w8 -                 dp8 b8 74544
+DeepSeek-R1-Distill-Qwen-1.5B   w2 577 (1377)        w4 -                 w8 -                 dp8 b8 50077
+SmolLM2-1.7B                    w2 621 (1338)        w4 735 (2411)        w8 697 (4025)        dp8 b8 42099
+granite-3.1-2b-instruct         w2 397 (927)         w4 464 (1723)        w8 433 (3019)        dp8 b8 30197
+Qwen2.5-3B                      w2 373 (721)         w4 -                 w8 -                 dp8 b8 25177
+Llama-3.2-3B                    w2 398 (677)         w4 499 (1112)        w8 500 (1638)        dp8 b8 23753
+Qwen3-4B                        w2 320 (554)         w4 403 (942)         w8 405 (1450)        dp8 b8 18958
+Qwen2.5-7B                      w2 241 (321)         w4 347 (563)         w8 -                 dp8 b8 11020
+Mistral-7B-v0.3                 w2 240 (337)         w4 357 (651)         w8 414 (1215)        dp8 b8 10867
+Llama-3.1-8B                    w2 223 (305)         w4 321 (539)         w8 366 (875)         dp8 b8 10309
+Qwen3-8B                        w2 213 (299)         w4 299 (519)         w8 333 (821)         dp8 b8 10207
+DeepSeek-R1-Distill-Llama-8B    w2 223 (305)         w4 321 (539)         w8 366 (875)         dp8 b8 10309
+phi-4                           w2 133 (167)         w4 -                 w8 -                 dp8 b8 5482
+Qwen2.5-32B                     w2 63 (75)           w4 105 (143)         w8 143 (262)         dp8 b8 2436
+DeepSeek-R1-Distill-Llama-70B   w2 31 (35)           w4 56 (67)           w8 84 (127)          dp8 b8 1124
+```
+
+`reng-ceiling <model_dir> --cards N [--batch b]` prints all of this for one
+model: every strategy, its physical and practical ceiling for both objectives,
+whether the split is admissible and why not, and the pick per objective with
+the reasons (does it fit one card, do the heads divide, how does the collective
+floor compare with the per-layer weight time). `--collectives <file.json>`
+replaces the measured latency table with another machine's.
+`tools/sweep_tp.py` runs the measured half -- `reng-tp` at every admissible
+world and N data-parallel replicas of `reng-bench` -- and writes the same JSON
+shape as the single-card benches plus a world and a strategy per entry. It
+holds every card it is given, so the `bench` workflow never runs it by default:
+it is a `workflow_dispatch` job with `multi_card` ticked, or the documented
+command on the box.
+
 After every merge, the `bench` workflow regenerates two tables:
 
 - decode versus batch (the plan's Chart 2):
