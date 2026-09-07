@@ -1248,10 +1248,12 @@ impl<'a> Worker<'a> {
     fn build_recipes(&mut self, a: &WorkerArgs<'_>) -> Result<()> {
         let t0 = Instant::now();
         let zeros = vec![0f32; N];
-        // `1 / world` (a power of two here, so exact in f32) and not 0.5:
-        // the all-reduce that follows D sums `world` copies of `P / world`,
-        // so P grows by exactly S each pass at any world size. With 0.5 the
-        // chain converges only at world 2 and overflows at 4 and 8.
+        // `1 / world` and not 0.5: the all-reduce that follows D sums `world`
+        // copies of `P / world`, so P grows by exactly S each pass at any
+        // world size. With 0.5 the chain converges only at world 2 and
+        // overflows at 4 and 8. `1 / world` is exact in f32 only when `world`
+        // is a power of two; the two chain checks that depend on the exact sum
+        // skip themselves otherwise rather than report arithmetic as ordering.
         let inv = vec![1.0 / self.world as f32; N];
         let mut rec = Recipes {
             w: recipe_w(&self.card, &self.x, &zeros)?,
@@ -1636,11 +1638,34 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Why the two bit-exact chains cannot run at this world, or `None`.
+    ///
+    /// Both chains assert `P == iters * S` bit for bit after `iters` passes
+    /// of `P = P / world + X` and an all-reduce. That identity holds only
+    /// while `1 / world` is representable in f32, which it is for a power of
+    /// two and is not for worlds 3, 5, 6 and 7: there the sum of `world`
+    /// copies of `fl(P / world)` is not `P`, and the check would report an
+    /// arithmetic rounding failure as an ordering failure. Skip instead of
+    /// lying about ordering.
+    fn inexact_scale(&self) -> Option<String> {
+        (!self.world.is_power_of_two()).then(|| {
+            format!(
+                "world {} is not a power of two, so 1/{} is not exact in f32 and the \
+                 bit-exact count would report rounding as a reordering",
+                self.world, self.world
+            )
+        })
+    }
+
     /// Recipe D (`P = P / world + X_r`) then an in-place all-reduce of P, on one
     /// stream, `iters` times without any host sync: each pass adds exactly
     /// `S` to P, so P must equal `iters * S` at the end (read through R).
     /// Any reordering of a launch and a collective breaks the count.
     fn ordering_chain(&mut self, iters: usize) -> Result<bool> {
+        if let Some(why) = self.inexact_scale() {
+            println!("ordering-chain: SKIP ({why})");
+            return Ok(true);
+        }
         self.memset(self.p, 0, N)?;
         self.card.sync()?;
         let t0 = Instant::now();
@@ -1688,6 +1713,10 @@ impl<'a> Worker<'a> {
     /// the collective stream; record after the collective, wait on the
     /// recipe stream), the documented cross-stream pattern.
     fn ordering_events(&mut self, iters: usize) -> Result<bool> {
+        if let Some(why) = self.inexact_scale() {
+            println!("ordering-events: SKIP ({why})");
+            return Ok(true);
+        }
         const RING: usize = 16;
         let s2 = self.card.new_stream()?;
         let mut ev_a = Vec::with_capacity(RING);
