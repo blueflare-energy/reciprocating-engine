@@ -19,8 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of the layer weights and 1/N of the KV cache per token at 2.45 TB/s
   with the LM head replicated and the embedding still a lookup, plus the
   collective floor of two all-reduces per layer at `hidden x batch x 4`
-  bytes, which gives a physical and a practical ceiling (the 70B at world
-  2 reproduces the 28.8 ms per token the README carries). Pipeline
+  bytes (the 70B at world 2 reproduces the 28.8 ms per token the README
+  carries). Pipeline
   parallel: consecutive layers in N stages, a single stream no faster
   than one card because the token still reads every layer, one activation
   hand-off per boundary, and up to N times the aggregate with N
@@ -33,25 +33,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   has no MoE layer yet and no all-to-all is measured on this box. The
   chooser returns the best strategy per model, card count and objective
   with its reasons: does it fit one card, do the heads divide the world,
-  and how the collective floor compares with the per-layer weight time.
-  The all-reduce latency table is the 8 KB to 64 MB sweep measured on the
-  box on 2026-09-06, interpolated in the log of the message size and
-  overridable with `--collectives <file.json>`.
+  and what the split saves in weight time against what the collective and
+  the host launch floor cost. Where no split is admissible it says so and
+  lists every rejection instead of naming a pick.
+  Three terms, kept apart: the physical ceiling (bytes per card over
+  2.45 TB/s), the measured collective floor, and the measured host launch
+  floor. The practical ceiling is
+  `max(physical + collective, launch)`, so it is never above the rate the
+  host can enqueue. The all-reduce latency table is the 8 KB to 64 MB
+  sweep measured on the box on 2026-09-06, interpolated in the log of the
+  message size and overridable with `--collectives <file.json>`; the
+  launch table is the cheapest per-step host enqueue measured per world
+  (60 us plus 75.6 us a layer at world 8, which is Llama-3.2-1B's 1.27 ms
+  step and its 787 tok/s enqueue floor), marked engine cost rather than
+  physics and overridable with `--launch <file.json>`.
 - `tools/sweep_tp.py`: the multi-card sweep. `reng-tp` over a roster at
   every admissible world (the Megatron gate is checked from config.json,
   so an inadmissible world is skipped with its reason recorded rather
   than run), and N data-parallel replicas of `reng-bench` started
-  together, one per module, summed. It writes the same JSON shape as the
-  single-card benches plus a world and a strategy per entry, and a
+  together, one per module, summed. Three repeats a cell and the median
+  reported, which is how the README's table is built, since one world-8
+  run in five stalls on a collective. It writes the same JSON shape as
+  the single-card benches plus a world and a strategy per entry, and a
   Markdown table. It holds every card it is given, so the `bench`
   workflow only runs it from a manual dispatch with `multi_card` ticked.
+  `tools/test_sweep_tp.py` covers the parts that need no card (the
+  argument parser, the Megatron gate, the median over repeats and the
+  entry shape) and `ci` runs it beside `py_compile` over `tools/`.
 - README: an "Across cards" table beside the single-card one. Per model,
   the measured tensor-parallel batch-1 throughput at worlds 2, 4 and 8
   against that world's practical ceiling, the measured eight-replica
   data-parallel aggregate at batch 8 against eight times the single-card
   ceiling, and `reng-ceiling`'s best eight-card strategy for each
   objective. Rows the split does not admit carry the reason (the head
-  counts, or the layer form `TpModel::new` rejects).
+  counts, or the layer form `TpModel::new` rejects); the ceilings block
+  beside it gives all three terms per world, so a reader can see which
+  floor binds.
 - Tensor-parallel decoding over the cards of one HCCL communicator
   (`reng_synapse::tp`, `reng_model::TpGenerator`, the `reng-tp` binary):
   a coordinator spawns one worker process per module id, each rank holds

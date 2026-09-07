@@ -164,6 +164,10 @@ jobs:
   #     --modules 0,1,2,3,4,5,6,7 --worlds 2,4,8 --replicas 1,8 --batches 1,8 \
   #     --ceiling ./target/release/reng-ceiling --ctx 192 "${dirs[@]}"
   #
+  # Every cell is three runs and the median of them (`--repeats`), which is
+  # what the README's table reports: one world-8 run in five stalls on a
+  # collective, so a single shot is not a measurement. Budget for it.
+  #
   # It runs after `bench` so the two never hold the cards at once.
   multi-card:
     name: multi-card sweep (manual)

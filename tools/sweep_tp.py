@@ -8,7 +8,7 @@ usage: sweep_tp.py <reng-tp> <reng-bench> <out_prefix>
                    [--replicas 1,2,4,8] [--batches 1,8] [--prompt 128]
                    [--new 64] [--capacity 1024] [--ids "1 2 3 4 5"]
                    [--prompt-dir <dir>] [--ceiling <reng-ceiling>] [--ctx 192]
-                   [--timeout 2900] [--strategies tp,dp]
+                   [--timeout 2900] [--strategies tp,dp] [--repeats 3]
                    <model_dir> [<model_dir> ...]
 
 This needs every card named in --modules, so it is not part of the bench
@@ -23,8 +23,11 @@ reng-bench processes started together, one per module, and its value is the
 sum of their throughputs. Percentages are against the strategy's own ceiling
 from `reng-ceiling --json`, when that binary is passed.
 
-Every cell is one invocation, so a failed cell does not stop the sweep; it is
-recorded as failed.
+Every cell is `--repeats` invocations (3 by default, the number the README's
+table is built from) and its value is the median of them: at world 8 one run
+in five stalls on a collective, so a single shot can be off by more than an
+order of magnitude. Every repeat is kept in the `-cells.json` file. A failed or
+timed-out cell does not stop the sweep; it is recorded as failed.
 """
 import json
 import os
@@ -40,18 +43,42 @@ def parse_args(argv):
     opts = {"modules": "0,1,2,3,4,5,6,7", "worlds": "2,4,8", "replicas": "1,2,4,8",
             "batches": "1,8", "prompt": "128", "new": "64", "capacity": "1024",
             "ids": "1 2 3 4 5", "prompt-dir": "", "ceiling": "", "ctx": "192",
-            "timeout": "2900", "strategies": "tp,dp"}
+            "timeout": "2900", "strategies": "tp,dp", "repeats": "3"}
     models = []
     i = 3
     while i < len(argv):
         a = argv[i]
         if a.startswith("--"):
-            opts[a[2:]] = argv[i + 1]
+            key = a[2:]
+            if key not in opts:
+                sys.exit(f"unknown option {a}; known: " + ", ".join(sorted(opts)))
+            if i + 1 >= len(argv):
+                sys.exit(f"{a} needs a value")
+            opts[key] = argv[i + 1]
             i += 2
         else:
             models.append(a)
             i += 1
+    if not models:
+        sys.exit("no model directory given")
+    for key in ("prompt", "new", "capacity", "ctx", "timeout", "repeats"):
+        if not opts[key].isdigit() or int(opts[key]) < 1:
+            sys.exit(f"--{key} wants a positive integer, got {opts[key]!r}")
     return tp, bench, prefix, opts, models
+
+
+def median_cell(cells):
+    """The median of the repeats by tok/s, with every repeat kept beside it."""
+    ok = [c for c in cells if c["ok"]]
+    if not ok:
+        out = dict(cells[0])
+        out["repeats"] = cells
+        return out
+    ok.sort(key=lambda c: c["tok_s"])
+    out = dict(ok[len(ok) // 2])
+    out["repeats"] = cells
+    out["tok_s_range"] = [ok[0]["tok_s"], ok[-1]["tok_s"]]
+    return out
 
 
 def config(model):
@@ -108,7 +135,14 @@ def run_tp(tp, model, world, batch, opts, out):
         cmd += ["--prompt-file", pf]
     else:
         cmd += opts["ids"].split()
-    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # `--timeout` is reng-tp's own deadline; the wall clock here is a
+    # backstop for a coordinator that never returns at all, so that one hung
+    # cell cannot hold every card for the rest of the sweep.
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False,
+                           timeout=int(opts["timeout"]) + 120)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "log": f"timed out after {int(opts['timeout']) + 120} s"}
     # The coordinator prefixes each rank's line with "[r0] ".
     m = re.search(r"RESULT: decode b\d+ ([0-9.]+) tok/s \(([0-9.]+) ms/step\)", r.stdout)
     if r.returncode != 0 or not m:
@@ -135,8 +169,14 @@ def run_dp(bench, model, replicas, batch, opts):
                                           stderr=subprocess.STDOUT, text=True)))
     per = []
     logs = []
+    deadline = int(opts["timeout"]) + 120
     for m, p in procs:
-        log = p.communicate()[0]
+        try:
+            log = p.communicate(timeout=deadline)[0]
+        except subprocess.TimeoutExpired:
+            # One hung replica would otherwise hold every card forever.
+            p.kill()
+            log = (p.communicate()[0] or "") + f"\nkilled after {deadline} s"
         logs.append(f"m{m}: {log[-200:]}")
         hit = re.search(r"^decode .*?: ([0-9.]+) tok/s, \w+ step ([0-9.]+) ms", log, re.M)
         if p.returncode != 0 or not hit:
@@ -151,7 +191,8 @@ def run_dp(bench, model, replicas, batch, opts):
 
 
 def entries(name, cell, strategy, world, batch, ceiling_tok_s, extra):
-    """The single-card bench JSON shape, plus world and strategy."""
+    """The single-card bench JSON shape, plus world and strategy. `cell` is a
+    median over the repeats, as the README's table is."""
     out = [{"name": f"{name} decode tok/s (b{batch}) {strategy} n{world}",
             "unit": "tok/s", "value": cell["tok_s"], "extra": extra,
             "world": world, "strategy": strategy}]
@@ -190,8 +231,11 @@ def main():
                         rows[name][key] = {"ok": False, "skipped": why}
                         print(f"{name} {key}: skipped, {why}", flush=True)
                         continue
-                    out = f"/tmp/sweep-tp-{name}-w{world}-b{batch}.json"
-                    cell = run_tp(tp, model, world, batch, opts, out)
+                    cell = median_cell([
+                        run_tp(tp, model, world, batch, opts,
+                               f"/tmp/sweep-tp-{name}-w{world}-b{batch}-r{r}.json")
+                        for r in range(1, int(opts["repeats"]) + 1)
+                    ])
                     rows[name][key] = cell
                     table = ceilings(opts, model, world, batch)
                     p = plan(table, "tensor")
@@ -203,7 +247,11 @@ def main():
                             f"{cell['step_ms']:.2f} ms/step at world {world}"
                             + (f"; ceiling {ceil:.1f} tok/s practical" if ceil else ""))
                         pct = f" ({100.0 * cell['tok_s'] / ceil:.1f}%)" if ceil else ""
-                        print(f"{name} {key}: {cell['tok_s']:.1f} tok/s{pct}", flush=True)
+                        rng = cell.get("tok_s_range", [])
+                        spread = (f" [{rng[0]:.1f}-{rng[1]:.1f} over "
+                                  f"{opts['repeats']}]") if rng else ""
+                        print(f"{name} {key}: {cell['tok_s']:.1f} tok/s{pct}{spread}",
+                              flush=True)
                     else:
                         print(f"{name} {key}: failed", flush=True)
             if "dp" in want:
@@ -212,7 +260,8 @@ def main():
                     if n > len(modules):
                         rows[name][key] = {"ok": False, "skipped": f"only {len(modules)} modules"}
                         continue
-                    cell = run_dp(bench, model, n, batch, opts)
+                    cell = median_cell([run_dp(bench, model, n, batch, opts)
+                                        for _ in range(int(opts["repeats"]))])
                     rows[name][key] = cell
                     table = ceilings(opts, model, n, batch)
                     p = plan(table, "data")
