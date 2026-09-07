@@ -16,9 +16,24 @@
 //! Five strategies: data, tensor, pipeline and expert parallelism, and the
 //! data-by-tensor hybrids. Every one is a bytes-per-card-per-token count
 //! divided by one card's HBM bandwidth, plus the communication that split
-//! forces. The bandwidth term is the *physical* ceiling; the physical ceiling
-//! plus the measured collective floor is the *practical* one. Neither is a
-//! prediction: they are what the hardware admits.
+//! forces, floored by what the host costs to issue the step.
+//!
+//! Three terms, kept apart and printed apart, because they are different
+//! kinds of number:
+//!
+//! - the *physical* ceiling, bytes per card over 2.45 TB/s: physics, and the
+//!   only term that improves when cards are added;
+//! - the measured collective floor, two all-reduces per layer at the latency
+//!   [`CollectiveFloor`] measured on this box;
+//! - the measured host launch floor, what the `2 + 4L` enqueues of one step
+//!   cost the host ([`LaunchFloor`]). This one is **engine cost, not
+//!   physics**: it is a property of today's launch path, it does not shrink
+//!   when cards are added, and it is the binding term for a short model on
+//!   eight cards.
+//!
+//! The *practical* ceiling is the larger of the two step times those give,
+//! `max(physical + collective, launch)`. The physical ceiling never carries
+//! the launch floor.
 
 use std::fmt;
 
@@ -146,17 +161,24 @@ impl CollectiveFloor {
             source: "measured on this box on 2026-09-06 (reng-hccl-test, \
                      median of three repeats)"
                 .to_string(),
-            worlds: MEASURED_2026_09_06
-                .iter()
-                .map(|(w, pts)| {
-                    (
-                        *w,
-                        pts.iter()
-                            .map(|(b, us)| (*b, us * 1e-6))
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect(),
+            worlds: {
+                // `all_reduce_s`'s "largest tabulated world below it" rule
+                // reads this in order, so sort rather than trust the
+                // constant's order.
+                let mut w: Vec<_> = MEASURED_2026_09_06
+                    .iter()
+                    .map(|(w, pts)| {
+                        (
+                            *w,
+                            pts.iter()
+                                .map(|(b, us)| (*b, us * 1e-6))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect();
+                w.sort_by_key(|(w, _)| *w);
+                w
+            },
         }
     }
 
@@ -225,27 +247,206 @@ impl CollectiveFloor {
         })
     }
 
+    /// The world whose latencies `all_reduce_s` will really use: `world`
+    /// itself when the table carries it, otherwise the largest tabulated
+    /// world below it, or the smallest one there is. `None` at world 1, which
+    /// has no communicator.
+    ///
+    /// A substituted world is always a cheaper one, so a ceiling built on it
+    /// is optimistic. Callers say so in the plan's notes.
+    #[must_use]
+    pub fn world_used(&self, world: u32) -> Option<u32> {
+        if world <= 1 {
+            return None;
+        }
+        if self.worlds.iter().any(|(w, _)| *w == world) {
+            return Some(world);
+        }
+        self.worlds
+            .iter()
+            .rev()
+            .find(|(w, _)| *w < world)
+            .or_else(|| self.worlds.first())
+            .map(|(w, _)| *w)
+    }
+
     /// Seconds for one all-reduce of `bytes` over `world` cards.
     ///
     /// World 1 has no communicator and costs nothing. A world the table does
     /// not carry takes the largest tabulated world below it, or the smallest
-    /// one there is.
+    /// one there is; [`CollectiveFloor::world_used`] says which.
     #[must_use]
     pub fn all_reduce_s(&self, world: u32, bytes: u64) -> f64 {
-        if world <= 1 {
+        let Some(used) = self.world_used(world) else {
             return 0.0;
-        }
-        let pts = match self.worlds.iter().find(|(w, _)| *w == world) {
-            Some((_, p)) => p,
-            None => {
-                let below = self.worlds.iter().rev().find(|(w, _)| *w < world);
-                match below.or_else(|| self.worlds.first()) {
-                    Some((_, p)) => p,
-                    None => return 0.0,
-                }
-            }
         };
-        interpolate_log(pts, bytes)
+        match self.worlds.iter().find(|(w, _)| *w == used) {
+            Some((_, pts)) => interpolate_log(pts, bytes),
+            None => 0.0,
+        }
+    }
+}
+
+/// The measured host launch floor: what one decode step costs the host to
+/// *enqueue*, whatever the device then does with it.
+///
+/// **Engine cost, not physics.** A decode step enqueues `2 + 4L` operations
+/// -- one recipe launch for the embedding and one for the LM head, plus
+/// recipe A, recipe B and two collectives for every layer -- and that count
+/// does not change when cards are added, so on eight cards a short model
+/// spends most of a step issuing work rather than doing it. It is the term
+/// fewer and larger launches would move, not the term more bandwidth moves. A
+/// ceiling that leaves it out sits above a rate the host cannot reach at all,
+/// so [`Rate`] carries it and takes the larger of the two step times.
+///
+/// The table is `base + per_layer * layers` seconds per step, per world. Each
+/// row is the *cheapest* per-step enqueue measured over this box's roster at
+/// that world: a floor has to be a lower bound, and the host cost of a launch
+/// grows with the model, so the roster median would sit above the measured
+/// step of the cheapest models. The world-8 median is the `60 + 102 L`
+/// microseconds the measurement report quotes; the cheapest is
+/// `60 + 75.6 L`, which is Llama-3.2-1B's 1.27 ms per step, the 787 tok/s
+/// enqueue floor of that report's C4 table.
+///
+/// World 1 is deliberately not tabulated. The single-card enqueue figure
+/// (`70 + 94.7 L` us) is dominated by device back-pressure inside the recipe
+/// launch rather than by host cost, so it is not a floor, and a data-parallel
+/// replica is charged nothing here. Only the tensor-parallel decode path is
+/// measured, so only the plans that run it are charged: tensor parallel, a
+/// hybrid's inner world, and the expert projection, which enqueues the same
+/// `2 + 4L`. Pipeline parallelism enqueues `2 + 2L` with no collective and is
+/// not measured, so it carries no launch floor.
+///
+/// One machine on one day, like the collective table, so it is overridable
+/// the same way: [`LaunchFloor::from_json`].
+#[derive(Debug, Clone)]
+pub struct LaunchFloor {
+    /// Where the numbers came from, for the CLI to print.
+    pub source: String,
+    /// One entry per world, world-ordered: (world, seconds of fixed cost per
+    /// step, seconds per layer).
+    pub worlds: Vec<(u32, f64, f64)>,
+}
+
+/// The cheapest per-step host enqueue measured on this box on 2026-09-06, in
+/// microseconds: `(world, fixed, per layer)`.
+///
+/// The fixed 60 us is the two embedding-and-head recipe launches, flat at
+/// 30 us each at every world. The per-layer figures are solved from the
+/// cheapest measured step on the roster at that world:
+///
+/// - world 2: Qwen2.5-0.5B, 24 layers, 1.70 ms per step
+/// - world 4: Qwen3-0.6B, 28 layers, 2.02 ms per step
+/// - world 8: Llama-3.2-1B, 16 layers, 1.27 ms per step, 787 tok/s
+const MEASURED_LAUNCH_2026_09_06: &[(u32, f64, f64)] =
+    &[(2, 60.0, 68.333), (4, 60.0, 70.0), (8, 60.0, 75.625)];
+
+impl Default for LaunchFloor {
+    fn default() -> Self {
+        Self::measured()
+    }
+}
+
+impl LaunchFloor {
+    /// The documented constant table: measured on this box on 2026-09-06.
+    #[must_use]
+    pub fn measured() -> Self {
+        let mut worlds: Vec<(u32, f64, f64)> = MEASURED_LAUNCH_2026_09_06
+            .iter()
+            .map(|(w, base, per)| (*w, base * 1e-6, per * 1e-6))
+            .collect();
+        worlds.sort_by_key(|(w, _, _)| *w);
+        Self {
+            source: "measured on this box on 2026-09-06 (reng-tp enqueue, the cheapest step \
+                     on the roster per world; engine cost, not physics)"
+                .to_string(),
+            worlds,
+        }
+    }
+
+    /// Read a table from JSON: `{"source": "...", "worlds": {"8": [60.0,
+    /// 75.625], ...}}`, the fixed cost and the per-layer cost in microseconds
+    /// per step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the JSON does not parse or does not have that
+    /// shape.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| Error::Other(format!("launch table parse: {e}")))?;
+        let src = v
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("from JSON")
+            .to_string();
+        let worlds = v
+            .get("worlds")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| Error::Other("launch table: no \"worlds\" object".into()))?;
+        let mut out = Vec::new();
+        for (k, pair) in worlds {
+            let world: u32 = k
+                .parse()
+                .map_err(|_| Error::Other(format!("launch table: world {k:?} is not a number")))?;
+            let arr = pair.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+                Error::Other(format!(
+                    "launch table: world {k} wants [fixed us, per-layer us]"
+                ))
+            })?;
+            let base = arr[0].as_f64().ok_or_else(|| {
+                Error::Other(format!(
+                    "launch table: world {k} has a non-number fixed cost"
+                ))
+            })?;
+            let per = arr[1].as_f64().ok_or_else(|| {
+                Error::Other(format!(
+                    "launch table: world {k} has a non-number per-layer cost"
+                ))
+            })?;
+            out.push((world, base * 1e-6, per * 1e-6));
+        }
+        if out.is_empty() {
+            return Err(Error::Other("launch table: no worlds".into()));
+        }
+        out.sort_by_key(|(w, _, _)| *w);
+        Ok(Self {
+            source: src,
+            worlds: out,
+        })
+    }
+
+    /// The world whose launch costs `step_s` will really use, on the same
+    /// rule as [`CollectiveFloor::world_used`]. `None` where nothing is
+    /// charged: world 1, or an empty table.
+    #[must_use]
+    pub fn world_used(&self, world: u32) -> Option<u32> {
+        if world <= 1 {
+            return None;
+        }
+        if self.worlds.iter().any(|(w, _, _)| *w == world) {
+            return Some(world);
+        }
+        self.worlds
+            .iter()
+            .rev()
+            .find(|(w, _, _)| *w < world)
+            .or_else(|| self.worlds.first())
+            .map(|(w, _, _)| *w)
+    }
+
+    /// Seconds the host needs to enqueue one decode step of `layers` layers
+    /// on `world` cards. Zero at world 1, where no host-only floor is
+    /// measured.
+    #[must_use]
+    pub fn step_s(&self, world: u32, layers: u32) -> f64 {
+        let Some(used) = self.world_used(world) else {
+            return 0.0;
+        };
+        match self.worlds.iter().find(|(w, _, _)| *w == used) {
+            Some((_, base, per)) => base + per * f64::from(layers),
+            None => 0.0,
+        }
     }
 }
 
@@ -272,32 +473,59 @@ fn interpolate_log(points: &[(u64, f64)], bytes: u64) -> f64 {
     last_t
 }
 
-/// A ceiling for one objective: what the bandwidth alone admits, and what it
-/// admits once the split's own communication is charged.
+/// A ceiling for one objective, in three terms: what the bandwidth alone
+/// admits, what the split's own communication costs on top, and what the host
+/// needs to issue the step at all.
 #[derive(Debug, Clone)]
 pub struct Rate {
-    /// Seconds per decode step with no communication charged.
+    /// Seconds per decode step with no communication and no launch cost
+    /// charged. Physics.
     pub physical_s: f64,
-    /// Seconds per decode step with the measured collective floor charged.
+    /// Seconds of measured collective floor charged on top of `physical_s`.
+    pub collective_s: f64,
+    /// Seconds the host needs to enqueue the step, zero where no host-only
+    /// floor is measured for this path. Engine cost, not physics.
+    pub launch_s: f64,
+    /// `max(physical_s + collective_s, launch_s)`: the step the machine can
+    /// actually turn in.
     pub practical_s: f64,
     /// Tokens per second at `practical_s`.
     pub tokens_per_s: f64,
     /// Tokens per second at `physical_s`.
     pub physical_tokens_per_s: f64,
+    /// True when the host launch floor, not the device, sets `practical_s`.
+    pub launch_bound: bool,
     /// Which resource sets `physical_s`.
     pub bottleneck: Bottleneck,
 }
 
 impl Rate {
-    fn new(tokens: f64, physical_s: f64, comm_s: f64, bottleneck: Bottleneck) -> Self {
-        let practical_s = physical_s + comm_s;
+    fn new(
+        tokens: f64,
+        physical_s: f64,
+        comm_s: f64,
+        launch_s: f64,
+        bottleneck: Bottleneck,
+    ) -> Self {
+        let device_s = physical_s + comm_s;
+        let practical_s = device_s.max(launch_s);
         Self {
             physical_s,
+            collective_s: comm_s,
+            launch_s,
             practical_s,
             tokens_per_s: tokens / practical_s,
             physical_tokens_per_s: tokens / physical_s,
+            launch_bound: launch_s > device_s,
             bottleneck,
         }
+    }
+
+    /// Tokens per second the host launch floor alone allows, or `None` where
+    /// none is charged.
+    #[must_use]
+    pub fn launch_tokens_per_s(&self, tokens: f64) -> Option<f64> {
+        (self.launch_s > 0.0).then(|| tokens / self.launch_s)
     }
 }
 
@@ -357,6 +585,7 @@ pub struct Scenario<'a> {
     /// Context length the KV cache is charged at.
     pub ctx: u32,
     pub floor: &'a CollectiveFloor,
+    pub launch: &'a LaunchFloor,
 }
 
 impl<'a> Scenario<'a> {
@@ -368,6 +597,7 @@ impl<'a> Scenario<'a> {
         batch: u32,
         ctx: u32,
         floor: &'a CollectiveFloor,
+        launch: &'a LaunchFloor,
     ) -> Self {
         Self {
             hw,
@@ -377,6 +607,7 @@ impl<'a> Scenario<'a> {
             batch,
             ctx,
             floor,
+            launch,
         }
     }
 
@@ -397,6 +628,22 @@ impl<'a> Scenario<'a> {
 
     fn embedding_bytes(&self) -> f64 {
         (self.model.hidden * self.model.vocab) as f64 * self.prec.weight_bytes()
+    }
+
+    /// The embedding table and the LM head as they sit in memory: one matrix
+    /// when the model ties them, two when it does not. This is the count
+    /// `ModelShape::total_params` uses, so a plan's "per card GB" and the
+    /// CLI's header agree.
+    ///
+    /// The streamed charge is a different question and is unaffected: a token
+    /// reads the tied matrix once as an output projection, which is what
+    /// `head_bytes()` in `body_bytes()`'s company already charges.
+    fn resident_embed_head_bytes(&self) -> f64 {
+        if self.model.tied_embeddings {
+            self.embedding_bytes()
+        } else {
+            self.embedding_bytes() + self.head_bytes()
+        }
     }
 
     /// Resident weight bytes of the layer stack: every expert, not just the
@@ -461,8 +708,7 @@ pub fn data_parallel(s: &Scenario, cards: u32) -> Plan {
     let (step_b, bn_b) = s.card_step(bytes_b, s.body_flops(s.batch) + s.head_flops(s.batch));
 
     let resident =
-        (s.resident_body_bytes() + s.embedding_bytes() + s.head_bytes() + s.kv_bytes(s.batch))
-            as u64;
+        (s.resident_body_bytes() + s.resident_embed_head_bytes() + s.kv_bytes(s.batch)) as u64;
     let rejected = (resident > s.hw.hbm_bytes).then(|| {
         format!(
             "does not fit one card ({:.1} GB resident against {:.1} GB of HBM)",
@@ -476,14 +722,17 @@ pub fn data_parallel(s: &Scenario, cards: u32) -> Plan {
         cards,
         batch: s.batch,
         rejected,
-        single_stream: Rate::new(1.0, step1, 0.0, bn1),
-        aggregate: Rate::new(n * f64::from(s.batch), step_b, 0.0, bn_b),
+        single_stream: Rate::new(1.0, step1, 0.0, 0.0, bn1),
+        aggregate: Rate::new(n * f64::from(s.batch), step_b, 0.0, 0.0, bn_b),
         resident_bytes_per_card: resident,
         collective_s: 0.0,
         projected: false,
         notes: vec![
             "no collective on the token path: a replica never talks to another".to_string(),
             format!("aggregate is {cards} x the single-card ceiling"),
+            "no host launch floor charged: a replica runs at world 1, where the measured \
+             enqueue is device back-pressure rather than host cost"
+                .to_string(),
         ],
     }
 }
@@ -508,10 +757,15 @@ fn tensor_split_reason(model: &ModelShape, world: u32) -> Option<String> {
 
 /// (b) Tensor parallel: one model over N cards, Megatron style. Each card
 /// streams `1/N` of the layer weights and `1/N` of the KV cache per token; the
-/// LM head and the norms are replicated, so they cost what they cost on one
-/// card, and the embedding stays the lookup the single-card formula treats it
-/// as. The split's own cost is two all-reduces per layer of `hidden x batch x
-/// 4` bytes, at the measured floor for this world.
+/// LM head is replicated, so it costs what it costs on one card, and the
+/// embedding stays the lookup the single-card formula treats it as. The
+/// layer norms are not counted at all: `2 * hidden` weights a layer is under
+/// a thousandth of the layer's bytes on every roster shape, and leaving them
+/// out is deliberate.
+///
+/// The split's own cost is two all-reduces per layer of `hidden x batch x 4`
+/// bytes at [`CollectiveFloor`], and the step cannot beat [`LaunchFloor`]:
+/// this is the one path whose host enqueue is measured.
 #[must_use]
 pub fn tensor_parallel(s: &Scenario, cards: u32) -> Plan {
     let n = f64::from(cards.max(1));
@@ -526,8 +780,7 @@ pub fn tensor_parallel(s: &Scenario, cards: u32) -> Plan {
     let coll_b = 2.0 * layers * s.floor.all_reduce_s(cards, s.all_reduce_bytes(s.batch));
 
     let resident = (s.resident_body_bytes() / n
-        + s.embedding_bytes()
-        + s.head_bytes()
+        + s.resident_embed_head_bytes()
         + s.kv_bytes(s.batch) / n) as u64;
     let rejected = tensor_split_reason(s.model, cards).or_else(|| {
         (resident > s.hw.hbm_bytes).then(|| {
@@ -540,30 +793,73 @@ pub fn tensor_parallel(s: &Scenario, cards: u32) -> Plan {
     });
 
     let per_layer_weights = s.body_bytes() / n / layers / s.hw.hbm_bw;
+    let launch = s.launch.step_s(cards, s.model.layers);
+    let mut notes = vec![
+        format!(
+            "two all-reduces of {} bytes per layer: {:.1} us each, {:.2} ms per token",
+            s.all_reduce_bytes(1),
+            s.floor.all_reduce_s(cards, s.all_reduce_bytes(1)) * 1e6,
+            coll1 * 1e3
+        ),
+        // Both ends of the comparison, because the split's saving is the
+        // difference between them, not the post-split remainder alone.
+        format!(
+            "collective floor {:.1} us per layer against {:.1} us of weight time a layer on \
+             one card, {:.1} us after the split",
+            2.0 * s.floor.all_reduce_s(cards, s.all_reduce_bytes(1)) * 1e6,
+            per_layer_weights * n * 1e6,
+            per_layer_weights * 1e6
+        ),
+    ];
+    let single = Rate::new(1.0, step1, coll1, launch, bn1);
+    if launch > 0.0 {
+        notes.push(format!(
+            "host launch floor {:.2} ms per step ({:.0} tok/s at batch 1) for the step's \
+             {} enqueues (2 + 4 x {} layers), {}: engine cost, not physics",
+            launch * 1e3,
+            1.0 / launch,
+            2 + 4 * s.model.layers,
+            s.model.layers,
+            if single.launch_bound {
+                "the binding term here"
+            } else {
+                "below the bandwidth and collective terms here"
+            },
+        ));
+    }
+    notes.extend(substitution_notes(s, cards));
     Plan {
         strategy: Strategy::Tensor,
         cards,
         batch: s.batch,
         rejected,
-        single_stream: Rate::new(1.0, step1, coll1, bn1),
-        aggregate: Rate::new(f64::from(s.batch), step_b, coll_b, bn_b),
+        single_stream: single,
+        aggregate: Rate::new(f64::from(s.batch), step_b, coll_b, launch, bn_b),
         resident_bytes_per_card: resident,
         collective_s: coll1,
         projected: false,
-        notes: vec![
-            format!(
-                "two all-reduces of {} bytes per layer: {:.1} us each, {:.2} ms per token",
-                s.all_reduce_bytes(1),
-                s.floor.all_reduce_s(cards, s.all_reduce_bytes(1)) * 1e6,
-                coll1 * 1e3
-            ),
-            format!(
-                "collective floor {:.1} us per layer against {:.1} us of weight time per layer",
-                2.0 * s.floor.all_reduce_s(cards, s.all_reduce_bytes(1)) * 1e6,
-                per_layer_weights * 1e6
-            ),
-        ],
+        notes,
     }
+}
+
+/// Notes for a world neither measured table carries, so a reader is told the
+/// numbers were borrowed from a smaller, cheaper world rather than measured.
+fn substitution_notes(s: &Scenario, cards: u32) -> Vec<String> {
+    let mut out = Vec::new();
+    match s.floor.world_used(cards) {
+        Some(used) if used != cards => out.push(format!(
+            "world {cards} is not in the collective table: using the world-{used} latencies, \
+             which are cheaper, so this row is optimistic"
+        )),
+        _ => {}
+    }
+    match s.launch.world_used(cards) {
+        Some(used) if used != cards => out.push(format!(
+            "world {cards} is not in the launch table: using the world-{used} enqueue cost"
+        )),
+        _ => {}
+    }
+    out
 }
 
 /// Layer counts of `n` consecutive stages, the longer ones first.
@@ -592,16 +888,14 @@ pub fn pipeline_parallel(s: &Scenario, cards: u32) -> Plan {
     let per_layer_bytes = s.body_bytes() / layers;
     let per_layer_flops = |batch: u32| s.body_flops(batch) / layers;
 
-    // The hand-off is one activation, hidden x batch, in the weight dtype. No
-    // point-to-point send is measured on this box, so it is charged at the
-    // world-2 all-reduce floor for the same message: an upper bound, since an
-    // all-reduce moves the message twice and a send moves it once.
-    let handoff = |batch: u32| {
-        s.floor.all_reduce_s(
-            2,
-            s.model.hidden * u64::from(batch) * (s.prec.weight_bytes() as u64).max(1),
-        )
-    };
+    // The hand-off is one activation, hidden x batch, in f32 -- the unit the
+    // tensor-parallel all-reduce moves, so the README's "one activation per
+    // stage boundary against two all-reduces per layer" compares like with
+    // like and does not change with `--precision`. No point-to-point send is
+    // measured on this box, so it is charged at the world-2 all-reduce floor
+    // for the same message: an upper bound, since an all-reduce moves the
+    // message twice and a send moves it once.
+    let handoff = |batch: u32| s.floor.all_reduce_s(2, s.all_reduce_bytes(batch));
 
     let stage_step = |batch: u32| {
         let kv_per_layer = s.kv_bytes(batch) / layers;
@@ -638,9 +932,15 @@ pub fn pipeline_parallel(s: &Scenario, cards: u32) -> Plan {
     let boundaries = f64::from(n - 1);
 
     // Resident: the busiest stage's weights, plus the embedding on the first
-    // stage and the LM head on the last.
+    // stage or the LM head on the last (one matrix either way, and the same
+    // matrix when the model ties them), plus the KV of every sequence in
+    // flight. The aggregate rate below assumes `n` micro-batches in flight, so
+    // `n * batch` sequences are alive and each of them holds KV for every
+    // stage's layers on that stage's card. Charging one micro-batch would
+    // admit a plan that cannot run at the rate the same plan advertises.
+    let live = f64::from(n) * s.kv_bytes(s.batch);
     let biggest = f64::from(*sizes.iter().max().unwrap_or(&0));
-    let resident = (biggest / layers * (s.resident_body_bytes() + s.kv_bytes(s.batch))
+    let resident = (biggest / layers * (s.resident_body_bytes() + live)
         + s.embedding_bytes().max(s.head_bytes())) as u64;
     let rejected = (resident > s.hw.hbm_bytes).then(|| {
         format!(
@@ -655,11 +955,13 @@ pub fn pipeline_parallel(s: &Scenario, cards: u32) -> Plan {
         cards,
         batch: s.batch,
         rejected,
-        single_stream: Rate::new(1.0, total1, boundaries * handoff(1), bn1),
+        // No launch floor: the pipeline path enqueues 2 + 2L operations with
+        // no collective, and no host cost is measured for it on this box.
+        single_stream: Rate::new(1.0, total1, boundaries * handoff(1), 0.0, bn1),
         // In steady state with N micro-batches in flight the pipeline retires
         // one micro-batch per bottleneck stage, so the machine's rate is that
         // stage's, not one token's.
-        aggregate: Rate::new(f64::from(s.batch), worst_b, handoff(s.batch), bn_b),
+        aggregate: Rate::new(f64::from(s.batch), worst_b, handoff(s.batch), 0.0, bn_b),
         resident_bytes_per_card: resident,
         collective_s: boundaries * handoff(1),
         projected: false,
@@ -673,15 +975,22 @@ pub fn pipeline_parallel(s: &Scenario, cards: u32) -> Plan {
                     .join("+")
             ),
             format!(
-                "{} hand-offs of {} bytes at {:.1} us each",
+                "{} hand-offs of {} bytes (one f32 activation) at {:.1} us each",
                 n - 1,
-                s.model.hidden * (s.prec.weight_bytes() as u64).max(1),
+                s.all_reduce_bytes(1),
                 handoff(1) * 1e6
             ),
             format!(
                 "aggregate needs {n} micro-batches in flight; the bottleneck stage is {:.2} ms",
                 (worst1 + handoff(1)) * 1e3
             ),
+            format!(
+                "resident charges those {n} micro-batches: {} sequences of KV live per stage",
+                u64::from(n) * u64::from(s.batch)
+            ),
+            "no host launch floor charged: the pipeline path enqueues 2 + 2L operations \
+             with no collective and is not measured on this box"
+                .to_string(),
         ],
     }
 }
@@ -774,11 +1083,13 @@ pub fn expert_parallel(s: &Scenario, cards: u32) -> Plan {
     let (step1, bn1) = s.card_step(card_bytes(1), card_flops(1));
     let (step_b, bn_b) = s.card_step(card_bytes(s.batch), card_flops(s.batch));
 
-    let a2a = |batch: u32| 2.0 * layers * s.floor.all_reduce_s(cards, s.all_reduce_bytes(batch));
+    // Dispatch and combine send each token to its `top_k` experts, so the
+    // payload is `top_k` copies of the hidden vector, not one.
+    let a2a_bytes = |batch: u32| s.all_reduce_bytes(batch) * u64::from(moe.top_k);
+    let a2a = |batch: u32| 2.0 * layers * s.floor.all_reduce_s(cards, a2a_bytes(batch));
 
     let resident = (layers * (shared_per_layer + f64::from(moe.n_experts) / n * one_expert)
-        + s.embedding_bytes()
-        + s.head_bytes()
+        + s.resident_embed_head_bytes()
         + s.kv_bytes(s.batch)) as u64;
     let rejected = (resident > s.hw.hbm_bytes).then(|| {
         format!(
@@ -788,33 +1099,53 @@ pub fn expert_parallel(s: &Scenario, cards: u32) -> Plan {
         )
     });
 
+    // The expert path enqueues the same 2 + 4L operations a tensor-parallel
+    // step does (two collectives a layer, dispatch and combine here), so it
+    // carries the same measured host launch floor.
+    let launch = s.launch.step_s(cards, s.model.layers);
+    let mut notes = vec![
+        format!(
+            "{} of {} experts per token; a card averages {:.2} of them",
+            moe.top_k,
+            moe.n_experts,
+            f64::from(moe.top_k) / n
+        ),
+        format!(
+            "bytes per card per token: shared {:.2} GB + experts {:.2} GB",
+            layers * shared_per_layer / 1e9,
+            layers * experts_per_card / 1e9
+        ),
+        format!(
+            "dispatch and combine move top_k x hidden x batch x 4 = {} bytes a layer",
+            a2a_bytes(1)
+        ),
+        "the all-to-all floor is an assumption in its latency, not in its size: the \
+         dispatch/combine message is charged in full, but at the measured all-reduce \
+         latency, two per layer, because no all-to-all is measured on this box"
+            .to_string(),
+        "projected: the engine has no mixture-of-experts layer yet".to_string(),
+    ];
+    if launch > 0.0 {
+        notes.push(format!(
+            "host launch floor {:.2} ms per step ({:.0} tok/s at batch 1): engine cost, \
+             not physics",
+            launch * 1e3,
+            1.0 / launch
+        ));
+    }
+    notes.extend(substitution_notes(s, cards));
+
     Plan {
         strategy: Strategy::Expert,
         cards,
         batch: s.batch,
         rejected,
-        single_stream: Rate::new(1.0, step1, a2a(1), bn1),
-        aggregate: Rate::new(f64::from(s.batch), step_b, a2a(s.batch), bn_b),
+        single_stream: Rate::new(1.0, step1, a2a(1), launch, bn1),
+        aggregate: Rate::new(f64::from(s.batch), step_b, a2a(s.batch), launch, bn_b),
         resident_bytes_per_card: resident,
         collective_s: a2a(1),
         projected: true,
-        notes: vec![
-            format!(
-                "{} of {} experts per token; a card averages {:.2} of them",
-                moe.top_k,
-                moe.n_experts,
-                f64::from(moe.top_k) / n
-            ),
-            format!(
-                "bytes per card per token: shared {:.2} GB + experts {:.2} GB",
-                layers * shared_per_layer / 1e9,
-                layers * experts_per_card / 1e9
-            ),
-            "the all-to-all floor is an assumption: charged at the measured all-reduce \
-             latency, two per layer, not yet measured on this box"
-                .to_string(),
-            "projected: the engine has no mixture-of-experts layer yet".to_string(),
-        ],
+        notes,
     }
 }
 
@@ -845,11 +1176,18 @@ pub fn plans(s: &Scenario, cards: u32) -> Vec<Plan> {
 #[derive(Debug, Clone)]
 pub struct Choice {
     pub objective: Objective,
+    /// False when no split was admissible at all. Then `plan` is the
+    /// tensor-parallel fallback, kept only so callers have a shape to read,
+    /// and it is **not** a recommendation: nothing on this many cards runs.
+    pub admissible: bool,
     pub plan: Plan,
-    /// Every plan considered, best first.
+    /// Every admissible plan considered, best first. Empty when
+    /// `admissible` is false.
     pub ranked: Vec<Plan>,
     /// The facts that decided it.
     pub reasons: Vec<String>,
+    /// Every plan that was rejected, and why: (strategy, reason).
+    pub rejected: Vec<(String, String)>,
 }
 
 /// (f) The chooser: the best strategy for this model on this many cards for
@@ -860,10 +1198,16 @@ pub struct Choice {
 /// equal number.
 #[must_use]
 pub fn choose(s: &Scenario, cards: u32, obj: Objective) -> Choice {
-    let mut ranked: Vec<Plan> = plans(s, cards)
-        .into_iter()
-        .filter(Plan::admissible)
+    let all = plans(s, cards);
+    let rejected: Vec<(String, String)> = all
+        .iter()
+        .filter_map(|p| {
+            p.rejected
+                .as_ref()
+                .map(|why| (p.strategy.to_string(), why.clone()))
+        })
         .collect();
+    let mut ranked: Vec<Plan> = all.into_iter().filter(Plan::admissible).collect();
     ranked.sort_by(|a, b| {
         b.rate(obj)
             .tokens_per_s
@@ -890,24 +1234,41 @@ pub fn choose(s: &Scenario, cards: u32, obj: Objective) -> Choice {
         ),
         Some(why) => format!("no tensor split at {cards}: {why}"),
     });
-    let per_layer_weights =
-        s.body_bytes() / f64::from(cards.max(1)) / f64::from(s.model.layers) / s.hw.hbm_bw;
-    let per_layer_coll = 2.0 * s.floor.all_reduce_s(cards, s.all_reduce_bytes(1));
+    // What the split saves is the *whole* per-token weight time it takes off
+    // one card, not the post-split remainder: splitting N ways removes
+    // `(N-1)/N` of it. Compare that against everything the split adds -- the
+    // collectives and the host launch floor -- and state the verdict as the
+    // comparison of the two step times, so the sentence and the pick cannot
+    // disagree.
+    // One card is `data_parallel(s, 1)`, which is the same arithmetic as
+    // `tensor_parallel(s, 1)`: no collective and no launch floor at world 1.
+    let one_s = &one_card.single_stream;
+    let n_s = &tp.single_stream;
     reasons.push(format!(
-        "collective floor {:.1} us per layer against {:.1} us of weight time per layer at {cards} \
-         cards: the split {} the token",
-        per_layer_coll * 1e6,
-        per_layer_weights * 1e6,
-        if per_layer_coll > per_layer_weights {
-            "costs more than it saves on"
-        } else {
+        "splitting {cards} ways saves {:.1} us of weight time per token ({:.1} us on one card \
+         against {:.1} us on {cards}) and costs {:.1} us of collective",
+        (one_s.physical_s - n_s.physical_s) * 1e6,
+        one_s.physical_s * 1e6,
+        n_s.physical_s * 1e6,
+        n_s.collective_s * 1e6,
+    ));
+    reasons.push(format!(
+        "the host launch floor at world {cards} is {:.1} us per step, so a token costs \
+         {:.2} ms on {cards} cards against {:.2} ms on one: the split {} the token",
+        n_s.launch_s * 1e6,
+        n_s.practical_s * 1e3,
+        one_s.practical_s * 1e3,
+        if n_s.practical_s < one_s.practical_s {
             "pays for itself on"
+        } else {
+            "costs more than it saves on"
         }
     ));
     if let Some(best) = ranked.first() {
         reasons.push(format!(
-            "{} wins {} at {:.1} tok/s; {}",
+            "{}{} wins {} at {:.1} tok/s; {}",
             best.strategy,
+            if best.projected { " (projected)" } else { "" },
             obj.label(),
             best.rate(obj).tokens_per_s,
             match ranked.get(1) {
@@ -919,18 +1280,30 @@ pub fn choose(s: &Scenario, cards: u32, obj: Objective) -> Choice {
                 None => "no other split is admissible".to_string(),
             }
         ));
+    } else {
+        reasons.insert(
+            0,
+            format!(
+                "no split of {cards} cards is admissible: every strategy was rejected, so there \
+             is no pick and no ceiling to measure against"
+            ),
+        );
     }
+    let admissible = !ranked.is_empty();
     let plan = ranked.first().cloned().unwrap_or_else(|| {
         let mut p = tp;
-        p.notes
-            .push("no admissible split on this many cards".to_string());
+        p.notes.push(
+            "no admissible split on this many cards: this row is a shape, not a plan".to_string(),
+        );
         p
     });
     Choice {
         objective: obj,
+        admissible,
         plan,
         ranked,
         reasons,
+        rejected,
     }
 }
 
@@ -978,6 +1351,17 @@ mod tests {
                 "intermediate_size":8192,"vocab_size":128256,"tie_word_embeddings":true}"#,
         )
         .expect("1B config")
+    }
+
+    /// Llama-3.1-405B, from its config.json: nothing on eight cards fits it.
+    fn llama_405b() -> ModelShape {
+        model_from_hf_config(
+            r#"{"_name_or_path":"Llama-3.1-405B","hidden_size":16384,
+                "num_hidden_layers":126,"num_attention_heads":128,"num_key_value_heads":8,
+                "head_dim":128,"intermediate_size":53248,"vocab_size":128256,
+                "tie_word_embeddings":false}"#,
+        )
+        .expect("405B config")
     }
 
     /// Mixtral-8x7B-v0.1, from its config.json.
@@ -1034,7 +1418,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_70b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 1, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &launch);
         let p = tensor_parallel(&s, 2);
         assert!(p.admissible(), "{:?}", p.rejected);
         assert!(
@@ -1064,7 +1449,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = qwen_32b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 1, 4096, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 4096, &floor, &launch);
         let one = data_parallel(&s, 1);
         assert!(
             (one.single_stream.tokens_per_s - 37.7).abs() < 0.05,
@@ -1091,13 +1477,14 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_70b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 1, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &launch);
         let dp = data_parallel(&s, 8);
         assert!(!dp.admissible());
         assert!(dp.rejected.unwrap().contains("does not fit one card"));
         // The 32B does fit.
         let m32 = qwen_32b();
-        let s32 = Scenario::new(&hw, &m32, 1, 192, &floor);
+        let s32 = Scenario::new(&hw, &m32, 1, 192, &floor, &launch);
         assert!(data_parallel(&s32, 8).admissible());
     }
 
@@ -1105,13 +1492,14 @@ mod tests {
     fn tensor_parallel_rejects_an_indivisible_shape() {
         let hw = HardwareSpec::gaudi2();
         let floor = CollectiveFloor::measured();
+        let launch = LaunchFloor::measured();
         // SmolLM2-135M: 9 attention heads, so no world in {2, 4, 8} divides.
         let m = model_from_hf_config(
             r#"{"hidden_size":576,"num_hidden_layers":30,"num_attention_heads":9,
                 "num_key_value_heads":3,"intermediate_size":1536,"vocab_size":49152}"#,
         )
         .expect("config");
-        let s = Scenario::new(&hw, &m, 1, 192, &floor);
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &launch);
         for n in [2u32, 4, 8] {
             let p = tensor_parallel(&s, n);
             assert!(!p.admissible(), "world {n}");
@@ -1123,7 +1511,7 @@ mod tests {
                 "num_key_value_heads":4,"intermediate_size":18944,"vocab_size":152064}"#,
         )
         .expect("config");
-        let s7 = Scenario::new(&hw, &q7, 1, 192, &floor);
+        let s7 = Scenario::new(&hw, &q7, 1, 192, &floor, &launch);
         assert!(tensor_parallel(&s7, 4).admissible());
         let w8 = tensor_parallel(&s7, 8);
         assert!(!w8.admissible());
@@ -1139,7 +1527,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_70b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         let one = data_parallel(&s, 1);
         let pp = pipeline_parallel(&s, 8);
         assert!(pp.admissible(), "{:?}", pp.rejected);
@@ -1166,7 +1555,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_70b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 1, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &launch);
         let pp = pipeline_parallel(&s, 8);
         let tp = tensor_parallel(&s, 8);
         assert!(pp.collective_s < tp.collective_s / 10.0);
@@ -1179,7 +1569,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = qwen_32b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         let tp4 = tensor_parallel(&s, 4);
         let h = hybrid(&s, 2, 4);
         assert_eq!(h.cards, 8);
@@ -1196,7 +1587,7 @@ mod tests {
                 "num_key_value_heads":4,"intermediate_size":18944,"vocab_size":152064}"#,
         )
         .expect("config");
-        let s7 = Scenario::new(&hw, &q7, 8, 192, &floor);
+        let s7 = Scenario::new(&hw, &q7, 8, 192, &floor, &launch);
         assert!(hybrid(&s7, 2, 4).admissible());
         assert!(!tensor_parallel(&s7, 8).admissible());
     }
@@ -1206,7 +1597,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = mixtral();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 1, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &launch);
         // At world 1 every activated expert is on the one card, so expert
         // parallel is exactly the single-card decode ceiling.
         let ep1 = expert_parallel(&s, 1);
@@ -1227,10 +1619,254 @@ mod tests {
         assert!(ep8.notes.iter().any(|n| n.contains("assumption")));
         // A dense model has no experts to spread.
         let dense = qwen_32b();
-        let sd = Scenario::new(&hw, &dense, 1, 192, &floor);
+        let sd = Scenario::new(&hw, &dense, 1, 192, &floor, &launch);
         let e = expert_parallel(&sd, 8);
         assert!(!e.admissible());
         assert!(e.rejected.unwrap().contains("not a mixture of experts"));
+    }
+
+    #[test]
+    fn launch_floor_at_world_8_is_the_measured_enqueue_floor() {
+        // mc-measure.md C4, line 898: Llama-3.2-1B, 16 layers, 1.27 ms of
+        // host enqueue per step at world 8, an enqueue floor of 787 tok/s.
+        // The table reproduces it: 60 us of embedding-and-head launches plus
+        // 16 x 75.625 us of layer launches is 1270 us exactly.
+        let lf = LaunchFloor::measured();
+        assert!(
+            (lf.step_s(8, 16) * 1e6 - 1270.0).abs() < 0.5,
+            "{:.1} us",
+            lf.step_s(8, 16) * 1e6
+        );
+        assert!(
+            (1.0 / lf.step_s(8, 16) - 787.0).abs() < 0.5,
+            "{:.1} tok/s",
+            1.0 / lf.step_s(8, 16)
+        );
+        // World 1 is not a host-only floor and is charged nothing.
+        assert!(lf.step_s(1, 16).abs() < 1e-15);
+        assert_eq!(lf.world_used(1), None);
+        // A world the table does not carry borrows the one below it, and says so.
+        assert_eq!(lf.world_used(3), Some(2));
+        assert!((lf.step_s(3, 24) - lf.step_s(2, 24)).abs() < 1e-15);
+
+        // And the ceiling is capped by it: the same model on eight cards is
+        // 787 tok/s practical, not the 905 the bandwidth and collective terms
+        // alone allow, while the physical ceiling stays free of it.
+        let hw = HardwareSpec::gaudi2();
+        let m = llama_1b();
+        let floor = CollectiveFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &lf);
+        let tp8 = tensor_parallel(&s, 8);
+        assert!(tp8.single_stream.launch_bound);
+        assert!(
+            (tp8.single_stream.tokens_per_s - 787.0).abs() < 0.5,
+            "{:.1} tok/s",
+            tp8.single_stream.tokens_per_s
+        );
+        assert!(
+            (tp8.single_stream.practical_s - tp8.single_stream.launch_s).abs() < 1e-15,
+            "the launch floor is the binding term"
+        );
+        assert!(
+            tp8.single_stream.physical_tokens_per_s > 3000.0,
+            "the physical ceiling never carries the launch floor: {:.0} tok/s",
+            tp8.single_stream.physical_tokens_per_s
+        );
+        // The 70B has enough weight time per layer that the floor is not
+        // binding at any world.
+        let m70 = llama_70b();
+        let s70 = Scenario::new(&hw, &m70, 1, 192, &floor, &lf);
+        for n in [2u32, 4, 8] {
+            assert!(
+                !tensor_parallel(&s70, n).single_stream.launch_bound,
+                "world {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_floor_from_json_overrides_the_constant() {
+        let lf = LaunchFloor::from_json(
+            r#"{"source":"a faster launch path","worlds":{"2":[10.0,5.0],"8":[20.0,6.0]}}"#,
+        )
+        .expect("parses");
+        assert!((lf.step_s(2, 10) * 1e6 - 60.0).abs() < 1e-9);
+        assert!((lf.step_s(8, 10) * 1e6 - 80.0).abs() < 1e-9);
+        // A world the table does not carry falls back to the one below it.
+        assert_eq!(lf.world_used(4), Some(2));
+        assert!(LaunchFloor::from_json("{}").is_err());
+        assert!(LaunchFloor::from_json(r#"{"worlds":{"2":[1]}}"#).is_err());
+        // An override with no world 8 leaves the 1B unfloored there.
+        let none = LaunchFloor::from_json(r#"{"worlds":{"2":[0.0,0.0]}}"#).expect("parses");
+        let hw = HardwareSpec::gaudi2();
+        let m = llama_1b();
+        let floor = CollectiveFloor::measured();
+        let s = Scenario::new(&hw, &m, 1, 192, &floor, &none);
+        let tp8 = tensor_parallel(&s, 8);
+        assert!(!tp8.single_stream.launch_bound);
+        assert!(tp8.single_stream.tokens_per_s > 900.0);
+    }
+
+    #[test]
+    fn tied_embeddings_are_counted_once() {
+        // Llama-3.2-1B ties the embedding and the LM head, so 2048 x 128256
+        // x 2 bytes is resident once, not twice. `ModelShape::total_params`
+        // already counted it once; every strategy's resident term now agrees
+        // with it, which is what the CLI header and the "per card GB" column
+        // both print.
+        let hw = HardwareSpec::gaudi2();
+        let m = llama_1b();
+        assert!(m.tied_embeddings);
+        let floor = CollectiveFloor::measured();
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
+        let table = (m.hidden * m.vocab) as f64 * 2.0;
+        assert!((table - 525_336_576.0).abs() < 1.0, "{table}");
+        let dp = data_parallel(&s, 8);
+        let want = m.total_params() as f64 * 2.0 + s.kv_bytes(8);
+        assert!(
+            (dp.resident_bytes_per_card as f64 - want).abs() < 2.0,
+            "{} against {want}",
+            dp.resident_bytes_per_card
+        );
+        // 2.47 GB of weights, not 3.0 GB.
+        assert!(
+            (dp.resident_bytes_per_card as f64 / 1e9 - 2.5).abs() < 0.06,
+            "{:.2} GB",
+            dp.resident_bytes_per_card as f64 / 1e9
+        );
+        // Tensor and expert residency count it once too.
+        let tp = tensor_parallel(&s, 8);
+        let body = s.resident_body_bytes();
+        assert!(
+            (tp.resident_bytes_per_card as f64 - (body / 8.0 + table + s.kv_bytes(8) / 8.0)).abs()
+                < 2.0
+        );
+        // A model that does not tie them still carries both matrices.
+        let m70 = llama_70b();
+        assert!(!m70.tied_embeddings);
+        let s70 = Scenario::new(&hw, &m70, 8, 192, &floor, &launch);
+        let dp70 = data_parallel(&s70, 8);
+        let want70 = m70.total_params() as f64 * 2.0 + s70.kv_bytes(8);
+        assert!((dp70.resident_bytes_per_card as f64 - want70).abs() < 2.0);
+    }
+
+    #[test]
+    fn pipeline_residency_charges_the_micro_batches() {
+        // The pipeline aggregate needs `n` micro-batches in flight, so
+        // `n * batch` sequences are alive and every one of them holds KV on
+        // every stage. The 70B at batch 16 and 32768 tokens of context needs
+        // 8 x 16 = 128 sequences: about 191 GB on a 103.1 GB card, so the
+        // plan is not admissible however good its aggregate rate looks.
+        let hw = HardwareSpec::gaudi2();
+        let m = llama_70b();
+        let floor = CollectiveFloor::measured();
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 16, 32768, &floor, &launch);
+        let pp = pipeline_parallel(&s, 8);
+        assert!(
+            !pp.admissible(),
+            "{:.1} GB",
+            pp.resident_bytes_per_card as f64 / 1e9
+        );
+        assert!(
+            (pp.resident_bytes_per_card as f64 / 1e9 - 191.0).abs() < 2.0,
+            "{:.1} GB",
+            pp.resident_bytes_per_card as f64 / 1e9
+        );
+        assert!(
+            pp.rejected
+                .as_deref()
+                .unwrap()
+                .contains("does not fit 8 stages")
+        );
+        assert!(
+            pp.notes
+                .iter()
+                .any(|n| n.contains("128 sequences of KV live"))
+        );
+        // It is exactly the micro-batch count: one micro-batch of KV is an
+        // eighth of the cache charged here.
+        let one = f64::from(*stage_layers(80, 8).iter().max().unwrap()) / 80.0 * s.kv_bytes(16);
+        let all =
+            f64::from(*stage_layers(80, 8).iter().max().unwrap()) / 80.0 * 8.0 * s.kv_bytes(16);
+        assert!((all - 8.0 * one).abs() < 1.0);
+        // At a context the cache does fit, the plan is admissible again.
+        let short = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
+        assert!(pipeline_parallel(&short, 8).admissible());
+    }
+
+    #[test]
+    fn choose_reports_that_no_split_is_admissible() {
+        // Llama-3.1-405B on eight cards: every strategy is rejected, so
+        // there is no pick. The chooser has to say so rather than name one of
+        // the rejected rows with a latency figure beside it.
+        let hw = HardwareSpec::gaudi2();
+        let m = llama_405b();
+        let floor = CollectiveFloor::measured();
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
+        for obj in [Objective::SingleStream, Objective::Aggregate] {
+            let c = choose(&s, 8, obj);
+            assert!(!c.admissible, "{}", c.plan.strategy);
+            assert!(c.ranked.is_empty());
+            // Every plan the tool prints is in the rejection list with its
+            // reason, and the reasons reach the caller.
+            assert_eq!(c.rejected.len(), plans(&s, 8).len());
+            assert!(c.rejected.iter().any(|(st, _)| st == "data"));
+            assert!(c.rejected.iter().any(|(st, _)| st == "tensor"));
+            assert!(c.rejected.iter().any(|(st, _)| st == "pipeline"));
+            assert!(
+                c.rejected
+                    .iter()
+                    .all(|(_, why)| why.contains("does not fit"))
+            );
+            assert!(
+                c.reasons
+                    .iter()
+                    .any(|r| r.contains("no split of 8 cards is admissible"))
+            );
+            assert!(
+                c.plan
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("this row is a shape, not a plan"))
+            );
+        }
+        // The 32B on the same eight cards does have a pick.
+        let m32 = qwen_32b();
+        let s32 = Scenario::new(&hw, &m32, 8, 192, &floor, &launch);
+        let c = choose(&s32, 8, Objective::SingleStream);
+        assert!(c.admissible);
+        assert!(!c.ranked.is_empty());
+    }
+
+    #[test]
+    fn expert_parallel_charges_the_dispatch_at_top_k_copies() {
+        // A dispatch/combine pair sends each token to its `top_k` experts, so
+        // the message is `top_k x hidden x batch x 4`, not one copy. Mixtral
+        // routes 2 of 8, so its all-to-all is twice the all-reduce a
+        // tensor-parallel layer would send.
+        let hw = HardwareSpec::gaudi2();
+        let m = mixtral();
+        let floor = CollectiveFloor::measured();
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 64, 192, &floor, &launch);
+        let ep = expert_parallel(&s, 8);
+        let one_copy = m.hidden * 4;
+        assert!(
+            ep.notes
+                .iter()
+                .any(|n| n.contains(&format!("= {} bytes a layer", 2 * one_copy))),
+            "{:?}",
+            ep.notes
+        );
+        // At batch 64 the honest message is on the sloped part of the curve,
+        // where charging one copy would under-count the latency.
+        let honest = floor.all_reduce_s(8, m.hidden * 64 * 4 * 2);
+        let one = floor.all_reduce_s(8, m.hidden * 64 * 4);
+        assert!(honest > one, "{honest} against {one}");
+        assert!((ep.aggregate.collective_s - 2.0 * f64::from(m.layers) * honest).abs() < 1e-12);
     }
 
     #[test]
@@ -1238,20 +1874,32 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_1b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         // 16 layers at 8 cards: the collective floor is far larger than the
         // per-layer weight time, so splitting the model costs throughput.
         let single = choose(&s, 8, Objective::SingleStream);
         assert_eq!(single.plan.strategy, Strategy::Data);
         let agg = choose(&s, 8, Objective::Aggregate);
         assert_eq!(agg.plan.strategy, Strategy::Data);
+        // And the reason says so with the numbers the pick is made on: a
+        // token is 1.01 ms on one card and cannot beat the 1.27 ms launch
+        // floor on eight, so splitting costs more than it saves.
         assert!(
             single
                 .reasons
                 .iter()
-                .any(|r| r.contains("costs more than it saves on"))
+                .any(|r| r.contains("costs more than it saves on the token")),
+            "{:?}",
+            single.reasons
         );
         assert!(single.reasons.iter().any(|r| r.contains("fits one card")));
+        assert!(
+            single
+                .reasons
+                .iter()
+                .any(|r| r.contains("saves") && r.contains("us of collective"))
+        );
     }
 
     #[test]
@@ -1259,7 +1907,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = qwen_32b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         let single = choose(&s, 8, Objective::SingleStream);
         assert_eq!(single.plan.strategy, Strategy::Tensor);
         assert!(single.plan.single_stream.tokens_per_s > 3.0 * 38.0);
@@ -1270,18 +1919,28 @@ mod tests {
             single
                 .reasons
                 .iter()
-                .any(|r| r.contains("collective floor"))
+                .any(|r| r.contains("us of collective"))
         );
-        // Two cards is where the split plainly pays: 199 us of weight time a
-        // layer against 38 us of collective. By eight cards the two are level
-        // (49.8 us against 49.8), and it is the seven-eighths of the weights
-        // already saved that keeps tensor parallel ahead, not the last split.
+        // The reason compares what the split saves with what it costs, and
+        // agrees with the pick: at eight cards a token is 26.1 ms on one card
+        // and 7.0 ms on eight, so the split pays for itself and tensor wins.
+        assert!(
+            single
+                .reasons
+                .iter()
+                .any(|r| r.contains("pays for itself on the token")),
+            "{:?}",
+            single.reasons
+        );
         assert!(
             choose(&s, 2, Objective::SingleStream)
                 .reasons
                 .iter()
                 .any(|r| r.contains("pays for itself"))
         );
+        assert!(single.admissible);
+        // Nothing is rejected for this shape on eight cards.
+        assert!(single.rejected.is_empty(), "{:?}", single.rejected);
     }
 
     #[test]
@@ -1289,7 +1948,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = llama_70b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         let single = choose(&s, 8, Objective::SingleStream);
         assert_eq!(single.plan.strategy, Strategy::Tensor);
         assert!(single.ranked.iter().all(|p| p.strategy != Strategy::Data));
@@ -1311,7 +1971,8 @@ mod tests {
         let hw = HardwareSpec::gaudi2();
         let m = qwen_32b();
         let floor = CollectiveFloor::measured();
-        let s = Scenario::new(&hw, &m, 8, 192, &floor);
+        let launch = LaunchFloor::measured();
+        let s = Scenario::new(&hw, &m, 8, 192, &floor, &launch);
         for n in [1u32, 2, 4, 8] {
             for p in plans(&s, n) {
                 assert_eq!(p.cards, n, "{} at {n}", p.strategy);
