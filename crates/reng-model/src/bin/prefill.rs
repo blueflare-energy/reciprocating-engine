@@ -2,16 +2,23 @@
 //! report per-position argmax tokens, optionally comparing against a reference
 //! JSON produced by an HF transformers run of the same token ids.
 //!
-//! `reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] <id> [<id> ...]`
+//! `reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] [--cached]
+//! [--rows <n>] <id> [<id> ...]`
 //!
 //! `--fp8` (or `RENG_FP8=1`) quantizes the projections at load; see
 //! [`reng_model::fp8_switch`] for the values the variable takes.
 //!
 //! The reference JSON has `argmax` (per position), `last_logits` (full row),
 //! and `last_top5` (ids). The engine's output JSON has the same fields.
+//!
+//! Prompts up to `max_nocache_prefill` run as one recipe of `tokens` rows
+//! with a full `[tokens, tokens]` mask. Longer ones (and `--cached`) run in
+//! blocks over the KV cache instead: the one-recipe form would need tensor
+//! strides wider than 32 bits and a DRAM workspace the card does not have.
 
 use reng_model::{
-    LlamaConfig, argmax_rows, fp8_switch, load_weights_fp8, prefill_logits, take_fp8_flag,
+    CachePath, CachePlan, LlamaConfig, MIN_PREFILL_TOKENS, argmax_rows, fp8_switch,
+    load_weights_fp8, max_nocache_prefill, prefill_logits, prefill_logits_cached, take_fp8_flag,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -53,17 +60,40 @@ fn main() -> reng_core::Result<()> {
     )?;
     if args.len() < 3 {
         return Err(reng_core::Error::Other(
-            "usage: reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] <id> [<id> ...]"
+            "usage: reng-prefill <model_dir> <out.json> [--ref <ref.json>] [--fp8] [--cached] \
+             [--rows <n>] <id> [<id> ...]"
                 .into(),
         ));
     }
     let dir = Path::new(&args[0]);
     let out_path = &args[1];
-    let (ref_path, id_start) = if args.get(2).map(String::as_str) == Some("--ref") {
-        (args.get(3).cloned(), 4)
-    } else {
-        (None, 2)
-    };
+    let mut ref_path: Option<String> = None;
+    let mut force_cached = false;
+    let mut rows = MIN_PREFILL_TOKENS;
+    let mut id_start = 2;
+    while id_start < args.len() {
+        match args[id_start].as_str() {
+            "--ref" => {
+                ref_path = args.get(id_start + 1).cloned();
+                id_start += 2;
+            }
+            "--cached" => {
+                force_cached = true;
+                id_start += 1;
+            }
+            "--rows" => {
+                rows = args
+                    .get(id_start + 1)
+                    .and_then(|s| s.parse().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        reng_core::Error::Other("--rows needs a number above zero".into())
+                    })?;
+                id_start += 2;
+            }
+            _ => break,
+        }
+    }
     let ids: Vec<u32> = args[id_start..]
         .iter()
         .map(|s| s.parse::<u32>())
@@ -97,12 +127,57 @@ fn main() -> reng_core::Result<()> {
         owned as f64 / 1e9
     );
 
+    let tokens = ids.len();
+    if let Some(msg) = cfg.context_warning(tokens) {
+        eprintln!("{msg}");
+        println!("{msg}");
+    }
+    let limit = max_nocache_prefill(&cfg);
+    let cached = force_cached || tokens > limit;
+    if cached {
+        let plan = CachePlan::new(&cfg, w.device_bytes(), rows, CachePath::Single);
+        println!("{}", plan.summary(tokens));
+        if !force_cached {
+            println!(
+                "prompt of {tokens} tokens is past the {limit}-token limit of the one-recipe \
+                 prefill (a [{tokens}, {tokens}, {}] score tensor needs a tensor stride wider \
+                 than 32 bits, and its workspace more DRAM than the card has): running it in \
+                 blocks of {rows} over the KV cache",
+                cfg.num_attention_heads
+            );
+        }
+        // Every position's logits come back in host f32: 4 * vocab bytes
+        // a token, which is the binding cost of a long prompt on this
+        // path and fails by aborting, not with an error.
+        let host = 4.0 * cfg.vocab_size as f64 * tokens as f64;
+        if host > 8e9 {
+            let msg = format!(
+                "warning: {tokens} positions of f32 logits are {:.1} GB of host memory in \
+                 one allocation ({} bytes a token); this path returns every position's \
+                 logits, and the process aborts if the allocator cannot serve it",
+                host / 1e9,
+                4 * cfg.vocab_size
+            );
+            eprintln!("{msg}");
+            println!("{msg}");
+        }
+    }
     let t1 = Instant::now();
-    let logits = prefill_logits(&w, &cfg, &ids)?;
+    let logits = if cached {
+        prefill_logits_cached(&w, &cfg, &ids, rows)?
+    } else {
+        prefill_logits(&w, &cfg, &ids)?
+    };
     let dt = t1.elapsed().as_secs_f32();
     let vocab = cfg.vocab_size;
-    let tokens = ids.len();
-    println!("prefill of {tokens} tokens (graph build + compile + run): {dt:.2}s");
+    if cached {
+        println!(
+            "prefill of {tokens} tokens (cached, {} blocks of {rows}): {dt:.2}s",
+            tokens.div_ceil(rows)
+        );
+    } else {
+        println!("prefill of {tokens} tokens (graph build + compile + run): {dt:.2}s");
+    }
 
     let am = argmax_rows(&logits, vocab);
     let last = &logits[(tokens - 1) * vocab..];

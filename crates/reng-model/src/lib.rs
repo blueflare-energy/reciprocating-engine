@@ -98,6 +98,10 @@ pub struct LlamaConfig {
     #[serde(default)]
     pub head_dim: Option<usize>,
     pub rms_norm_eps: f32,
+    /// The context the checkpoint was trained for. Absent from a few old
+    /// configs; [`LlamaConfig::trained_context`] reads it.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
     #[serde(default = "default_theta")]
     pub rope_theta: f32,
     /// HF `rope_scaling`: the `llama3`, `linear`, `yarn` and `longrope`
@@ -105,8 +109,6 @@ pub struct LlamaConfig {
     /// [`LlamaConfig::load`] and ignored.
     #[serde(default)]
     pub rope_scaling: Option<RopeScaling>,
-    #[serde(default)]
-    pub max_position_embeddings: Option<usize>,
     /// Phi-3: the pretraining length, kept at the top level of the config
     /// (it takes priority over a copy inside `rope_scaling`).
     #[serde(default)]
@@ -615,6 +617,51 @@ impl LlamaConfig {
         Ok(cfg)
     }
 
+    /// The context the model was trained for, from
+    /// `max_position_embeddings`. Nothing in the engine's shapes stops a
+    /// longer one: the caches, the RoPE tables and the masks all scale, so
+    /// a caller asking for more gets a model evaluated outside the
+    /// positions its RoPE ever saw, with no error and quietly worse
+    /// output. The bins warn; see [`LlamaConfig::context_warning`].
+    #[must_use]
+    pub fn trained_context(&self) -> Option<usize> {
+        self.max_position_embeddings.filter(|&n| n > 0)
+    }
+
+    /// The context before RoPE scaling, when the config scales RoPE
+    /// (`rope_scaling.original_max_position_embeddings`): the length the
+    /// rotary frequencies were actually trained at, which the scaling
+    /// stretches to [`LlamaConfig::trained_context`].
+    #[must_use]
+    pub fn original_context(&self) -> Option<usize> {
+        self.rope_scaling
+            .as_ref()
+            .and_then(|r| r.original_max_position_embeddings)
+            .filter(|&n| n > 0)
+    }
+
+    /// A warning when `positions` runs past the trained context, or `None`
+    /// when it fits (or the config does not say).
+    #[must_use]
+    pub fn context_warning(&self, positions: usize) -> Option<String> {
+        let trained = self.trained_context()?;
+        if positions <= trained {
+            return None;
+        }
+        let scaled = match self.original_context() {
+            Some(o) if o < trained => {
+                format!(" (rope scaling stretches a {o}-position model to {trained})")
+            }
+            _ => String::new(),
+        };
+        Some(format!(
+            "warning: {positions} positions exceed this model's trained context of \
+             {trained}{scaled}; the engine will run it, but the rotary embeddings are \
+             extrapolating and the output past position {trained} is not what the checkpoint \
+             was trained to produce"
+        ))
+    }
+
     #[must_use]
     pub fn n_kv_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
@@ -1027,6 +1074,29 @@ impl LlamaWeights {
             .iter()
             .flat_map(|l| [&l.wq, &l.wk, &l.wv, &l.wo, &l.wg, &l.wu, &l.wd]);
         [&self.embed, &self.lm_head].into_iter().chain(per_layer)
+    }
+
+    /// Weight bytes the engine uploads to the device: every distinct
+    /// matrix once, mapped or owned, plus the embedding table a second
+    /// time when the LM head is tied to it.
+    ///
+    /// [`LlamaWeights::footprint`] de-duplicates by source, which is right
+    /// for the host mapping and wrong for the card: the wide recipe
+    /// uploads `LMHEAD` and the decode loop uploads `EMBED` as two named
+    /// tensors with two `synDeviceMalloc`s, so a tied checkpoint holds the
+    /// same matrix twice on the device (0.79 GB for Llama-3.2-3B).
+    #[must_use]
+    pub fn device_bytes(&self) -> u64 {
+        let (mapped, owned) = self.footprint();
+        let tied = self.embed.source_key() == self.lm_head.source_key();
+        let again = if !tied {
+            0
+        } else if self.embed.is_mapped() {
+            self.embed.len() * 2
+        } else {
+            self.embed.owned_bytes()
+        };
+        (mapped + owned + again) as u64
     }
 
     /// Bytes of bf16 weights viewed in place in the mapped checkpoint
@@ -2250,6 +2320,284 @@ pub fn argmax_rows(logits: &[f32], vocab: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Which decoder path a KV cache is planned for. The paths differ in how
+/// many copies of one sequence's cache they keep on the card, and in what
+/// `capacity` means to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePath {
+    /// One sequence (`Generator`): the wide recipe's ScatterND is not in
+    /// place, so it reads one cache buffer and writes the other and the
+    /// two alternate: two buffers, both allocated at `capacity` when the
+    /// model is compiled.
+    Single,
+    /// `batch` sequences (`BatchedGenerator`): one slot per sequence at
+    /// the bucket in use, plus the bucket it grew from, which is alive
+    /// beside it while the used rows are copied across
+    /// (`reng_synapse::cache_bucket` doubles, so that peak is 1.5 slots
+    /// per sequence at the new bucket), plus the single-sequence K/V pair
+    /// the batched prefill recipe holds for the sequence it is feeding.
+    ///
+    /// `capacity` is a ceiling for this path, not an allocation: the model
+    /// starts at `reng_synapse::cache_bucket(1, capacity)` and grows only
+    /// as sequences reach the bucket in use. A plan for this path is
+    /// therefore evaluated at the bucket a run will actually reach, never
+    /// at `capacity` (see [`CachePlan::allocated_capacity`]).
+    Batched(usize),
+}
+
+/// What a KV cache of a given capacity costs on one card, and the largest
+/// capacity that fits next to the weights.
+///
+/// Everything here is arithmetic on the model shape, so it answers before
+/// anything is compiled or uploaded, and it errs high: the cache term is
+/// the peak of a growth step rather than the steady state, the transient
+/// term is the widest recipe's score tensors, masks and logits at their
+/// full size, and the reserve covers the recipes, the RoPE tables, the
+/// loop's index buffers and whatever the graph compiler's workspace holds
+/// beyond the score tensors. Measured against `RENG_RECIPE_TRACE` on
+/// Llama-3.1-8B, `--prompt 512 --new 32 --batch 64 --capacity 8192`: the
+/// plan says 31.6 GB where the run allocates 16.06 GB of weights, 13.17 GB
+/// of cache at the peak of its last growth and 0.19 GB of transients.
+///
+/// The card's HBM is the nominal figure for one Gaudi2
+/// (`reng_ceiling::HardwareSpec::gaudi2`), not what the card has free: a
+/// plan cannot see another process holding memory on it, so a capacity it
+/// approves can still fail at `synDeviceMalloc` on a busy card.
+#[derive(Debug, Clone)]
+pub struct CachePlan {
+    pub layers: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub n_heads: usize,
+    pub vocab: usize,
+    /// Rows of the widest recipe (the prompt block).
+    pub rows: usize,
+    /// Mask inputs a recipe holds: two on a model with a sliding window
+    /// (the plain causal mask and `MASKW`), one otherwise.
+    pub masks: usize,
+    /// Weight bytes resident on the device.
+    pub weight_bytes: u64,
+    pub path: CachePath,
+    /// HBM of one card.
+    pub device_bytes: u64,
+    /// Held back for recipes, RoPE tables and the loop's buffers.
+    pub reserve_bytes: u64,
+}
+
+impl CachePlan {
+    /// The plan for `cfg` with `weight_bytes` of weights on the device and
+    /// a widest recipe of `rows` rows, on one Gaudi2 card.
+    #[must_use]
+    pub fn new(cfg: &LlamaConfig, weight_bytes: u64, rows: usize, path: CachePath) -> Self {
+        Self {
+            layers: cfg.num_hidden_layers,
+            n_kv_heads: cfg.n_kv_heads(),
+            head_dim: cfg.head_dim(),
+            n_heads: cfg.num_attention_heads,
+            vocab: cfg.vocab_size,
+            rows,
+            masks: if cfg.window().is_some() { 2 } else { 1 },
+            weight_bytes,
+            path,
+            device_bytes: reng_ceiling::HardwareSpec::gaudi2().hbm_bytes,
+            reserve_bytes: 2 << 30,
+        }
+    }
+
+    /// Keys and values of one position of one layer, in bytes:
+    /// `2 * n_kv_heads * head_dim * 2` (bf16).
+    #[must_use]
+    pub fn bytes_per_position_per_layer(&self) -> u64 {
+        2 * (self.n_kv_heads * self.head_dim * 2) as u64
+    }
+
+    /// Keys and values of one position over all layers, in bytes.
+    #[must_use]
+    pub fn bytes_per_position(&self) -> u64 {
+        self.bytes_per_position_per_layer() * self.layers as u64
+    }
+
+    /// Copies of one sequence's cache the path keeps alive at the capacity
+    /// asked about: two alternating buffers for [`CachePath::Single`], and
+    /// for [`CachePath::Batched`] one slot per sequence, the half-size
+    /// bucket they grew from (alive beside them while the rows are copied
+    /// across, so `1.5 * batch` at the new bucket), and the two the
+    /// prefill recipe holds for the one sequence it feeds.
+    ///
+    /// Measured on Llama-3.1-8B, `--prompt 512 --new 32 --batch 64
+    /// --capacity 8192` with `RENG_RECIPE_TRACE=1`: the run reaches the
+    /// 1024 bucket and the three recipes report `scratch 8.60`, `4.30` and
+    /// `0.33` GB, which is `(1.5 * 64 + 2) * 1025 * 131072` bytes to the
+    /// digit.
+    #[must_use]
+    pub fn buffers(&self) -> f64 {
+        match self.path {
+            CachePath::Single => 2.0,
+            CachePath::Batched(b) => 1.5 * b as f64 + 2.0,
+        }
+    }
+
+    /// Cache bytes at `capacity` positions (the trash slot included).
+    #[must_use]
+    pub fn cache_bytes_at(&self, capacity: usize) -> u64 {
+        (self.bytes_per_position() as f64 * (capacity + 1) as f64 * self.buffers()) as u64
+    }
+
+    /// The widest recipe's transients: a double-buffered
+    /// `[keys, rows, heads]` bf16 score tensor, the mask inputs of every
+    /// key bucket, and the logits in bf16 and in the f32 the device argmax
+    /// casts them to.
+    ///
+    /// The key window (`reng_synapse::key_step`) gives the single-sequence
+    /// path one wide recipe per bucket, and each holds its own mask and
+    /// gather indices over its own key count; the sum of those is charged
+    /// here, rounded up to whole buckets.
+    #[must_use]
+    pub fn transient_bytes_at(&self, capacity: usize) -> u64 {
+        let keys = (capacity + 1) as u64;
+        let rows = self.rows as u64;
+        let masks = self.masks as u64;
+        // Key columns summed over the buckets: `n` buckets of `step`,
+        // `2 * step`, ... `n * step` columns, the last capped at `keys`.
+        let bucket_keys = match self.path {
+            CachePath::Single => {
+                let step = reng_synapse::key_step(self.rows, keys as usize) as u64;
+                let n = keys.div_ceil(step);
+                step * n * (n + 1) / 2
+            }
+            // The batched prefill recipe is compiled per capacity bucket
+            // and carries no key window.
+            CachePath::Batched(_) => keys,
+        };
+        2 * keys * rows * self.n_heads as u64 * 2
+            + masks * bucket_keys * rows * 2
+            + bucket_keys * self.n_kv_heads as u64 * 4
+            + 6 * self.vocab as u64 * rows
+    }
+
+    /// Device bytes the whole run needs at `capacity`.
+    #[must_use]
+    pub fn total_bytes_at(&self, capacity: usize) -> u64 {
+        self.weight_bytes
+            + self.cache_bytes_at(capacity)
+            + self.transient_bytes_at(capacity)
+            + self.reserve_bytes
+    }
+
+    /// Whether `capacity` positions fit on the card.
+    #[must_use]
+    pub fn fits(&self, capacity: usize) -> bool {
+        self.total_bytes_at(capacity) <= self.device_bytes
+    }
+
+    /// The capacity a run that reaches `need` positions actually
+    /// allocates, with `capacity` as its ceiling.
+    ///
+    /// [`CachePath::Single`] allocates both buffers at `capacity` when the
+    /// model is compiled, so the ceiling is the allocation. The batched
+    /// path allocates for the bucket
+    /// (`reng_synapse::cache_bucket`) and grows into it, so a batched run
+    /// that stops at position 544 holds 1024 positions per sequence
+    /// whatever `--capacity` says, and charging it the ceiling refuses
+    /// configurations that run today.
+    #[must_use]
+    pub fn allocated_capacity(&self, need: usize, capacity: usize) -> usize {
+        match self.path {
+            CachePath::Single => capacity,
+            CachePath::Batched(_) => reng_synapse::cache_bucket(need, capacity),
+        }
+    }
+
+    /// The largest capacity that fits (0 when even an empty cache does
+    /// not). The total is monotone in the capacity, so this is a bisection.
+    #[must_use]
+    pub fn max_capacity(&self) -> usize {
+        if !self.fits(0) {
+            return 0;
+        }
+        let (mut lo, mut hi) = (0usize, 1usize);
+        while self.fits(hi) && hi < usize::MAX / 4 {
+            lo = hi;
+            hi *= 2;
+        }
+        while lo + 1 < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// One line naming the per-position cost, the buffers and the total.
+    #[must_use]
+    pub fn summary(&self, capacity: usize) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        let buffers = match self.path {
+            CachePath::Single => "2 buffers".to_string(),
+            CachePath::Batched(b) => {
+                format!("{b} slots + the bucket they grew from + the prefill pair")
+            }
+        };
+        format!(
+            "KV cache: {} bytes per position per layer ({} KV heads x {} x bf16, keys and values), \
+             {} layers, {buffers} x {} slots = {:.2} GB; weights {:.2} GB, transients {:.2} GB, \
+             reserve {:.2} GB: {:.1} of the card's nominal {:.1} GB; this model holds up to {} \
+             positions",
+            self.bytes_per_position_per_layer(),
+            self.n_kv_heads,
+            self.head_dim,
+            self.layers,
+            capacity + 1,
+            gb(self.cache_bytes_at(capacity)),
+            gb(self.weight_bytes),
+            gb(self.transient_bytes_at(capacity)),
+            gb(self.reserve_bytes),
+            gb(self.total_bytes_at(capacity)),
+            gb(self.device_bytes),
+            self.max_capacity()
+        )
+    }
+
+    /// `Ok` when `capacity` fits, else the plan and the largest capacity
+    /// that does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the card cannot hold the weights plus the
+    /// cache at this capacity.
+    pub fn check(&self, capacity: usize) -> Result<()> {
+        if self.fits(capacity) {
+            return Ok(());
+        }
+        let gb = |b: u64| b as f64 / 1e9;
+        let at = match self.path {
+            CachePath::Single => String::new(),
+            CachePath::Batched(b) => format!(" at batch {b}"),
+        };
+        let what = match self.path {
+            CachePath::Single => "a KV cache of",
+            CachePath::Batched(_) => "a KV cache grown to",
+        };
+        Err(Error::Other(format!(
+            "{what} {capacity} positions{at} needs {:.1} GB (weights {:.1} GB, cache {:.1} GB \
+             at {} bytes per position per layer over {} layers, transients {:.1} GB, reserve {:.1} GB), \
+             more than the card's nominal {:.1} GB; the largest capacity for this model{at} is {}",
+            gb(self.total_bytes_at(capacity)),
+            gb(self.weight_bytes),
+            gb(self.cache_bytes_at(capacity)),
+            self.bytes_per_position_per_layer(),
+            self.layers,
+            gb(self.transient_bytes_at(capacity)),
+            gb(self.reserve_bytes),
+            gb(self.device_bytes),
+            self.max_capacity()
+        )))
+    }
+}
+
 /// Smallest token count a prefill recipe is launched with. The final kernel
 /// (the LM head gemm, whose M dimension is the token count) must run long
 /// enough for its HBM writeback to be visible to the readback DMA on this
@@ -2369,6 +2717,18 @@ fn layer_views<'a>(
 #[cfg(feature = "link-synapse")]
 pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Result<Vec<f32>> {
     let real = ids.len();
+    let limit = max_nocache_prefill(cfg);
+    if real > limit {
+        return Err(Error::Other(format!(
+            "a prompt of {real} tokens is too long for the no-cache prefill recipe, whose \
+             [{real}, {real}, {}] score tensor and [{}, {real}] logits would need tensor strides \
+             wider than 32 bits (the limit for this model is {limit} tokens); use \
+             prefill_logits_cached, which runs the same prompt in blocks over the KV cache \
+             (from reng-generate, drop --recompute; reng-prefill routes past the limit by \
+             itself)",
+            cfg.num_attention_heads, cfg.vocab_size
+        )));
+    }
     let tokens = real.max(MIN_PREFILL_TOKENS);
     let mut padded: Vec<u32> = ids.to_vec();
     padded.resize(tokens, 0);
@@ -2386,6 +2746,56 @@ pub fn prefill_logits(w: &LlamaWeights, cfg: &LlamaConfig, ids: &[u32]) -> Resul
     )?;
     logits.truncate(real * cfg.vocab_size);
     Ok(logits)
+}
+
+/// The longest prompt [`prefill_logits`] can build one recipe for.
+///
+/// That recipe holds the whole `[tokens, tokens, heads]` bf16 score tensor
+/// and `[vocab, tokens]` bf16 logits, and no tensor may pass
+/// `reng_synapse::MAX_TENSOR_BYTES` (a 32-bit tensor stride). For
+/// Llama-3.1-8B that is 8192 tokens; past it the device also runs out of
+/// DRAM for the score tensor's workspace, which is what made a 32768-token
+/// `reng-prefill` fail to compile at all.
+#[must_use]
+pub fn max_nocache_prefill(cfg: &LlamaConfig) -> usize {
+    let limit = reng_synapse::MAX_TENSOR_BYTES as f64;
+    let by_scores = (limit / (2.0 * cfg.num_attention_heads as f64)).sqrt() as usize;
+    let by_logits = (limit / (2.0 * cfg.vocab_size as f64)) as usize;
+    by_scores.min(by_logits).max(MIN_PREFILL_TOKENS)
+}
+
+/// Prefill `ids` through the KV cache in blocks of `rows` and return every
+/// position's logits `[ids.len(), vocab]`: the same computation as
+/// [`prefill_logits`], in blocks over the KV cache instead of one recipe.
+/// It is not the same result to the last bit. The K and V of every block
+/// go out to a bf16 cache and come back through the key gather, and that
+/// round trip moves a few argmaxes per thousand positions: on
+/// Llama-3.1-8B over an 8192-token prompt, measured against the same f32
+/// CPU oracle, this path agrees on 8001 of 8192 argmaxes at last-logits
+/// cosine 0.9998 where [`prefill_logits`] agrees on 8015 at cosine
+/// 1.0000. This is the path for prompts past [`max_nocache_prefill`],
+/// which cannot run as one recipe at all.
+///
+/// The whole result is held in host f32: `4 * vocab` bytes per position,
+/// 513 KB per token for Llama-3.1-8B, so 16.8 GB at 32768 tokens and
+/// 67.3 GB at 131072, in one allocation that fails by aborting the process
+/// rather than with an [`Error`]. A caller that does not want the whole
+/// matrix should build the [`Generator`] itself and feed blocks through
+/// [`Generator::feed`], which returns the last row only.
+///
+/// # Errors
+///
+/// Returns an error if the cache does not fit the card or a device run
+/// fails.
+#[cfg(feature = "link-synapse")]
+pub fn prefill_logits_cached(
+    w: &LlamaWeights,
+    cfg: &LlamaConfig,
+    ids: &[u32],
+    rows: usize,
+) -> Result<Vec<f32>> {
+    let mut g = Generator::new_prefill_only(w, cfg, rows, ids.len().max(1))?;
+    g.feed_all(ids)
 }
 
 /// A model compiled once with a KV cache, fed token ids block by block.
@@ -2421,9 +2831,46 @@ impl<'a> Generator<'a> {
         decode_rows: usize,
         capacity: usize,
     ) -> Result<Self> {
+        Self::build(w, cfg, rows, decode_rows, capacity, true)
+    }
+
+    /// Compile only the wide recipe: prompt blocks of `rows` tokens over a
+    /// cache of `capacity` positions, with no decode path at all.
+    ///
+    /// [`Generator::new`] hands the embedding table to
+    /// `reng_synapse::CachedModel`, which then also builds and uploads the
+    /// device decode loop: a second compile, the whole embedding matrix as
+    /// its own device input (1.03 GB for Llama-3.1-8B) and the loop's RoPE
+    /// tables and mask patterns at the capacity. A caller that only feeds
+    /// a prompt ([`prefill_logits_cached`]) never launches it, so this
+    /// constructor leaves it out. [`Generator::feed`],
+    /// [`Generator::feed_id`] and [`Generator::generate`] still work; they
+    /// run single tokens through the wide recipe instead of the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compilation or the upload fails.
+    pub fn new_prefill_only(
+        w: &'a LlamaWeights,
+        cfg: &'a LlamaConfig,
+        rows: usize,
+        capacity: usize,
+    ) -> Result<Self> {
+        Self::build(w, cfg, rows, 0, capacity, false)
+    }
+
+    fn build(
+        w: &'a LlamaWeights,
+        cfg: &'a LlamaConfig,
+        rows: usize,
+        decode_rows: usize,
+        capacity: usize,
+        decode: bool,
+    ) -> Result<Self> {
         if let Some(msg) = cfg.longrope_capacity_warning(capacity) {
             eprintln!("{msg}");
         }
+        CachePlan::new(cfg, w.device_bytes(), rows, CachePath::Single).check(capacity)?;
         let rope = cfg.rope_caches(capacity);
         // The cached recipes take RoPE rows as per-step inputs, so the layer
         // views carry no tables (they would have to outlive `rope`).
@@ -2441,7 +2888,7 @@ impl<'a> Generator<'a> {
             decode_rows,
             capacity,
             &rope.tables(),
-            Some(&embed),
+            decode.then_some(&embed),
         )?;
         Ok(Self { model, w, cfg })
     }
@@ -2485,6 +2932,39 @@ impl<'a> Generator<'a> {
             };
         }
         Ok(last)
+    }
+
+    /// Append `ids` and return every position's logits
+    /// (`[ids.len(), vocab]`), block by block through the cached recipe:
+    /// the same computation as [`prefill_logits`], not the same bits. The
+    /// K and V round trip through a bf16 cache and the key gather, which
+    /// on Llama-3.1-8B over an 8192-token prompt moves the per-position
+    /// argmax agreement against an f32 CPU oracle from 8015 of 8192 at
+    /// cosine 1.0000 to 8001 of 8192 at cosine 0.9998.
+    ///
+    /// The returned vector is `4 * vocab` host bytes per id, allocated in
+    /// one piece: 513 KB per token for Llama-3.1-8B, so 16.8 GB at 32768
+    /// ids and 67.3 GB at 131072. There is no bound on it but the host's
+    /// allocator, and an allocation this large fails by aborting the
+    /// process, not with an [`Error`]. Read a block at a time
+    /// ([`Generator::feed`] returns the last row) when the whole matrix
+    /// is not wanted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a device run fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty or would overflow the cache.
+    pub fn feed_all(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        assert!(!ids.is_empty());
+        let mut out = Vec::with_capacity(ids.len() * self.cfg.vocab_size);
+        for block in ids.chunks(self.model.rows()) {
+            let x = embed_tokens(self.w, self.cfg, block);
+            out.extend(self.model.step(&x)?);
+        }
+        Ok(out)
     }
 
     /// Append `ids` and return the greedy next token (argmax on the device).
@@ -2552,6 +3032,8 @@ pub struct BatchedGenerator<'a> {
     model: reng_synapse::BatchedModel<'a>,
     w: &'a LlamaWeights,
     cfg: &'a LlamaConfig,
+    plan: CachePlan,
+    capacity: usize,
 }
 
 #[cfg(feature = "link-synapse")]
@@ -2577,6 +3059,12 @@ impl<'a> BatchedGenerator<'a> {
         if let Some(msg) = cfg.longrope_capacity_warning(capacity) {
             eprintln!("{msg}");
         }
+        let plan = CachePlan::new(cfg, w.device_bytes(), rows, CachePath::Batched(batch));
+        // `capacity` is this path's ceiling, not its allocation: the model
+        // compiles for the smallest bucket now and grows into the rest, so
+        // the check here is what construction allocates and
+        // `BatchedGenerator::room_for` re-checks each growth.
+        plan.check(plan.allocated_capacity(1, capacity))?;
         let rope = cfg.rope_caches(capacity);
         // The batched recipes take RoPE rows as per-step inputs, so the
         // layer views carry no tables (they would have to outlive `rope`).
@@ -2596,7 +3084,41 @@ impl<'a> BatchedGenerator<'a> {
             &rope.tables(),
             Some(&embed),
         )?;
-        Ok(Self { model, w, cfg })
+        Ok(Self {
+            model,
+            w,
+            cfg,
+            plan,
+            capacity,
+        })
+    }
+
+    /// The KV plan this generator was built with.
+    #[must_use]
+    pub fn plan(&self) -> &CachePlan {
+        &self.plan
+    }
+
+    /// `Ok` when the cache bucket that holds `need` positions fits the
+    /// card, so the growth this call is about to ask for will not fail in
+    /// the middle of a compile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the largest bucket that fits when it does
+    /// not.
+    pub fn room_for(&self, need: usize) -> Result<()> {
+        self.plan
+            .check(self.plan.allocated_capacity(need, self.capacity))
+    }
+
+    /// The furthest position any sequence has reached.
+    #[must_use]
+    fn furthest(&self) -> usize {
+        (0..self.model.batch())
+            .map(|b| self.model.position(b))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Number of sequences.
@@ -2623,6 +3145,7 @@ impl<'a> BatchedGenerator<'a> {
     /// Panics if `ids` is empty or would overflow the cache.
     pub fn prefill(&mut self, b: usize, ids: &[u32]) -> Result<Vec<f32>> {
         assert!(!ids.is_empty());
+        self.room_for(ids.len())?;
         self.model.reset(b);
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.prefill(b, &x)
@@ -2640,6 +3163,7 @@ impl<'a> BatchedGenerator<'a> {
     /// Panics if `ids` is not one id per sequence.
     pub fn step(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
         assert_eq!(ids.len(), self.model.batch());
+        self.room_for(self.furthest() + 1)?;
         if self.model.has_loop() {
             return Ok(self.model.run_ids_logits(ids, 1)?.1);
         }
@@ -2655,6 +3179,7 @@ impl<'a> BatchedGenerator<'a> {
     /// Returns an error if a device run fails.
     pub fn prefill_id(&mut self, b: usize, ids: &[u32]) -> Result<u32> {
         assert!(!ids.is_empty());
+        self.room_for(ids.len())?;
         self.model.reset(b);
         let x = embed_tokens(self.w, self.cfg, ids);
         self.model.prefill_id(b, &x)
@@ -2668,6 +3193,7 @@ impl<'a> BatchedGenerator<'a> {
     /// Returns an error if a device run fails.
     pub fn step_ids(&mut self, ids: &[u32]) -> Result<Vec<u32>> {
         assert_eq!(ids.len(), self.model.batch());
+        self.room_for(self.furthest() + 1)?;
         if self.model.has_loop() {
             return self.model.run_ids(ids, 1);
         }
@@ -2696,6 +3222,7 @@ impl<'a> BatchedGenerator<'a> {
     pub fn generate(&mut self, seeds: &[u32], n: usize) -> Result<Vec<u32>> {
         assert!(n >= 1);
         assert_eq!(seeds.len(), self.model.batch());
+        self.room_for(self.furthest() + n)?;
         if self.model.has_loop() {
             return self.model.run_ids(seeds, n);
         }
@@ -4184,5 +4711,107 @@ mod tests {
             &(8..16).map(|i| i as u16).collect::<Vec<u16>>()[..]
         );
         assert_eq!(s1.embed.len(), 32);
+    }
+
+    /// Llama-3.1-8B's shape, for the cache plan and context tests.
+    fn llama31_8b() -> LlamaConfig {
+        serde_json::from_str(
+            r#"{"model_type": "llama", "hidden_size": 4096, "intermediate_size": 14336,
+                "num_hidden_layers": 32, "num_attention_heads": 32, "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-5, "vocab_size": 128256, "max_position_embeddings": 131072,
+                "rope_scaling": {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 8192}}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cache_plan_counts_bytes_per_position() {
+        let cfg = llama31_8b();
+        let plan = CachePlan::new(&cfg, 16_060_000_000, 256, CachePath::Single);
+        // 2 (K and V) x 8 KV heads x 128 x 2 bytes.
+        assert_eq!(plan.bytes_per_position_per_layer(), 4096);
+        assert_eq!(plan.bytes_per_position(), 4096 * 32);
+        // Two buffers of 32769 slots.
+        let want = 2 * 32769u64 * 4096 * 32;
+        assert_eq!(plan.cache_bytes_at(32768), want);
+        assert!(plan.fits(32768));
+        let max = plan.max_capacity();
+        assert!(
+            (200_000..400_000).contains(&max),
+            "largest capacity {max} for an 8B on 96 GiB"
+        );
+        assert!(!plan.fits(max + 1));
+    }
+
+    #[test]
+    fn cache_plan_charges_the_batched_bucket_not_the_ceiling() {
+        let cfg = llama31_8b();
+        let plan = CachePlan::new(&cfg, 16_060_000_000, 256, CachePath::Batched(64));
+        // reng-bench --prompt 512 --new 32 --batch 64 --capacity 8192: the
+        // sequences stop at position 544, so the model compiles the 1024
+        // bucket and never allocates for the 8192 ceiling.
+        assert_eq!(plan.allocated_capacity(544, 8192), 1024);
+        assert_eq!(plan.allocated_capacity(1, 8192), 256);
+        // 1.5 slots per sequence at that bucket (the bucket in use and the
+        // 512 one it grew from, alive together while the rows are copied)
+        // plus the prefill recipe's own single-sequence pair.
+        let want = ((1.5 * 64.0 + 2.0) * 1025.0 * 4096.0 * 32.0) as u64;
+        assert_eq!(plan.cache_bytes_at(1024), want);
+        // That run is charged 13.2 GB of cache and fits; the ceiling would
+        // have been charged 105.3 GB and refused.
+        assert!(plan.fits(plan.allocated_capacity(544, 8192)));
+        assert!(!plan.fits(8192));
+        plan.check(plan.allocated_capacity(544, 8192)).unwrap();
+        // A run that does reach the ceiling is still refused, and the
+        // message names the bucket rather than the ceiling.
+        let err = plan
+            .check(plan.allocated_capacity(8100, 8192))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("grown to 8192 positions at batch 64"), "{err}");
+        // The single-sequence path allocates its ceiling up front, so
+        // nothing about it moves.
+        let single = CachePlan::new(&cfg, 16_060_000_000, 256, CachePath::Single);
+        assert_eq!(single.allocated_capacity(544, 8192), 8192);
+        assert_eq!(single.cache_bytes_at(8192), 2 * 8193 * 4096 * 32);
+    }
+
+    #[test]
+    fn cache_plan_rejects_what_the_card_cannot_hold() {
+        let cfg = llama31_8b();
+        let plan = CachePlan::new(&cfg, 16_060_000_000, 256, CachePath::Batched(64));
+        let err = plan.check(32768).unwrap_err().to_string();
+        assert!(err.contains("more than the card"), "{err}");
+        assert!(err.contains("the largest capacity"), "{err}");
+        assert!(plan.max_capacity() < 32768);
+    }
+
+    #[test]
+    fn trained_context_warns_only_past_it() {
+        let cfg = llama31_8b();
+        assert_eq!(cfg.trained_context(), Some(131_072));
+        assert_eq!(cfg.original_context(), Some(8192));
+        assert!(cfg.context_warning(131_072).is_none());
+        let w = cfg.context_warning(131_073).unwrap();
+        assert!(w.contains("131072"), "{w}");
+        assert!(w.contains("rope scaling"), "{w}");
+        // A config without the key says nothing.
+        let bare: LlamaConfig = serde_json::from_str(
+            r#"{"hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 1,
+                "num_attention_heads": 4, "rms_norm_eps": 1e-5, "vocab_size": 16}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.trained_context(), None);
+        assert!(bare.context_warning(1_000_000).is_none());
+    }
+
+    #[test]
+    fn nocache_prefill_limit_is_the_stride_limit() {
+        let cfg = llama31_8b();
+        // 8192^2 x 32 heads x 2 bytes is exactly the 2^32 byte limit.
+        assert_eq!(max_nocache_prefill(&cfg), 8192);
+        assert!(reng_synapse::tensor_fits(&[8192, 8192, 32], 2));
+        assert!(!reng_synapse::tensor_fits(&[16384, 16384, 32], 2));
     }
 }

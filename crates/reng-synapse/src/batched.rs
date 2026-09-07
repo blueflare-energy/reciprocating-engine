@@ -57,10 +57,6 @@ use core::ffi::c_void;
 use reng_core::Result;
 use std::time::Instant;
 
-/// Smallest cache bucket (positions); `RENG_MIN_CAP` overrides it (a huge
-/// value disables bucketing, a tiny one exercises growth in tests).
-const MIN_BUCKET: usize = 256;
-
 /// Per-step input indices of a recipe; the second RoPE rows and the two
 /// masks exist only when some layer reads them.
 #[derive(Clone, Copy)]
@@ -122,7 +118,6 @@ pub struct BatchedModel<'a> {
     capacity: usize,
     /// Current bucket (positions the recipes are compiled for).
     cap: usize,
-    min_cap: usize,
     hidden: usize,
     inter: usize,
     vocab: usize,
@@ -141,16 +136,6 @@ pub struct BatchedModel<'a> {
     slots: Vec<(u64, u64)>,
     /// Sliding window of the windowed layers.
     window: Option<usize>,
-}
-
-/// The bucket for `need` positions: the smallest of `min_cap`, doubling,
-/// that holds them, clamped to `capacity`.
-fn bucket_for(need: usize, min_cap: usize, capacity: usize) -> usize {
-    let mut c = min_cap.max(1);
-    while c < need {
-        c *= 2;
-    }
-    c.min(capacity)
 }
 
 impl<'a> BatchedModel<'a> {
@@ -195,11 +180,7 @@ impl<'a> BatchedModel<'a> {
         }
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
-        let min_cap = std::env::var("RENG_MIN_CAP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(MIN_BUCKET);
-        let cap = bucket_for(1, min_cap, capacity);
+        let cap = crate::cache_bucket(1, capacity);
         let embed = match embed {
             Some(e) if device_loop_enabled() => Some(*e),
             _ => None,
@@ -257,7 +238,6 @@ impl<'a> BatchedModel<'a> {
             rows,
             capacity,
             cap,
-            min_cap,
             hidden,
             inter,
             vocab,
@@ -720,6 +700,8 @@ impl<'a> BatchedModel<'a> {
             mask: t_mask,
             mask_window: t_mask_window,
             cache: Some(cap),
+            // The batched prefill recipe already compiles per bucket.
+            key_window: None,
             kidx: Some(t_kidx),
             inplace: false,
             sdpa: fused_sdpa(false),
@@ -824,7 +806,7 @@ impl<'a> BatchedModel<'a> {
         if need <= self.cap {
             return Ok(());
         }
-        let cap = bucket_for(need, self.min_cap, self.capacity);
+        let cap = crate::cache_bucket(need, self.capacity);
         let tag = format!("_{cap}");
         let (gb, out) = match &self.embed {
             Some(e) => {

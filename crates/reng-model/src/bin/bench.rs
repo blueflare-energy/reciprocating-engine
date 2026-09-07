@@ -23,8 +23,8 @@ use reng_ceiling::{
     HardwareSpec, Precision, decode_ceiling, model_from_hf_config, prefill_ceiling,
 };
 use reng_model::{
-    BatchedGenerator, Fp8Config, Generator, LlamaConfig, fp8_switch, load_weights_fp8,
-    take_fp8_flag,
+    BatchedGenerator, CachePath, CachePlan, Fp8Config, Generator, LlamaConfig, fp8_switch,
+    load_weights_fp8, take_fp8_flag,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -140,6 +140,28 @@ fn main() -> reng_core::Result<()> {
         mapped as f64 / 1e9,
         owned as f64 / 1e9
     );
+
+    let batch_for_plan = a.batch.max(1);
+    let plan = CachePlan::new(
+        &cfg,
+        w.device_bytes(),
+        a.rows,
+        if batch_for_plan == 1 {
+            CachePath::Single
+        } else {
+            CachePath::Batched(batch_for_plan)
+        },
+    );
+    // What this run allocates: `--capacity` itself at batch 1, and the
+    // cache bucket the run grows into on the batched path, whose
+    // `--capacity` is a ceiling.
+    let planned = plan.allocated_capacity(a.prompt + a.n_new, a.capacity);
+    println!("{}", plan.summary(planned));
+    if let Some(msg) = cfg.context_warning(a.prompt + a.n_new) {
+        eprintln!("{msg}");
+        println!("{msg}");
+    }
+    plan.check(planned)?;
 
     // A synthetic prompt: the ids only need to be valid, throughput does not
     // depend on their values.

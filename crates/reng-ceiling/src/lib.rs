@@ -248,6 +248,18 @@ fn ceiling_from(flops: f64, bytes: f64, peak_flops: f64, hbm_bw: f64, tokens: f6
 
 /// Prefill ceiling: process `seq_len` prompt tokens for `batch` sequences at a
 /// 0% cache hit.
+///
+/// Attention is counted causally: query `q` of a causal prefill needs the
+/// scores against keys `0 ..= q` and no others, so the two attention gemms
+/// each touch `s (s + 1) / 2` of the `s^2` (query, key) pairs. Counting
+/// the full square, as this did before, doubles the attention term and so
+/// halves the ceiling at long context: at 32768 tokens on Llama-3.1-8B,
+/// whose [`ModelShape::active_params`] is 7.50B, that is the difference
+/// between 13421 and 18305 tok/s, and it flattered every measured
+/// percentage. The memory term carries the weights once, the KV
+/// cache written once and read once (a tiled attention reads each key and
+/// value once per pass); prefill is compute-bound at every context this
+/// engine runs, so the memory term never sets the ceiling.
 #[must_use]
 pub fn prefill_ceiling(
     hw: &HardwareSpec,
@@ -261,16 +273,18 @@ pub fn prefill_ceiling(
     let s = f64::from(seq_len);
     let active = model.active_params() as f64;
     let linear_flops = 2.0 * active * b * s;
+    // Causal: the (query, key) pairs below the diagonal, its own included.
+    let pairs = s * (s + 1.0) / 2.0;
     let attn_flops = 4.0
         * f64::from(model.layers)
         * b
         * f64::from(model.n_heads)
-        * s
-        * s
+        * pairs
         * model.head_dim as f64;
     let flops = linear_flops + attn_flops;
-    // Weights read once; KV cache written for the whole prompt.
-    let bytes = active * prec.weight_bytes() + b * s * model.kv_bytes_per_token(kv);
+    // Weights read once; the KV cache written for the whole prompt and read
+    // once by attention.
+    let bytes = active * prec.weight_bytes() + 2.0 * b * s * model.kv_bytes_per_token(kv);
     ceiling_from(flops, bytes, prec.compute_flops(hw), hw.hbm_bw, b * s)
 }
 
@@ -510,6 +524,27 @@ mod tests {
         let c = prefill_ceiling(&hw, &m, Precision::Bf16, Precision::Bf16, 1, 8192);
         assert_eq!(c.bottleneck, Bottleneck::Compute);
         assert!(c.arithmetic_intensity > 100.0);
+    }
+
+    #[test]
+    fn prefill_attention_is_counted_causally() {
+        let hw = HardwareSpec::gaudi2();
+        let m = dense_7b();
+        // At a context where attention dominates the linear layers, the
+        // causal count is close to half the dense one, so the ceiling is
+        // close to twice what counting the full square would give.
+        let s = 131_072;
+        let c = prefill_ceiling(&hw, &m, Precision::Bf16, Precision::Bf16, 1, s);
+        let linear = 2.0 * m.active_params() as f64 * f64::from(s);
+        let pairs = f64::from(s) * (f64::from(s) + 1.0) / 2.0;
+        let attn = 4.0 * f64::from(m.layers) * f64::from(m.n_heads) * pairs * m.head_dim as f64;
+        let want = (linear + attn) / Precision::Bf16.compute_flops(&hw);
+        assert!(
+            (c.compute_time_s - want).abs() / want < 1e-9,
+            "{} vs {want}",
+            c.compute_time_s
+        );
+        assert!(attn > linear, "attention should dominate at {s}");
     }
 
     #[test]

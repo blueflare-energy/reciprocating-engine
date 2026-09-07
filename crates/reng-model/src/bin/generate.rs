@@ -21,8 +21,8 @@
 //! `reng-generate <model_dir> <out.json> <n_new> [--ref <ref.json>] [--margin <f32>] [--rows <n>] [--decode-rows <n>] [--capacity <n>] [--recompute] [--fp8] <id> [<id> ...]`
 
 use reng_model::{
-    Fp8Config, Generator, LlamaConfig, argmax_rows, fp8_switch, load_weights_fp8, prefill_logits,
-    take_fp8_flag,
+    CachePath, CachePlan, Fp8Config, Generator, LlamaConfig, argmax_rows, fp8_switch,
+    load_weights_fp8, prefill_logits, take_fp8_flag,
 };
 use std::path::Path;
 use std::time::Instant;
@@ -219,6 +219,14 @@ fn main() -> reng_core::Result<()> {
         owned as f64 / 1e9
     );
     let vocab = cfg.vocab_size;
+    let plan = CachePlan::new(&cfg, w.device_bytes(), a.rows, CachePath::Single);
+    if !a.recompute {
+        println!("{}", plan.summary(a.capacity));
+    }
+    if let Some(msg) = cfg.context_warning(prompt_len + n_new) {
+        eprintln!("{msg}");
+        println!("{msg}");
+    }
     let mut ids = a.ids.clone();
     let mut generated: Vec<u32> = Vec::with_capacity(n_new);
     let mut step_secs: Vec<f32> = Vec::with_capacity(n_new);
@@ -227,11 +235,14 @@ fn main() -> reng_core::Result<()> {
     let mut cached = if a.recompute {
         None
     } else {
-        assert!(
-            prompt_len + n_new <= a.capacity,
-            "prompt {prompt_len} + {n_new} new tokens exceed the cache capacity {}",
-            a.capacity
-        );
+        if prompt_len + n_new > a.capacity {
+            return Err(reng_core::Error::Other(format!(
+                "a prompt of {prompt_len} tokens plus {n_new} new tokens exceeds the cache \
+                 capacity {} (--capacity); this model holds up to {} positions",
+                a.capacity,
+                plan.max_capacity()
+            )));
+        }
         let t0 = Instant::now();
         let g = Generator::new(&w, &cfg, a.rows, a.decode_rows, a.capacity)?;
         println!(

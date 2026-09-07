@@ -177,6 +177,94 @@ pub use model::{
     model_probe_bf16, model_probe_cpu,
 };
 
+/// How many wide recipes a model may hold, one per key bucket (see
+/// [`key_step`]). Each costs its own mask input and gather indices and
+/// borrows everything else (weights, KV cache, workspace) from the first
+/// one, so the ceiling is compile time, not memory.
+const MAX_KEY_BUCKETS: usize = 16;
+
+/// Granularity of the key buckets: `rows`, doubled until at most
+/// [`MAX_KEY_BUCKETS`] buckets span `keys_full` slots.
+///
+/// A block of `rows` queries at position `p` sees keys `0 .. p + rows` and
+/// no more, so a recipe compiled for `p + rows` keys does half the work of
+/// one compiled for the whole capacity, summed over a full prefill. One
+/// recipe per block would be exact; a bucket wastes at most `step` key
+/// columns per block, 11% over an exact per-block range at 256-row blocks
+/// and a capacity of 32832 (see the unit test), against a factor of 1.77
+/// saved on the whole-capacity form.
+pub fn key_step(rows: usize, keys_full: usize) -> usize {
+    let mut step = rows.max(1);
+    while keys_full.div_ceil(step) > MAX_KEY_BUCKETS {
+        step *= 2;
+    }
+    step
+}
+
+/// The bucket that holds `need` key slots.
+pub fn key_bucket(need: usize, step: usize, keys_full: usize) -> usize {
+    need.max(1)
+        .div_ceil(step)
+        .saturating_mul(step)
+        .min(keys_full)
+}
+
+/// Smallest KV-cache bucket the batched decoder compiles, in positions.
+/// `RENG_MIN_CAP` overrides it (a huge value disables bucketing, a tiny
+/// one exercises growth in tests).
+pub const MIN_CACHE_BUCKET: usize = 256;
+
+/// The cache bucket `BatchedModel` holds `need` positions in: the smallest
+/// power-of-two multiple of [`MIN_CACHE_BUCKET`] (or `RENG_MIN_CAP`) that
+/// holds them, capped at `capacity`.
+///
+/// The batched path's `capacity` is a ceiling, not an allocation. The
+/// model starts at `cache_bucket(1, capacity)` and doubles only when a
+/// sequence actually reaches the current bucket, copying the used rows
+/// across, so a run that stops at position 544 never allocates for more
+/// than 1024 positions whatever `--capacity` says. Anything that budgets
+/// device memory for this path has to ask what bucket the run reaches,
+/// not what the ceiling is.
+#[must_use]
+pub fn cache_bucket(need: usize, capacity: usize) -> usize {
+    let min_cap: usize = std::env::var("RENG_MIN_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MIN_CACHE_BUCKET);
+    let mut c = min_cap.max(1);
+    while c < need {
+        c *= 2;
+    }
+    c.min(capacity)
+}
+
+/// The largest tensor the engine will build, in bytes.
+///
+/// A SynapseAI tensor stride is a 32-bit field in the TPC descriptor, and
+/// the largest stride of a dense tensor is its own byte size (the stride
+/// past its outermost dimension). Above `2^32` the graph compiler prints
+/// `non-irf44 tpc node with a tensor with non-0 high32 bits in tensor
+/// stride ... (Will not be set in the descriptor)` at critical level and
+/// computes with the truncated stride, so any TPC node reading such a
+/// tensor is one layout change away from silently reading the wrong rows.
+/// Measured on SynapseAI 1.24.1: a `[t, t, heads]` bf16 score tensor is
+/// silent at `t = 8192` (exactly `2^32` bytes) and prints one message per
+/// layer per tensor from `t = 16384` (`2^34` bytes) up.
+pub const MAX_TENSOR_BYTES: u64 = 1 << 32;
+
+/// The byte size of a dense tensor of `sizes` elements of `elem` bytes,
+/// and whether it stays inside [`MAX_TENSOR_BYTES`].
+#[must_use]
+pub fn tensor_bytes(sizes: &[u64], elem: usize) -> u64 {
+    sizes.iter().product::<u64>() * elem as u64
+}
+
+/// Whether a tensor of these sizes can be built: see [`MAX_TENSOR_BYTES`].
+#[must_use]
+pub fn tensor_fits(sizes: &[u64], elem: usize) -> bool {
+    tensor_bytes(sizes, elem) <= MAX_TENSOR_BYTES
+}
+
 /// Tensor-parallel decoding over the cards of one HCCL communicator.
 #[cfg(feature = "link-synapse")]
 pub mod tp;
@@ -619,5 +707,62 @@ mod tests {
         let a = [1.0, 2.0, 3.0, 4.0];
         let b = [5.0, 6.0, 7.0, 8.0];
         assert_eq!(matmul_cpu(&a, &b, 2, 2, 2), vec![19.0, 22.0, 43.0, 50.0]);
+    }
+
+    #[test]
+    fn tensor_stride_limit_matches_the_compiler() {
+        // The no-cache prefill score tensor [tokens, tokens, heads] of a
+        // 32-head model: silent at 8192 tokens (exactly 2^32 bytes),
+        // "non-0 high32 bits in tensor stride" at 16384 and beyond.
+        assert_eq!(tensor_bytes(&[8192, 8192, 32], 2), MAX_TENSOR_BYTES);
+        assert!(tensor_fits(&[8192, 8192, 32], 2));
+        assert!(!tensor_fits(&[16384, 16384, 32], 2));
+        assert!(!tensor_fits(&[32768, 32768, 32], 2));
+        // The cached path's block score tensor [keys, 256, heads] stays
+        // inside it even at a capacity of 131072 positions.
+        assert!(tensor_fits(&[131_137, 256, 32], 2));
+        // And so do the two KV cache buffers of that capacity.
+        assert!(tensor_fits(&[128, 131_137, 1, 8], 2));
+        // f32 counts four bytes per element.
+        assert!(tensor_fits(&[1 << 30], 4));
+        assert!(!tensor_fits(&[(1 << 30) + 1], 4));
+    }
+
+    #[test]
+    fn key_buckets_span_the_capacity() {
+        // 256-row blocks over a 32832-position cache: the step doubles
+        // from the block size until at most sixteen buckets cover it.
+        let (rows, full) = (256, 32833);
+        let step = key_step(rows, full);
+        assert_eq!(step, 4096);
+        assert!(full.div_ceil(step) <= 16);
+        assert_eq!(key_bucket(1, step, full), 4096);
+        assert_eq!(key_bucket(4096, step, full), 4096);
+        assert_eq!(key_bucket(4097, step, full), 8192);
+        assert_eq!(key_bucket(full, step, full), full);
+        // Never past the cache, never below one bucket.
+        for need in [0, 1, full, full + 1] {
+            let b = key_bucket(need, step, full);
+            assert!(b <= full && b >= need.min(full).max(1));
+        }
+        // A small cache keeps the block size as its step.
+        assert_eq!(key_step(256, 513), 256);
+        assert_eq!(key_bucket(256, 256, 513), 256);
+        assert_eq!(key_bucket(257, 256, 513), 512);
+        // Summed over a full prefill the buckets cost well under the
+        // whole-capacity form (2392129 key columns against 4235457, a
+        // factor of 1.77) and not much over the exact prefix (2146369,
+        // a factor of 1.11); the exact prefix itself is the factor of two
+        // the causal mask throws away.
+        let (mut bucketed, mut exact) = (0usize, 0usize);
+        let mut pos = 0;
+        while pos < full - 1 {
+            bucketed += key_bucket((pos + rows).min(full), step, full);
+            exact += (pos + rows).min(full);
+            pos += rows;
+        }
+        let whole = full * (full - 1).div_ceil(rows);
+        assert!(bucketed * 5 < whole * 3, "{bucketed} vs {whole}");
+        assert!(bucketed < exact * 6 / 5, "{bucketed} vs {exact}");
     }
 }

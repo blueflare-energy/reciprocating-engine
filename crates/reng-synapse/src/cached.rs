@@ -40,7 +40,7 @@
 use crate::f32_to_bf16;
 use crate::ffi::{SYN_TYPE_BF16, SYN_TYPE_F32, synTensor};
 use crate::model::{
-    EmbedTable, Gb, MASK_NEG, ModelWeights, RopeTables, Shared, build_head, build_layer,
+    EmbedTable, Gb, KeyWindow, MASK_NEG, ModelWeights, RopeTables, Shared, build_head, build_layer,
     cache_names, common_window, fused_sdpa, lm_head_input, uses_full_mask, uses_local_rope,
 };
 use crate::probe::SYN_TYPE_INT32;
@@ -63,6 +63,16 @@ pub(crate) fn device_loop_enabled() -> bool {
 /// its own cache line, so the tensors of consecutive launches never share
 /// a line (the batched loop's rows are whole multiples of it).
 pub(crate) const SLOT: usize = 128;
+
+/// Whether wide recipes attend over the prefix a block can see instead of
+/// the whole cache: `RENG_KEY_WINDOW` set to anything but `0` or `off`, or
+/// unset.
+pub(crate) fn key_window_enabled() -> bool {
+    match std::env::var("RENG_KEY_WINDOW") {
+        Ok(v) => !(v == "0" || v.eq_ignore_ascii_case("off")),
+        Err(_) => true,
+    }
+}
 
 /// `ns_GatherKernel::Params`: the FCD-first axis the indices select along.
 #[repr(C)]
@@ -105,6 +115,14 @@ struct Inputs {
     kidx: usize,
 }
 
+/// One wide recipe compiled for a key bucket, sharing everything but its
+/// mask and gather indices with the full-capacity one.
+struct Win<'a> {
+    keys: usize,
+    rt: Runtime<'a>,
+    ix: Inputs,
+}
+
 /// A compiled decoder recipe with its resident weights and KV cache, plus an
 /// optional second recipe for small blocks (decode) that shares them.
 pub struct CachedModel<'a> {
@@ -113,11 +131,19 @@ pub struct CachedModel<'a> {
     dec: Option<(Runtime<'a>, Inputs, usize)>,
     /// The device decode loop, if any (the same borrow).
     lp: Option<Loop<'a>>,
+    /// Wide recipes for the key buckets below the capacity, compiled the
+    /// first time a block needs one (see [`key_step`]); the same borrow.
+    wins: Vec<Win<'a>>,
     rt: Runtime<'a>,
     ix: Inputs,
+    /// The weights, kept so a key bucket can be compiled later.
+    m: ModelWeights<'a>,
     rows: usize,
     capacity: usize,
+    /// Key-bucket granularity, 0 when the key window is off.
+    keys_step: usize,
     hidden: usize,
+    inter: usize,
     vocab: usize,
     head_dim: usize,
     n_kv: usize,
@@ -188,12 +214,22 @@ impl<'a> CachedModel<'a> {
         assert_eq!(m.final_gamma.len(), hidden);
         assert_eq!(m.lm_head.len(), hidden * vocab);
         let t0 = Instant::now();
-        let (gb, out) = Self::build(m, hidden, inter, vocab, rows, capacity, false)?;
+        let (gb, out) = Self::build(
+            m,
+            hidden,
+            inter,
+            vocab,
+            rows,
+            capacity,
+            false,
+            capacity + 1,
+            "",
+        )?;
         if std::env::var("RENG_RECIPE_TRACE").is_ok() {
             eprintln!("graph build: {:.2} s", t0.elapsed().as_secs_f64());
         }
         let rt = Runtime::new(gb, out)?;
-        let ix = Self::inputs(&rt);
+        let ix = Self::inputs(&rt, "");
         let lp = match embed {
             Some(e) if decode_rows <= 1 && device_loop_enabled() => {
                 let t0 = Instant::now();
@@ -220,9 +256,19 @@ impl<'a> CachedModel<'a> {
             _ => None,
         };
         let dec = if decode_rows > 0 && decode_rows != rows && lp.is_none() {
-            let (gb, out) = Self::build(m, hidden, inter, vocab, decode_rows, capacity, true)?;
+            let (gb, out) = Self::build(
+                m,
+                hidden,
+                inter,
+                vocab,
+                decode_rows,
+                capacity,
+                true,
+                capacity + 1,
+                "",
+            )?;
             let d = Runtime::new_with(gb, out, Some(&rt))?;
-            let ix = Self::inputs(&d);
+            let ix = Self::inputs(&d, "");
             Some((d, ix, decode_rows))
         } else {
             None
@@ -230,11 +276,19 @@ impl<'a> CachedModel<'a> {
         Ok(Self {
             dec,
             lp,
+            wins: Vec::new(),
             rt,
             ix,
+            m: m.clone(),
             rows,
             capacity,
+            keys_step: if key_window_enabled() {
+                crate::key_step(rows, capacity + 1)
+            } else {
+                0
+            },
             hidden,
+            inter,
             vocab,
             head_dim: hd,
             n_kv: l0.n_kv_heads,
@@ -251,7 +305,9 @@ impl<'a> CachedModel<'a> {
     }
 
     /// The graph for blocks of `rows` positions over a cache of `capacity`;
-    /// `inplace` selects the cache update form (see [`Shared::inplace`]).
+    /// `inplace` selects the cache update form (see [`Shared::inplace`]),
+    /// and `keys` how many cache slots attention reads (see
+    /// [`crate::model::KeyWindow`]); `capacity + 1` reads them all.
     #[allow(clippy::too_many_arguments)]
     fn build(
         m: &ModelWeights<'a>,
@@ -261,40 +317,64 @@ impl<'a> CachedModel<'a> {
         rows: usize,
         capacity: usize,
         inplace: bool,
+        keys: usize,
+        tag: &str,
     ) -> Result<(Gb<'a>, crate::runtime::Out)> {
         let hd = m.layers[0].head_dim;
-        let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, capacity as u64 + 1);
+        assert!(keys >= 1 && keys <= capacity + 1);
+        let (t, h, hd64, keys) = (rows as u64, hidden as u64, hd as u64, keys as u64);
         let mut gb = Gb::new()?;
         // Per-step inputs; their contents are replaced before every launch.
-        let t_x = gb.input("X", &[h, t], &vec![0.0; rows * hidden])?;
-        let t_sin = gb.input("SIN", &[hd64, t], &vec![0.0; rows * hd])?;
-        let t_cos = gb.input("COS", &[hd64, t], &vec![0.0; rows * hd])?;
+        let t_x = gb.input(&format!("X{tag}"), &[h, t], &vec![0.0; rows * hidden])?;
+        let t_sin = gb.input(&format!("SIN{tag}"), &[hd64, t], &vec![0.0; rows * hd])?;
+        let t_cos = gb.input(&format!("COS{tag}"), &[hd64, t], &vec![0.0; rows * hd])?;
         let (t_sin_local, t_cos_local) = if uses_local_rope(&m.layers) {
             (
-                Some(gb.input("SINL", &[hd64, t], &vec![0.0; rows * hd])?),
-                Some(gb.input("COSL", &[hd64, t], &vec![0.0; rows * hd])?),
+                Some(gb.input(&format!("SINL{tag}"), &[hd64, t], &vec![0.0; rows * hd])?),
+                Some(gb.input(&format!("COSL{tag}"), &[hd64, t], &vec![0.0; rows * hd])?),
             )
         } else {
             (None, None)
         };
         let groups = m.layers[0].n_kv_heads as u64;
-        let zero_mask = vec![0.0; rows * (capacity + 1)];
+        let zero_mask = vec![0.0; rows * keys as usize];
         let t_mask = if uses_full_mask(&m.layers) {
-            Some(gb.input("MASK", &[keys, t, 1, 1], &zero_mask)?)
+            Some(gb.input(&format!("MASK{tag}"), &[keys, t, 1, 1], &zero_mask)?)
         } else {
             None
         };
         let t_mask_window = if common_window(&m.layers).is_some() {
-            Some(gb.input("MASKW", &[keys, t, 1, 1], &zero_mask)?)
+            Some(gb.input(&format!("MASKW{tag}"), &[keys, t, 1, 1], &zero_mask)?)
         } else {
             None
         };
         let t_kidx = gb.input_raw(
-            "KIDX",
+            &format!("KIDX{tag}"),
             &[3, t * groups],
             SYN_TYPE_INT32,
             &vec![0u8; 3 * 4 * rows * groups as usize],
         )?;
+        // With fewer keys than the cache holds, one int32 index vector per
+        // graph takes the prefix of every layer's K and V (see
+        // [`crate::model::KeyWindow`]).
+        let key_window = if (keys as usize) < capacity + 1 {
+            let full = capacity as i32 + 1;
+            let idx: Vec<u8> = (0..groups as i32)
+                .flat_map(|g| (0..keys as i32).map(move |k| g * full + k))
+                .flat_map(i32::to_le_bytes)
+                .collect();
+            Some(KeyWindow {
+                keys: keys as usize,
+                idx: gb.input_raw(
+                    &format!("KWIN{tag}"),
+                    &[keys * groups],
+                    SYN_TYPE_INT32,
+                    &idx,
+                )?,
+            })
+        } else {
+            None
+        };
         let sh = Shared {
             sin: t_sin,
             cos: t_cos,
@@ -303,6 +383,7 @@ impl<'a> CachedModel<'a> {
             mask: t_mask,
             mask_window: t_mask_window,
             cache: Some(capacity),
+            key_window,
             kidx: Some(t_kidx),
             inplace,
             // The in-place recipe is the decode one (small blocks), where
@@ -554,6 +635,9 @@ impl<'a> CachedModel<'a> {
             mask: t_mask,
             mask_window: t_mask_window,
             cache: Some(capacity),
+            // The loop's one query is at the far end of the cache, so it
+            // reads every slot.
+            key_window: None,
             kidx: Some(t_kidx),
             inplace: true,
             // The loop is the single-sequence decode recipe: fused
@@ -568,16 +652,16 @@ impl<'a> CachedModel<'a> {
         Ok((gb, out))
     }
 
-    fn inputs(rt: &Runtime<'_>) -> Inputs {
+    fn inputs(rt: &Runtime<'_>, tag: &str) -> Inputs {
         Inputs {
-            x: rt.input_index("X"),
-            sin: rt.input_index("SIN"),
-            cos: rt.input_index("COS"),
-            sin_local: rt.find_input("SINL"),
-            cos_local: rt.find_input("COSL"),
-            mask: rt.find_input("MASK"),
-            mask_window: rt.find_input("MASKW"),
-            kidx: rt.input_index("KIDX"),
+            x: rt.input_index(&format!("X{tag}")),
+            sin: rt.input_index(&format!("SIN{tag}")),
+            cos: rt.input_index(&format!("COS{tag}")),
+            sin_local: rt.find_input(&format!("SINL{tag}")),
+            cos_local: rt.find_input(&format!("COSL{tag}")),
+            mask: rt.find_input(&format!("MASK{tag}")),
+            mask_window: rt.find_input(&format!("MASKW{tag}")),
+            kidx: rt.input_index(&format!("KIDX{tag}")),
         }
     }
 
@@ -795,6 +879,41 @@ impl<'a> CachedModel<'a> {
         Ok(v[0] as u32)
     }
 
+    /// Compile the wide recipe for `keys` cache slots unless it is there
+    /// already (or is the full-capacity one, which always is). It shares
+    /// the weights, the KV cache, the per-step inputs, the read-back
+    /// tensors and the workspace of the full-capacity recipe, so it costs
+    /// only its own mask buffer and gather indices.
+    fn ensure_window(&mut self, keys: usize) -> Result<()> {
+        if keys > self.capacity || self.wins.iter().any(|w| w.keys == keys) {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        let tag = format!("_k{keys}");
+        let (gb, out) = Self::build(
+            &self.m,
+            self.hidden,
+            self.inter,
+            self.vocab,
+            self.rows,
+            self.capacity,
+            false,
+            keys,
+            &tag,
+        )?;
+        let rt = Runtime::new_with(gb, out, Some(&self.rt))?;
+        let ix = Self::inputs(&rt, &tag);
+        if std::env::var("RENG_RECIPE_TRACE").is_ok() {
+            eprintln!(
+                "key bucket {keys} of {}: built in {:.2} s",
+                self.capacity + 1,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        self.wins.push(Win { keys, rt, ix });
+        Ok(())
+    }
+
     fn step_rows(&mut self, x: &[f32], read: Read) -> Result<Vec<f32>> {
         let (h, hd, c) = (self.hidden, self.head_dim, self.capacity);
         assert_eq!(x.len() % h, 0);
@@ -814,10 +933,28 @@ impl<'a> CachedModel<'a> {
         let flipped = self.flipped;
         let check_argmax = self.check_argmax;
         let wide = !matches!(&self.dec, Some((_, _, dr)) if n <= *dr);
+        // A wide block only sees keys up to its own last position, so it
+        // runs on the recipe of the smallest key bucket that holds them.
+        let keys = if wide && self.keys_step > 0 {
+            let bucket = crate::key_bucket((pos + self.rows).min(c + 1), self.keys_step, c + 1);
+            self.ensure_window(bucket)?;
+            bucket
+        } else {
+            c + 1
+        };
         let bufs = self.cache_bufs();
-        let (rt, ix, p) = match &mut self.dec {
-            Some((d, ix, dr)) if n <= *dr => (d, &*ix, *dr),
-            _ => (&mut self.rt, &self.ix, self.rows),
+        let (rt, ix, p) = if !wide {
+            let (d, ix, dr) = self.dec.as_mut().expect("decode recipe");
+            (d, &*ix, *dr)
+        } else if keys > c {
+            (&mut self.rt, &self.ix, self.rows)
+        } else {
+            let w = self
+                .wins
+                .iter_mut()
+                .find(|w| w.keys == keys)
+                .expect("key bucket recipe");
+            (&mut w.rt, &w.ix, self.rows)
         };
         for (li, b) in bufs.iter().enumerate() {
             let (kci, vci, kco, vco) = cache_names(li);
@@ -858,12 +995,11 @@ impl<'a> CachedModel<'a> {
         // (padding rows past the cache end see everything but the trash slot;
         // they are discarded), and with a window none further back than
         // it. Built directly in bf16: the largest per-step upload.
-        let keys = c + 1;
         let neg = f32_to_bf16(MASK_NEG);
         let mask_rows = |window: Option<usize>| -> Vec<u16> {
             let mut mb = vec![neg; p * keys];
             for q in 0..p {
-                let end = (pos + q + 1).min(c);
+                let end = (pos + q + 1).min(c).min(keys);
                 let start = window.map_or(0, |w| (pos + q + 1).saturating_sub(w));
                 mb[q * keys + start..q * keys + end].fill(0);
             }

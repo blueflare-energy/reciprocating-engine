@@ -729,7 +729,14 @@ pub(crate) struct Runtime<'a> {
     h_out: *mut c_void,
     /// The buffers of [`Runtime::fence`].
     fence: Fence,
-    /// Pinned buffer for [`Runtime::read_bf16_range`], grown on demand.
+    /// Pinned buffer for [`Runtime::read_bf16_range`], grown on demand and
+    /// held for the runtime's life. It is per runtime, not per family, so
+    /// every key-bucket recipe that serves one block of a `feed_all` grows
+    /// its own: `rows * vocab * 2` bytes of `synHostMalloc` each, 65.7 MB
+    /// for Llama-3.1-8B at 256 rows, about 0.6 GB over the nine buckets a
+    /// 32768-token cached prefill touches. Pinned memory is scarcer than
+    /// pageable, so a path that reads all the logits from many buckets
+    /// pays a host cost the device-byte accounting does not show.
     h_aux: *mut c_void,
     aux_bytes: u64,
     /// Pinned buffers for [`Runtime::upload_at`] and
@@ -740,6 +747,14 @@ pub(crate) struct Runtime<'a> {
     ring_bytes: u64,
     out: Out,
     dws: u64,
+    /// Bytes of the workspace at `dws`, and whether this runtime allocated
+    /// it. Recipes over one model differ only in their block and key
+    /// shapes, so a child whose workspace fits the parent's borrows it:
+    /// only one recipe of a runtime family is ever in flight (every launch
+    /// is followed by a readback or a stream sync), and the workspace holds
+    /// nothing between launches.
+    ws_bytes: u64,
+    owns_ws: bool,
 }
 
 impl<'a> Runtime<'a> {
@@ -757,6 +772,7 @@ impl<'a> Runtime<'a> {
     /// parent.
     pub fn new_with(gb: Gb<'a>, out: Out, parent: Option<&Runtime<'_>>) -> Result<Self> {
         let borrowed = parent.map(|p| (p.dev, p.stream));
+        let parent_ws = parent.map(|p| (p.dws, p.ws_bytes));
         // A tensor is shared with the parent when it has the same name AND
         // the same element count (a weight may be declared 4-D in one graph
         // and 5-D with a trailing 1 in another; the per-step inputs of a
@@ -767,7 +783,7 @@ impl<'a> Runtime<'a> {
                 _ => None,
             })
         };
-        Self::build(gb, out, &lookup, borrowed)
+        Self::build(gb, out, &lookup, borrowed, parent_ws)
     }
 
     /// Like [`Runtime::new`], but on a device and stream the caller has
@@ -775,7 +791,7 @@ impl<'a> Runtime<'a> {
     /// exactly one device for its HCCL rank). Nothing is shared with another
     /// runtime, and drop leaves the device and stream alone.
     pub fn new_on(gb: Gb<'a>, out: Out, dev: synDeviceId, stream: synStreamHandle) -> Result<Self> {
-        Self::build(gb, out, &|_, _| None, Some((dev, stream)))
+        Self::build(gb, out, &|_, _| None, Some((dev, stream)), None)
     }
 
     /// Like [`Runtime::new_on`], binding every persistent tensor (the
@@ -789,7 +805,7 @@ impl<'a> Runtime<'a> {
         stream: synStreamHandle,
         bind: &Bindings,
     ) -> Result<Self> {
-        Self::build(gb, out, &|n, e| bind.get(n, e), Some((dev, stream)))
+        Self::build(gb, out, &|n, e| bind.get(n, e), Some((dev, stream)), None)
     }
 
     /// Persistent tensors `lookup` knows (by name and element count) bind
@@ -801,6 +817,7 @@ impl<'a> Runtime<'a> {
         out: Out,
         lookup: &dyn Fn(&str, u64) -> Option<u64>,
         borrowed: Option<(synDeviceId, synStreamHandle)>,
+        parent_ws: Option<(u64, u64)>,
     ) -> Result<Self> {
         gb.serialize_if_requested()?;
         let trace = env_on("RENG_RECIPE_TRACE");
@@ -990,9 +1007,20 @@ impl<'a> Runtime<'a> {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0)
             << 20;
-        let mut dws = 0u64;
-        if ws + slack > 0 {
-            syn!(synDeviceMalloc(dev, ws + slack, 0, 0, &mut dws));
+        let need = ws + slack;
+        // The parent's workspace when it is big enough (see the field docs).
+        // Sharing it is safe only while the two runtimes launch in order on
+        // one stream, which they do because a child borrows the parent's.
+        debug_assert!(
+            parent_ws.is_none() || borrowed.is_some(),
+            "a runtime offered a workspace must also run on the lender's stream"
+        );
+        let (mut dws, ws_bytes, owns_ws) = match parent_ws {
+            Some((addr, bytes)) if addr != 0 && bytes >= need => (addr, bytes, false),
+            _ => (0, need, true),
+        };
+        if owns_ws && need > 0 {
+            syn!(synDeviceMalloc(dev, need, 0, 0, &mut dws));
         }
         syn!(synStreamSynchronize(stream));
         if trace {
@@ -1004,11 +1032,11 @@ impl<'a> Runtime<'a> {
                 (t0.elapsed() - t_compile - t_device).as_secs_f64(),
                 n_in,
                 own_input.iter().filter(|o| !**o).count(),
-                to_gb(in_bytes + scratch_bytes + out_bytes + ws + slack),
+                to_gb(in_bytes + scratch_bytes + out_bytes + if owns_ws { need } else { 0 }),
                 to_gb(in_bytes),
                 to_gb(scratch_bytes),
                 to_gb(out_bytes),
-                to_gb(ws + slack)
+                to_gb(if owns_ws { need } else { 0 })
             );
         }
         Ok(Self {
@@ -1037,6 +1065,8 @@ impl<'a> Runtime<'a> {
             ring_bytes: 0,
             out,
             dws,
+            ws_bytes,
+            owns_ws,
         })
     }
 
@@ -1245,6 +1275,13 @@ impl<'a> Runtime<'a> {
     /// Enqueue one launch without reading anything back (launches on the
     /// stream run in order; a later [`Runtime::launch_and_read`] completes
     /// after all of them). For throughput measurements.
+    ///
+    /// The workspace at `dws` may be borrowed from another runtime of the
+    /// family (see the `ws_bytes` field), and a launch owns it until it
+    /// completes. That is safe only because every runtime of a family
+    /// shares one stream and launches on it run in order; anything that
+    /// gives a family a second stream, or launches two of its recipes to
+    /// be read later, has to stop sharing the workspace first.
     ///
     /// # Errors
     ///
@@ -1902,7 +1939,7 @@ impl Drop for Runtime<'_> {
             if self.owns_out {
                 synDeviceFree(self.dev, self.d_out, 0);
             }
-            if self.dws != 0 {
+            if self.dws != 0 && self.owns_ws {
                 synDeviceFree(self.dev, self.dws, 0);
             }
             mark("device frees", &mut since);

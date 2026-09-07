@@ -577,6 +577,17 @@ pub(crate) fn make_tensor_in(
     dtype: core::ffi::c_int,
     section: synSectionHandle,
 ) -> Result<(synTensor, CString)> {
+    let elem = elem_bytes(dtype);
+    if !crate::tensor_fits(sizes, elem) {
+        return Err(Error::Other(format!(
+            "tensor {name} {sizes:?} x {elem} B = {} bytes exceeds the {} byte limit on a \
+             32-bit tensor stride; the graph compiler would truncate the stride of every \
+             TPC node that reads it. Use the KV-cache path (reng-prefill routes prompts \
+             past this size through it) or a smaller block.",
+            crate::tensor_bytes(sizes, elem),
+            crate::MAX_TENSOR_BYTES
+        )));
+    }
     let cname = CString::new(name).unwrap();
     let mut t: synTensor = core::ptr::null_mut();
     syn!(synTensorHandleCreate(
@@ -1041,6 +1052,37 @@ impl<'a> Gb<'a> {
     }
 }
 
+/// The cache prefix one recipe's attention reads.
+///
+/// A block of queries at positions `pos .. pos + rows` can see keys
+/// `0 .. pos + rows` and nothing beyond, so a recipe compiled for that
+/// block only needs the first `keys` slots of each layer's cache. The
+/// cache tensors keep their full `[head_dim, capacity + 1, 1, kv_heads]`
+/// shape (so every recipe of a model shares the same buffers) and a
+/// `gather_fwd_bf16` takes the prefix into a `[head_dim, keys, 1,
+/// kv_heads]` tensor the scores are computed from. The gather copies
+/// `keys` positions of K and V per layer; the scores, the mask add and the
+/// softmax, which read and write a `[keys, rows, heads]` tensor several
+/// times each, all shrink with it.
+///
+/// The cache is viewed as 2-D `[head_dim, (capacity + 1) * kv_heads]` for
+/// the gather (a free reshape: the KV head is the outermost dimension, so
+/// its slabs are contiguous) and the index vector picks the first `keys`
+/// slots of each slab. `gather_fwd_bf16` over the second dimension of a
+/// 2-D tensor is the form the decode loop's RoPE and mask rows already
+/// use; the same node on the 4-D cache with the key axis inside the KV
+/// head axis returns the wrong rows for every head past the first
+/// (measured: `reng-cache-test` at 4 KV heads fails, `RENG_KEY_WINDOW=0`
+/// passes).
+#[derive(Clone, Copy)]
+pub(crate) struct KeyWindow {
+    /// Cache slots the scores span, `1 ..= capacity + 1`.
+    pub keys: usize,
+    /// int32 `[keys * kv_heads]` gather indices into the flattened cache:
+    /// entry `g * keys + k` is `g * (capacity + 1) + k`.
+    pub idx: synTensor,
+}
+
 /// Shared per-graph tensors a layer needs besides its own weights.
 pub(crate) struct Shared {
     pub sin: synTensor,
@@ -1056,9 +1098,12 @@ pub(crate) struct Shared {
     pub mask_window: Option<synTensor>,
     /// KV-cache capacity in positions. When set, every layer gets cache
     /// input and output tensors (see [`cache_names`]) of `capacity + 1`
-    /// positions (the last is a trash slot padded rows are written to),
-    /// which is also the key axis of the scores.
+    /// positions (the last is a trash slot padded rows are written to).
     pub cache: Option<usize>,
+    /// The prefix of the cache attention reads (see [`KeyWindow`]). None
+    /// means the whole `capacity + 1` slots, which is what a block at the
+    /// end of a full cache needs and what every earlier block wastes.
+    pub key_window: Option<KeyWindow>,
     /// The int32 scatter indices input, `[3, tokens * groups]` device sizes:
     /// update `r + tokens * g` (row r of KV head g) goes to ONNX index
     /// `(g, 0, position)` of the `[hd, keys, 1, groups]` cache.
@@ -1151,9 +1196,18 @@ pub(crate) fn build_layer<'a>(
         nkv as u64,
         qw_us as u64,
     );
-    // Key axis of the score matrices: the block alone, or the whole cache
-    // (its usable positions plus the trash slot).
-    let keys = sh.cache.map_or(t, |c| c as u64 + 1);
+    // Slots of each layer's cache tensors: its usable positions plus the
+    // trash slot padded rows are written to. Every recipe over one model
+    // declares the same cache, whatever its block or key shapes, so they
+    // all bind to the same buffers.
+    let cache_keys = sh.cache.map_or(t, |c| c as u64 + 1);
+    // Key axis of the score matrices: the block's own keys with no cache,
+    // else the cache prefix this block can see (all of it without a
+    // window, see [`KeyWindow`]).
+    let keys = match sh.key_window {
+        Some(kw) if sh.cache.is_some() => kw.keys as u64,
+        _ => cache_keys,
+    };
     let bf = SYN_TYPE_BF16;
     let p = |s: &str| format!("l{li}_{s}");
 
@@ -1602,19 +1656,29 @@ pub(crate) fn build_layer<'a>(
     // of the rotated keys and of the values at its position (padded rows go
     // to the trash slot); the "out" tensor aliases the "in" one, so only the
     // written rows move (see cached.rs).
+    //
+    // Without `sh.inplace` (the wide prefill recipe) the out tensor is its
+    // own buffer, so the node reads the whole `[hd, cache_keys, 1, groups]`
+    // cache and writes a whole copy of it, per layer, for K and for V,
+    // whatever the key window then reads. That is an O(capacity) floor the
+    // key window does not touch: 134 MB per layer per direction at capacity
+    // 32832 on Llama-3.1-8B, about 8.6 GB of HBM traffic per block, which
+    // at 2.45 TB/s is roughly 3.5 ms of the 26.8 ms the first block takes.
+    // Flat in the position, so it is the larger of the two costs for the
+    // early blocks, where the window has already done its work.
     let (k_full, v_full) = if let Some(kidx) = sh.kidx {
         let (n_kci, n_vci, n_kco, n_vco) = cache_names(li);
-        let kci = gb.scratch(&n_kci, &[hd, keys, 1, groups])?;
-        let vci = gb.scratch(&n_vci, &[hd, keys, 1, groups])?;
+        let kci = gb.scratch(&n_kci, &[hd, cache_keys, 1, groups])?;
+        let vci = gb.scratch(&n_vci, &[hd, cache_keys, 1, groups])?;
         let (kco, vco) = if sh.inplace {
             (
-                gb.scratch_alias(&n_kco, &[hd, keys, 1, groups], &n_kci)?,
-                gb.scratch_alias(&n_vco, &[hd, keys, 1, groups], &n_vci)?,
+                gb.scratch_alias(&n_kco, &[hd, cache_keys, 1, groups], &n_kci)?,
+                gb.scratch_alias(&n_vco, &[hd, cache_keys, 1, groups], &n_vci)?,
             )
         } else {
             (
-                gb.scratch(&n_kco, &[hd, keys, 1, groups])?,
-                gb.scratch(&n_vco, &[hd, keys, 1, groups])?,
+                gb.scratch(&n_kco, &[hd, cache_keys, 1, groups])?,
+                gb.scratch(&n_vco, &[hd, cache_keys, 1, groups])?,
             )
         };
         let kru = gb.mid(&p("kru"), &[hd, t * groups], bf)?;
@@ -1640,6 +1704,53 @@ pub(crate) fn build_layer<'a>(
         (kco, vco)
     } else {
         (t_kr, t_v)
+    };
+    // With a key window, attention reads the cache prefix the block can
+    // see instead of every slot (see [`KeyWindow`]).
+    let (k_full, v_full) = match (sh.cache, sh.key_window) {
+        (Some(c), Some(kw)) if kw.keys < c + 1 => {
+            let axis = crate::cached::GatherParams { axis: 1 };
+            let pgw = (
+                (&raw const axis).cast::<c_void>(),
+                core::mem::size_of::<crate::cached::GatherParams>() as u32,
+            );
+            let full_flat = cache_keys * groups;
+            let win_flat = keys * groups;
+            let mut window = |name: &str, src: synTensor| -> Result<synTensor> {
+                let flat = gb.mid(&p(&format!("{name}_flat")), &[hd, full_flat], bf)?;
+                let picked = gb.mid(&p(&format!("{name}_picked")), &[hd, win_flat], bf)?;
+                let out = gb.mid(&p(&format!("{name}_win")), &[hd, keys, 1, groups], bf)?;
+                gb.node(
+                    "reshape",
+                    &p(&format!("{name}_win_2d")),
+                    &[src],
+                    &[flat],
+                    none.0,
+                    none.1,
+                )?;
+                gb.node(
+                    "gather_fwd_bf16",
+                    &p(&format!("{name}_window")),
+                    &[flat, kw.idx],
+                    &[picked],
+                    pgw.0,
+                    pgw.1,
+                )?;
+                gb.node(
+                    "reshape",
+                    &p(&format!("{name}_win_4d")),
+                    &[picked],
+                    &[out],
+                    none.0,
+                    none.1,
+                )?;
+                Ok(out)
+            };
+            let kw_k = window("k", k_full)?;
+            let kw_v = window("v", v_full)?;
+            (kw_k, kw_v)
+        }
+        _ => (k_full, v_full),
     };
     if sh.sdpa && w.attn_softcap.is_none() {
         // Fused attention: one node over the same tensors (the scale is
@@ -2691,6 +2802,7 @@ fn build_stack<'a>(
         mask: t_mask,
         mask_window: t_mask_window,
         cache: None,
+        key_window: None,
         kidx: None,
         inplace: true,
         sdpa: fused_sdpa(false),

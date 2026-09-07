@@ -122,6 +122,49 @@ bytes per token (FP8 halves them, INT4 quarters them), more cards
 (speculative decoding). Batching raises throughput, not latency: batch 8
 rides eight tokens on one pass over the weights.
 
+### Prefill versus context
+
+A prompt is fed in blocks of 256 positions over the KV cache, and a block at
+position `p` attends over the keys `0 .. p + 256`, so the attention work of
+an `N`-token prompt grows with `N^2` while the projections and the MLP grow
+with `N`. The roofline grows the same way, so the honest reading is the
+percentage of the ceiling at that context rather than the tok/s. One card,
+bf16, `--new 32 --capacity N + 64 --warmup 1` (the warmup moves the lazy
+per-bucket compiles out of the timed prefill), median of three runs, against
+the causal `reng-ceiling` prefill roofline:
+
+| Model | Prefill 2048 | Prefill 8192 | Prefill 32768 | Decode at 32768 |
+|---|---|---|---|---|
+| Llama-3.2-3B | 21.7k (34.1%) | 13.6k (24.7%) | 4871 (13.6%) | 160.8 (66.9%) |
+| Qwen2.5-7B | 16.0k (53.8%) | 10.3k (37.8%) | 4339 (20.8%) | 114.3 (74.8%) |
+| Llama-3.1-8B | 12.6k (45.3%) | 8805 (35.0%) | 3414 (18.6%) | 96.3 (75.9%) |
+
+Decode is untouched by any of this: at every context measured it produces
+the same 32 greedy ids, hash for hash, as the build before the key window
+(`fnv1a64 9c049205f1dc8ccf` at 32768 positions from both). Its absolute rate
+falls with the context because the cache is read in full every step, and it
+holds a slowly shrinking share of its own HBM roofline as it goes:
+Llama-3.1-8B runs 111.8 tok/s at 16384 positions (78.3% of the roofline
+there), 96.3 at 32768 (75.9%) and 52.9 at 131072 (69.5%), so the share drifts
+by almost nine points over the range rather than staying flat. 131072
+positions do run on one card: the plan for that capacity is 57.5 GB (cache
+34.38, weights 16.06, transients 4.90, reserve 2.15).
+
+Prefill is where the context costs, and two things remain in it. The score
+tensor is the larger at long context: a block materialises `[keys, 256,
+heads]` in bf16 and the mask add and the softmax read and write it whole,
+several times, per layer; a tiled attention that keeps it in SRAM is the next
+lever. The other is flat in the position and so dominates the early blocks,
+where the key window has already done its work: the wide recipe's cache
+update is not in place, so every block reads the whole KV cache and writes a
+whole copy of it, per layer, for keys and for values -- about 8.6 GB of HBM
+traffic per block at capacity 32832, roughly 3.5 ms of the 26.8 ms the first
+block takes.
+
+Prompts longer than a model's `max_position_embeddings` are run, with a
+warning: the caches, the RoPE tables and the masks all scale, but the rotary
+embeddings are extrapolating past what the checkpoint saw.
+
 ### Across cards
 
 Two objectives decide which split of N cards is the right one, and they do not

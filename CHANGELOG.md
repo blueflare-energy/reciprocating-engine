@@ -8,6 +8,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Prefill attends over the prefix a block can see, not the whole cache.
+  A 256-row block at position `p` needs keys `0 .. p + 256`, so the
+  single-sequence cached model now compiles one wide recipe per key
+  bucket (`key_step`: `rows`, doubled until at most sixteen buckets span
+  the capacity) and picks the smallest bucket that holds the block. The
+  cache tensors keep their full `[head_dim, capacity + 1, 1, kv_heads]`
+  shape, so every bucket recipe binds to the same KV buffers and shares
+  the weights, the read-back tensors and the workspace of the
+  full-capacity recipe, costing only its own mask and gather indices; a
+  `gather_fwd_bf16` over the cache viewed as
+  `[head_dim, (capacity + 1) * kv_heads]` takes the prefix. The scores,
+  the mask add, the softmax and the mask upload all shrink with the key
+  count. Measured on one card at 32768 tokens with `--capacity 32832`:
+  Llama-3.1-8B prefill 1930 -> 3414 tok/s, Qwen2.5-7B 2485 -> 4339,
+  Llama-3.2-3B 2861 -> 4871 (medians of three runs), with decode unchanged.
+  `RENG_KEY_WINDOW=0` restores the whole-cache form.
+- A hard limit on tensor size (`reng_synapse::MAX_TENSOR_BYTES`,
+  `tensor_bytes`, `tensor_fits`): a SynapseAI tensor stride is a 32-bit
+  field, and above `2^32` bytes the graph compiler prints `non-irf44 tpc
+  node with a tensor with non-0 high32 bits in tensor ... stride (Will
+  not be set in the descriptor)` at critical level and computes with the
+  truncated stride. Building such a tensor is now an error naming the
+  tensor, its shape and its size instead of a silent hazard. Measured:
+  the no-cache prefill recipe of Llama-3.1-8B emits 128 of those messages
+  at 16384 tokens and none at 8192.
+- `reng-prefill` routes prompts past that limit through the KV cache
+  (`--cached` forces it, `--rows` sets the block size): the one-recipe
+  form holds a whole `[tokens, tokens, heads]` score tensor, which needs
+  a 137 GB DRAM workspace at 32768 tokens and failed `synGraphCompile`
+  with `synStatus 26`. Llama-3.1-8B at 32768 tokens now runs and agrees
+  with the f32 CPU oracle on 32375 of 32768 argmaxes at last-logits
+  cosine 0.9999; at 16384 it agrees on 16008 of 16384 (cosine 0.9998,
+  against 16002 and 0.9997 for the one-recipe form) and emits no stride
+  messages. `reng_model::max_nocache_prefill` is the per-model limit
+  (8192 tokens for Llama-3.1-8B) and `prefill_logits_cached` the blocked
+  path.
+- `LlamaConfig::max_position_embeddings`, `trained_context`,
+  `original_context` and `context_warning`: `reng-bench`,
+  `reng-generate` and `reng-prefill` warn when the positions they will
+  run at pass the context the checkpoint was trained for, naming the RoPE
+  scaling's original length when there is one. Nothing in the engine's
+  shapes stops a longer run, so it stayed silent before.
+- `CachePlan` (`reng_model`): bytes per position per layer
+  (`2 * n_kv_heads * head_dim * 2`), the buffers each decode path keeps,
+  the widest recipe's transients, and the largest capacity that fits the
+  card next to the weights. The three binaries print the plan, and a
+  capacity the card cannot hold is refused, naming the largest one that
+  fits, before anything is compiled or uploaded. `Generator::new` is
+  checked at `--capacity`, which it allocates outright. The batched path
+  allocates the bucket a run grows into and not the ceiling
+  (`reng_synapse::cache_bucket`, `CachePlan::allocated_capacity`), so
+  `BatchedGenerator::new` is checked at the bucket it compiles and
+  `BatchedGenerator::room_for` re-checks each growth: `reng-bench
+  --prompt 512 --new 32 --batch 64 --capacity 8192` reaches the 1024
+  bucket and runs, and it is the growth to 8192 that is refused.
+- `Generator::feed_all`: every position's logits from the cached path,
+  and `Generator::new_prefill_only` for a caller that wants no decode
+  path (`prefill_logits_cached`), which leaves out the device decode
+  loop's second compile and its copy of the embedding table.
+
 - N-card parallelism strategies and the ceiling each one admits
   (`reng_ceiling::strategy`, and a `reng-ceiling <model_dir> --cards N
   [--batch b]` binary that prints them). Two objectives, because they do
@@ -520,6 +580,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Gaudi2 MIN/MAX macros so the 1.19.0 driver builds on kernel 6.8+.
 - CI pipeline (build, format, clippy, tests, coverage) and self-hosted status
   badges.
+
+### Changed
+
+- `prefill_ceiling` counts attention causally. It counted the full
+  `s x s` score matrix, twice what a causal prefill computes, which
+  halved the ceiling at long context and flattered every percentage: on
+  Llama-3.1-8B at 32768 tokens the ceiling rises from 13421 to 18305
+  tok/s, computed from the 7.50B parameters `active_params` counts, so
+  the measured 1930 and 3414 tok/s are 10.5% and 18.6% of it. Its memory
+  term now also carries the KV cache read, not only the write. Prefill
+  stays compute-bound at every context the engine runs.
+- A child `Runtime` borrows its parent's workspace when the parent's is
+  large enough instead of allocating its own; recipes of one model never
+  run concurrently, and the workspace holds nothing between launches.
+  Without this each key-bucket recipe would want its own copy of the
+  largest recipe's workspace.
 
 ### Fixed
 
