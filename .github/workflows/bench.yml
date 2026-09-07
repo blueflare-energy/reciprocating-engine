@@ -43,7 +43,9 @@ jobs:
       # A cancelled job can leave its engine process holding the card.
       - name: clean up
         run: |
-          for pid in $(pgrep -u "$(id -u)" -f "[t]arget/release/reng-"); do
+          # Only this runner's own leftovers: other engine processes on the
+          # box (agents, manual runs under other trees) must survive a CI run.
+          for pid in $(pgrep -u "$(id -u)" -f "[_]work/.*target/release/reng-"); do
             echo "killing leftover engine process $pid"
             kill -9 "$pid" || true
           done
@@ -179,7 +181,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: clean up
         run: |
-          for pid in $(pgrep -u "$(id -u)" -f "[t]arget/release/reng-"); do
+          for pid in $(pgrep -u "$(id -u)" -f "[_]work/.*target/release/reng-"); do
             echo "killing leftover engine process $pid"
             kill -9 "$pid" || true
           done
